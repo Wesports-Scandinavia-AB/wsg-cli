@@ -1,5 +1,12 @@
-"""wsg: one Microsoft Graph sign-in shared by all your scripts."""
+"""wsg: one sign-in per service, shared by all your scripts.
 
-from .auth import AuthError, get_token, login, logout, read_cache  # noqa: F401
+    from wsg import graph, arena
+    graph.get_token(["User.Read"])     # Microsoft Graph, Entra
+    arena.get("/api/me")               # WeSports Arena, Cloudflare Access
+"""
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
+
+from . import auth as graph  # noqa: E402,F401
+from . import arena  # noqa: E402,F401
+from .auth import AuthError, get_token, login, logout, read_cache  # noqa: E402,F401

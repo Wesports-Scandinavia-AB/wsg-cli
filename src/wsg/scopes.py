@@ -2,9 +2,9 @@
 Default delegated Graph scopes requested at login.
 
 One login should cover every script we run, so this is the union of what they
-need. Add a scope here when a script starts needing it, then run `wsg login`
+need. Add a scope here when a script starts needing it, then run `wsg graph login`
 again. Users without the matching admin role can still sign in with a narrower
-set: `wsg login --scopes User.Read,Files.ReadWrite,Mail.Send`.
+set: `wsg graph login --scopes User.Read,Files.ReadWrite,Mail.Send`.
 """
 
 DEFAULT_SCOPES = [

@@ -134,13 +134,13 @@ def get_token(scopes=None):
     """
     cached = read_cache()
     if not cached:
-        raise AuthError("Not signed in. Run: wsg login")
+        raise AuthError("Not signed in. Run: wsg graph login")
     have = granted_scopes(cached)
     want = set(scopes or [])
     if cached.get("expires_at", 0) > time.time() and want <= have:
         return cached["access_token"]
     if not cached.get("refresh_token"):
-        raise AuthError("Cached token expired and no refresh token. Run: wsg login")
+        raise AuthError("Cached token expired and no refresh token. Run: wsg graph login")
     # Refresh for the union, so the cache keeps covering everything granted so far.
     return _refresh(cached["refresh_token"], sorted(have | want))["access_token"]
 
