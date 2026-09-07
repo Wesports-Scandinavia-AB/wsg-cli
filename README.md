@@ -29,7 +29,10 @@ wsg whoami           calls Graph /me
 wsg logout           deletes the cache
 ```
 
-`wsg login` does not open a browser by itself. Pass `--open` if you want that.
+`wsg login` does not open a browser by itself. Pass `--open` for the default
+browser, or `--browser edge` to pick one. Use the browser that is signed in to
+your work account on a joined device: Conditional Access policies that require
+a compliant device only see the device through that browser session.
 On a machine with no browser (a server), use `wsg login --device`.
 
 The refresh token lives 90 days and is renewed each time it is used, so after

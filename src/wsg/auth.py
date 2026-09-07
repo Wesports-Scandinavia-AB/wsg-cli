@@ -160,7 +160,39 @@ _DONE_HTML = (
 )
 
 
-def login(scopes, open_browser=False, timeout=300, out=sys.stderr, login_hint=None):
+def open_in_browser(url, browser=None):
+    """browser: None for the system default, or 'edge' / 'chrome' / 'firefox' / a path."""
+    if not browser:
+        webbrowser.open(url)
+        return
+    aliases = {"edge": "msedge", "chrome": "chrome", "firefox": "firefox"}
+    exe = aliases.get(browser.lower(), browser)
+    if sys.platform == "win32":
+        import shutil
+        import subprocess
+        path = shutil.which(exe) or _win_app_path(exe)
+        if not path:
+            raise AuthError(f"Hittar inte webbläsaren {browser}.")
+        # Popen with a list: no shell, so the & in the URL is never interpreted.
+        subprocess.Popen([path, url])
+    else:
+        webbrowser.get(exe).open(url)
+
+
+def _win_app_path(exe):
+    """Resolve e.g. msedge.exe via the App Paths registry key (not on PATH by default)."""
+    import winreg
+    name = exe if exe.lower().endswith(".exe") else exe + ".exe"
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(root, rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{name}") as k:
+                return winreg.QueryValueEx(k, "")[0]
+        except OSError:
+            continue
+    return None
+
+
+def login(scopes, open_browser=False, timeout=600, out=sys.stderr, login_hint=None, browser=None):
     """Authorization code flow with PKCE. Prints the URL, waits for the redirect."""
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
@@ -209,17 +241,20 @@ def login(scopes, open_browser=False, timeout=300, out=sys.stderr, login_hint=No
         while not got.is_set():
             server.handle_request()
 
-    threading.Thread(target=serve, daemon=True).start()
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
 
     print("Öppna den här adressen i webbläsaren och logga in:", file=out, flush=True)
     print(url, file=out, flush=True)
-    if open_browser:
-        webbrowser.open(url)
+    if open_browser or browser:
+        open_in_browser(url, browser)
 
     ok = got.wait(timeout)
+    got.set()            # stop the serve loop before closing the socket
+    thread.join(3)
     server.server_close()
     if not ok:
-        raise AuthError("Ingen inloggning inom tidsgränsen.")
+        raise AuthError(f"Ingen inloggning inom {timeout} sekunder.")
 
     if result.get("error"):
         raise AuthError(f"{result['error']}: {result.get('error_description', '')}")

@@ -18,7 +18,7 @@ def cmd_login(a):
         if a.device:
             data = auth.login_device(scopes)
         else:
-            data = auth.login(scopes, open_browser=a.open, timeout=a.timeout, login_hint=a.user)
+            data = auth.login(scopes, open_browser=a.open, timeout=a.timeout, login_hint=a.user, browser=a.browser)
     except auth.AuthError as e:
         print(f"Inloggningen misslyckades: {e}", file=sys.stderr)
         return 1
@@ -99,10 +99,11 @@ def main(argv=None):
 
     s = sub.add_parser("login", help="sign in interactively and cache the token")
     s.add_argument("--scopes", help="comma separated, default is the full list in wsg/scopes.py")
-    s.add_argument("--open", action="store_true", help="open the browser instead of just printing the URL")
+    s.add_argument("--open", action="store_true", help="open the default browser instead of just printing the URL")
+    s.add_argument("--browser", metavar="NAME", help="open in this browser: edge, chrome, firefox, or an executable")
     s.add_argument("--device", action="store_true", help="use device code flow (for machines without a browser)")
     s.add_argument("--user", help="login hint, e.g. name@domain")
-    s.add_argument("--timeout", type=int, default=300)
+    s.add_argument("--timeout", type=int, default=600, help="seconds to wait for the browser, default 600")
     s.set_defaults(fn=cmd_login)
 
     s = sub.add_parser("token", help="print a valid access token, refreshing silently")
