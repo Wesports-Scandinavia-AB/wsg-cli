@@ -7,13 +7,13 @@ are allowed to do.
 ## Install
 
 ```
-pipx install git+https://github.com/tomeo/wsg-cli
+pipx install git+https://github.com/Wesports-Scandinavia-AB/wsg-cli
 ```
 
 or, for development:
 
 ```
-git clone https://github.com/tomeo/wsg-cli
+git clone https://github.com/Wesports-Scandinavia-AB/wsg-cli
 pip install -e wsg-cli
 ```
 
