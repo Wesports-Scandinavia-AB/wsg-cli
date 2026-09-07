@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wsg-cli"
+version = "0.1.0"
+description = "Sign in to Microsoft Graph once, reuse the token from any script."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+wsg = "wsg.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
