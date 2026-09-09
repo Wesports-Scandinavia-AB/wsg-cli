@@ -28,4 +28,8 @@ DEFAULT_SCOPES = [
     "DeviceManagementConfiguration.Read.All",
     "DeviceManagementServiceConfig.Read.All",
     "DeviceManagementServiceConfig.ReadWrite.All",
+    "DeviceManagementScripts.ReadWrite.All",
+    "DeviceManagementApps.ReadWrite.All",
+    # LAPS-lösenord för enskild enhet
+    "DeviceLocalCredential.Read.All",
 ]

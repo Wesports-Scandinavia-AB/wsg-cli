@@ -37,7 +37,17 @@ wsg arena token      prints the Access JWT for Arena
 wsg arena whoami     calls Arena /api/me
 wsg arena get PATH   GET any Arena API path, prints JSON
 wsg arena incidents  open Site Watch incidents and warnings
+wsg arena ack X      acknowledge an incident (id or domain)
+wsg arena resolve X  close an incident, --false-positive, --cause, --learning
+wsg arena reopen X   undo a resolve
 wsg arena logout     deletes the Arena session
+
+wsg intune apps        managed apps with their assignments
+wsg intune app-status  per-user install status for one app
+wsg intune intent      what the service intends for a user on a device
+wsg intune store-app   add a Microsoft Store app (new) by Store id
+wsg intune win32       publish an .intunewin package
+wsg intune sync        ask a device to check in now
 ```
 
 The 0.1 spellings `wsg login`, `wsg token`, `wsg status`, `wsg whoami` and
@@ -131,5 +141,43 @@ warnings (`watch`). Open ones by default; `--status resolved --days 7` for
 last week's, `--severity acute` for incidents only, `--id X` for one incident
 with its timeline, `--json` for scripts. From Python: `arena.incidents()`.
 
+`ack`, `resolve` and `reopen` take an incident id or a domain, as long as the
+domain has exactly one incident in the relevant state. `ack` only needs
+`sitewatch.read`, the other two need `sitewatch.write`. `resolve --cause "..."
+--learning "..."` writes the after-the-fact note in the same go.
+
 Send a real `User-Agent`: the zone's bot rules answer 403 to `Python-urllib`.
 Override the app with `WSG_ARENA_URL`, the binary with `WSG_CLOUDFLARED`.
+
+## Intune
+
+App management over Graph beta, using the same cached token as everything else.
+Needs `DeviceManagementApps.ReadWrite.All` for the write commands and
+`DeviceManagementManagedDevices.ReadWrite.All` for `sync`.
+
+```
+wsg intune apps ChatGPT
+wsg intune store-app 9PLM9XGG6VKS --name ChatGPT --publisher OpenAI --assign all
+wsg intune win32 pkg.intunewin --name "Claude Desktop" --publisher "Anthropic, PBC" \
+    --install "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1" \
+    --uninstall "..." --detect-path "%LOCALAPPDATA%\AnthropicClaude" \
+    --detect-file claude.exe --assign <group-id> --intent required
+```
+
+`--run-as` defaults to `user`, which is what per-user installers need. Squirrel
+and Electron apps unpack into `%LOCALAPPDATA%`; published as `system` they land
+in the SYSTEM profile and the user gets nothing, with no error anywhere.
+
+Detection is always file existence, never a version comparison, because
+self-updating apps drift away from a pinned version on first launch.
+
+`--intent available` only reaches devices that have Company Portal. `required`
+installs through the management extension without it. An empty `app-status`
+means no client has reported yet, which is not the same as "not assigned" —
+`wsg intune intent <user> <device>` is the authoritative check, and it updates
+long before Company Portal's own catalogue does.
+
+Graph beta retires endpoints without notice: `deviceStatuses`, `installSummary`
+and `getDeviceInstallStatusReport` are all gone, which is why `app-status` goes
+through `reports/getUserInstallStatusReport` and why every failure prints the
+Graph error body rather than a bare status code.

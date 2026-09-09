@@ -189,3 +189,39 @@ def incidents(status="active", severity=None, company_id=None, days=None):
 def incident(incident_id):
     """One incident with its event timeline."""
     return get("/api/site-watch/incidents?" + parse.urlencode({"id": incident_id}))
+
+
+def resolve_incident_ref(ref, status="active"):
+    """Accept an incident id (26-char ULID) or a domain. A domain must match exactly
+    one incident with the given status, otherwise AuthError says which ones."""
+    if len(ref) == 26 and ref.isalnum():
+        return ref
+    hits = [r for r in incidents(status=status) if (r.get("domain") or "").lower() == ref.lower()]
+    if len(hits) == 1:
+        return hits[0]["id"]
+    if not hits:
+        raise AuthError(f"Ingen {status} incident för {ref}. Lista med: wsg arena incidents")
+    shown = hits[:6]
+    lines = "\n".join(f"  {h['id']}  {(h.get('openedAt') or '')[:16]}  {h.get('severity')}/{h.get('status')}  {h.get('title')}" for h in shown)
+    more = f"\n  ... och {len(hits) - len(shown)} till (wsg arena incidents --status {status} --json)" if len(hits) > len(shown) else ""
+    raise AuthError(f"{len(hits)} incidenter för {ref}, ange id:\n{lines}{more}")
+
+
+def ack(incident_id):
+    """Acknowledge: stops escalation. Needs sitewatch.read only."""
+    return api("POST", "/api/site-watch/ack", body={"action": "ack", "id": incident_id})
+
+
+def note(incident_id, cause=None, learning=None):
+    """After-the-fact cause / learning note. Needs sitewatch.read only."""
+    return api("POST", "/api/site-watch/ack", body={"action": "note", "id": incident_id, "cause": cause, "learning": learning})
+
+
+def resolve(incident_id, false_positive=False):
+    """Close an incident. Needs sitewatch.write."""
+    return api("POST", "/api/site-watch/mutate", body={"action": "incident.resolve", "id": incident_id, "falsePositive": bool(false_positive)})
+
+
+def reopen(incident_id):
+    """Undo a resolve. Needs sitewatch.write."""
+    return api("POST", "/api/site-watch/mutate", body={"action": "incident.reopen", "id": incident_id})

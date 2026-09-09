@@ -4,7 +4,7 @@ import sys
 import time
 from datetime import datetime
 
-from . import arena, auth
+from . import arena, auth, intune
 from .scopes import DEFAULT_SCOPES
 
 
@@ -195,9 +195,203 @@ def cmd_arena_incidents(a):
     return 0
 
 
+def _incident_action(a, action):
+    """Shared driver for ack / resolve / reopen: resolve the reference, act, report."""
+    try:
+        want = "resolved" if action == "reopen" else "active"
+        iid = arena.resolve_incident_ref(a.incident, status=want)
+        before = (arena.incident(iid) or {}).get("incident") or {}
+        if action == "ack":
+            r = arena.ack(iid)
+        elif action == "reopen":
+            r = arena.reopen(iid)
+        else:
+            r = arena.resolve(iid, false_positive=a.false_positive)
+            if a.cause or a.learning:
+                arena.note(iid, cause=a.cause, learning=a.learning)
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    title = before.get("title") or iid
+    if not (r or {}).get("ok"):
+        was = before.get("status") or "?"
+        print(f"Ingen ändring: {title} är redan {was}.", file=sys.stderr)
+        return 1
+    done = {"ack": "acknowledgad", "resolve": "stängd", "reopen": "återöppnad"}[action]
+    extra = " som falsklarm" if action == "resolve" and a.false_positive else ""
+    print(f"{title}: {done}{extra}. id={iid}")
+    return 0
+
+
+def cmd_arena_ack(a):
+    return _incident_action(a, "ack")
+
+
+def cmd_arena_resolve(a):
+    return _incident_action(a, "resolve")
+
+
+def cmd_arena_reopen(a):
+    return _incident_action(a, "reopen")
+
+
 def cmd_arena_logout(a):
     print("Arena-session borttagen." if arena.logout() else "Ingen Arena-session fanns.")
     return 0
+
+
+def cmd_intune_apps(a):
+    try:
+        rows = intune.apps(a.name)
+    except intune.IntuneError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("Inga appar matchade.")
+        return 0
+    for app in sorted(rows, key=lambda x: (x.get("displayName") or "").casefold()):
+        kind = (app.get("@odata.type") or "").split(".")[-1]
+        print(f"{app['id']}  {app.get('displayName')}  [{kind}]  {app.get('publishingState')}")
+        for asg in app.get("assignments", []):
+            t = asg.get("target") or {}
+            who = t.get("groupId") or (t.get("@odata.type") or "").split(".")[-1]
+            print(f"    {asg.get('intent')} -> {who}")
+    return 0
+
+
+def cmd_intune_app_status(a):
+    try:
+        rows = intune.app_status(a.app_id)
+    except intune.IntuneError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("Ingen klient har rapporterat än. Det betyder inte att tilldelningen saknas -\n"
+              "kör 'wsg intune intent' för att se vad tjänsten avser för en användare.")
+        return 0
+    for r in rows:
+        print(" | ".join(f"{k}={v}" for k, v in r.items() if v not in (None, "")))
+    return 0
+
+
+def cmd_intune_intent(a):
+    try:
+        rows = intune.intent(a.user, a.device)
+    except intune.IntuneError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    for x in rows:
+        print(f"{x.get('displayName')}  |  {x.get('mobileAppIntent')}  |  {x.get('installState')}")
+    return 0
+
+
+def cmd_intune_store_app(a):
+    try:
+        app_id = intune.add_store_app(a.package_id, a.name, a.publisher,
+                                      description=a.description, run_as=a.run_as)
+        print(f"Appen skapad: {app_id}")
+        if a.assign:
+            intune.assign(app_id, a.assign, a.intent,
+                          "#microsoft.graph.winGetAppAssignmentSettings")
+            print(f"Tilldelad {a.assign} som {a.intent}")
+    except intune.IntuneError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_intune_win32(a):
+    def progress(done, total):
+        print(f"\r  laddar upp {done / 1e6:.0f}/{total / 1e6:.0f} MB", end="", file=sys.stderr, flush=True)
+
+    try:
+        app_id = intune.publish_win32(
+            a.package, a.name, a.publisher, a.install, a.uninstall,
+            a.detect_path, a.detect_file, description=a.description,
+            run_as=a.run_as, arch=a.arch, min_os=a.min_os, setup_file=a.setup_file,
+            on_progress=None if a.quiet else progress,
+        )
+        if not a.quiet:
+            print(file=sys.stderr)
+        print(f"Appen publicerad: {app_id}")
+        if a.assign:
+            intune.assign(app_id, a.assign, a.intent,
+                          "#microsoft.graph.win32LobAppAssignmentSettings")
+            print(f"Tilldelad {a.assign} som {a.intent}")
+    except intune.IntuneError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_intune_sync(a):
+    try:
+        intune.sync_device(a.device)
+    except intune.IntuneError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print("Synk begärd. Enheten hämtar tilldelningar vid nästa incheckning.")
+    return 0
+
+
+def _add_intune_commands(sub):
+    s = sub.add_parser("apps", help="list managed apps with their assignments")
+    s.add_argument("name", nargs="?", help="only apps whose display name contains this")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_intune_apps)
+
+    s = sub.add_parser("app-status", help="per-user install status for one app")
+    s.add_argument("app_id")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_intune_app_status)
+
+    s = sub.add_parser("intent", help="what the service intends for a user on a device")
+    s.add_argument("user", help="user object id or UPN")
+    s.add_argument("device", help="Intune managed device id")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_intune_intent)
+
+    s = sub.add_parser("store-app", help="add a Microsoft Store app (new) by Store id")
+    s.add_argument("package_id", help="Store id, e.g. 9PLM9XGG6VKS")
+    s.add_argument("--name", required=True)
+    s.add_argument("--publisher", required=True)
+    s.add_argument("--description")
+    s.add_argument("--run-as", choices=("user", "system"), default="user")
+    s.add_argument("--assign", metavar="GROUP", help="group id, or 'all' for all licensed users")
+    s.add_argument("--intent", choices=("available", "required"), default="available")
+    s.set_defaults(fn=cmd_intune_store_app)
+
+    s = sub.add_parser("win32", help="publish an .intunewin package")
+    s.add_argument("package", help="path to the .intunewin file")
+    s.add_argument("--name", required=True)
+    s.add_argument("--publisher", required=True)
+    s.add_argument("--install", required=True, metavar="CMD", help="install command line")
+    s.add_argument("--uninstall", required=True, metavar="CMD", help="uninstall command line")
+    s.add_argument("--detect-path", required=True, help=r"e.g. %%LOCALAPPDATA%%\AnthropicClaude")
+    s.add_argument("--detect-file", required=True, help="file whose existence means installed")
+    s.add_argument("--description")
+    s.add_argument("--setup-file", help="default: the SetupFile from Detection.xml")
+    s.add_argument("--run-as", choices=("user", "system"), default="user",
+                   help="user (default) for per-user installers under %%LOCALAPPDATA%%")
+    s.add_argument("--arch", default="x64")
+    s.add_argument("--min-os", default="1809")
+    s.add_argument("--assign", metavar="GROUP", help="group id, or 'all' for all licensed users")
+    s.add_argument("--intent", choices=("available", "required"), default="required")
+    s.add_argument("-q", "--quiet", action="store_true", help="no upload progress")
+    s.set_defaults(fn=cmd_intune_win32)
+
+    s = sub.add_parser("sync", help="ask a device to check in now")
+    s.add_argument("device", help="Intune managed device id")
+    s.set_defaults(fn=cmd_intune_sync)
 
 
 def _add_graph_commands(sub, visible=True):
@@ -263,6 +457,23 @@ def _add_arena_commands(sub):
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_arena_incidents)
 
+    ref_help = "incident id, or a domain that has exactly one matching incident"
+
+    s = sub.add_parser("ack", help="acknowledge an incident (stops escalation; sitewatch.read is enough)")
+    s.add_argument("incident", help=ref_help)
+    s.set_defaults(fn=cmd_arena_ack)
+
+    s = sub.add_parser("resolve", help="close an incident (needs sitewatch.write)")
+    s.add_argument("incident", help=ref_help)
+    s.add_argument("--false-positive", action="store_true", help="mark it as a false alarm (feeds threshold tuning)")
+    s.add_argument("--cause", help="what it was, saved on the incident")
+    s.add_argument("--learning", help="what we take with us, saved on the incident")
+    s.set_defaults(fn=cmd_arena_resolve)
+
+    s = sub.add_parser("reopen", help="undo a resolve (needs sitewatch.write)")
+    s.add_argument("incident", help=ref_help)
+    s.set_defaults(fn=cmd_arena_reopen)
+
     s = sub.add_parser("logout", help="delete the cached Access token for Arena")
     s.set_defaults(fn=cmd_arena_logout)
 
@@ -279,13 +490,16 @@ def main(argv=None):
                     "Services: graph (Microsoft Graph via Entra), arena (WeSports Arena via Cloudflare Access).",
     )
     # metavar hides the compatibility aliases from the usage line.
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,arena}")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,arena,intune}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
 
     ar = sub.add_parser("arena", help="WeSports Arena via Cloudflare Access (needs cloudflared)")
     _add_arena_commands(ar.add_subparsers(dest="arena_cmd", required=True))
+
+    it = sub.add_parser("intune", help="Intune app management: list, status, publish Store and Win32 apps")
+    _add_intune_commands(it.add_subparsers(dest="intune_cmd", required=True))
 
     _add_graph_commands(sub, visible=False)   # wsg login / token / status / whoami / logout
 
