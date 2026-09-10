@@ -163,6 +163,140 @@ def cmd_arena_get(a):
     return 0
 
 
+def cmd_arena_companies(a):
+    try:
+        rows = arena.companies()
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.filter:
+        rows = [c for c in rows if a.filter.lower() in json.dumps(c, ensure_ascii=False).lower()]
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    for c in rows:
+        print(f"{c['id']:<24} {c.get('legal_name') or '':<38} {c.get('org_no') or '':<12} {c.get('group_role') or ''}")
+    print(f"{len(rows)} bolag", file=sys.stderr)
+    return 0
+
+
+def cmd_arena_integrations(a):
+    try:
+        co = arena.resolve_company(a.company)
+        rows = arena.integrations(co)
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print(f"Inga integrationer på {co}.")
+        return 0
+    for i in rows:
+        cfg = json.dumps(i.get("config") or {}, ensure_ascii=False)
+        flag = "" if i.get("enabled", True) else "  [avstängd]"
+        print(f"{i.get('key'):<18} {i.get('instance'):<14} {cfg}{flag}")
+        if a.verbose:
+            print(f"{'':18} id={i.get('id')}")
+    return 0
+
+
+def cmd_arena_integration_add(a):
+    try:
+        co = arena.resolve_company(a.company)
+        config = json.loads(a.config) if a.config else None
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    except ValueError as e:
+        print(f"--config är inte giltig JSON: {e}", file=sys.stderr)
+        return 2
+    if config is not None and not isinstance(config, dict):
+        print("--config måste vara ett JSON-objekt", file=sys.stderr)
+        return 2
+    try:
+        r = arena.create_integration(co, a.key, a.instance, config=config, label=a.label)
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    i = r.get("integration") or {}
+    print(f"Skapad: {i.get('key')} · {i.get('instance')} på {co}")
+    print(f"id={i.get('id')}")
+    return 0
+
+
+def cmd_arena_secrets(a):
+    try:
+        co = arena.resolve_company(a.company)
+        rows = arena.secrets(co)
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print(f"Inga secrets på {co}.")
+        return 0
+    for r in rows:
+        # No value is ever returned by the API, so there is nothing here to redact.
+        link = r.get("integration_id") or r.get("integrationId") or ""
+        print(f"{r.get('name'):<34} {(r.get('hint') or ''):<14} {(r.get('updated_at') or r.get('updatedAt') or '')[:16]}  {link}")
+    return 0
+
+
+def cmd_arena_secret_set(a):
+    """Store or rotate one secret. The value is read from STDIN and never from argv:
+    an argument lands in shell history and in the process list, and this is a
+    credential. There is deliberately no --value flag."""
+    try:
+        co = arena.resolve_company(a.company)
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if sys.stdin.isatty():
+        import getpass
+        value = getpass.getpass(f"Värde för {a.name} på {co} (visas inte): ")
+    else:
+        # A trailing newline from a pipe or heredoc is the shell's, not the secret's.
+        # Anything else is kept: some credentials legitimately contain whitespace.
+        value = sys.stdin.read()
+        # Exactly one trailing line ending is removed, because it belongs to the
+        # pipe or heredoc rather than to the secret. Anything beyond that is kept:
+        # a credential may legitimately end in whitespace, and silently trimming it
+        # would store something that does not authenticate.
+        for eol in (chr(13) + chr(10), chr(10), chr(13)):
+            if value.endswith(eol):
+                value = value[: -len(eol)]
+                break
+    if not value:
+        print("Tomt värde, avbryter.", file=sys.stderr)
+        return 2
+    existing = {}
+    try:
+        existing = {r.get("name"): r for r in arena.secrets(co)}
+    except auth.AuthError:
+        pass
+    verb = "Roterar" if a.name in existing else "Skapar"
+    if a.dry_run:
+        print(f"[torrkörning] {verb} {a.name} på {co}"
+              + (f", länkad till integration {a.integration}" if a.integration else "")
+              + f" ({len(value)} tecken, inget skickat)")
+        return 0
+    try:
+        r = arena.set_secret(co, a.name, value,
+                             description=a.description, integration_id=a.integration)
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    sec = r.get("secret") or {}
+    print(f"{verb[:-1]}d: {a.name} på {co}"
+          + (f"  hint={sec.get('hint')}" if sec.get("hint") else ""))
+    print("Värdet kan inte läsas tillbaka. Rotera genom att köra kommandot igen.", file=sys.stderr)
+    return 0
+
+
 def cmd_arena_incidents(a):
     try:
         if a.id:
@@ -446,6 +580,40 @@ def _add_arena_commands(sub):
     s.add_argument("path")
     s.add_argument("--compact", action="store_true", help="one-line JSON")
     s.set_defaults(fn=cmd_arena_get)
+
+    s = sub.add_parser("companies", help="list the companies in the registry (id, legal name, org no)")
+    s.add_argument("--filter", help="substring match anywhere in the row")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_arena_companies)
+
+    co_help = "company id (co_vartex) or a unique fragment of its legal name"
+
+    s = sub.add_parser("integrations", help="integration rows for one company (config is cleartext, credentials are not here)")
+    s.add_argument("--company", required=True, metavar="REF", help=co_help)
+    s.add_argument("-v", "--verbose", action="store_true", help="also print the row id")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_arena_integrations)
+
+    s = sub.add_parser("integration-add", help="create an integration row (needs company.secrets.write)")
+    s.add_argument("--company", required=True, metavar="REF", help=co_help)
+    s.add_argument("--key", required=True, help="platform key from the catalog, e.g. garp")
+    s.add_argument("--instance", required=True, help="instance slug, unique per (company, key)")
+    s.add_argument("--config", help="JSON object of the non-secret config fields")
+    s.add_argument("--label", help="free-text label shown in the UI")
+    s.set_defaults(fn=cmd_arena_integration_add)
+
+    s = sub.add_parser("secrets", help="secret NAMES and metadata for one company — values are never returned")
+    s.add_argument("--company", required=True, metavar="REF", help=co_help)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_arena_secrets)
+
+    s = sub.add_parser("secret-set", help="store or rotate a secret; the VALUE is read from stdin, never from an argument")
+    s.add_argument("--company", required=True, metavar="REF", help=co_help)
+    s.add_argument("--name", required=True, help="secret name, env-var style, e.g. GARP_DB_PASSWORD")
+    s.add_argument("--integration", metavar="ID", help="link it to an integration row id")
+    s.add_argument("--description", help="what this credential is, shown in the UI")
+    s.add_argument("--dry-run", action="store_true", help="say what would be written, send nothing")
+    s.set_defaults(fn=cmd_arena_secret_set)
 
     s = sub.add_parser("incidents", help="Site Watch incidents (acute) and warnings (watch); open ones by default")
     s.add_argument("--status", default="active", help="active (default, = not resolved), open, acknowledged, resolved, all")

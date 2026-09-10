@@ -168,6 +168,104 @@ def get(path, **kw):
     return api("GET", path, **kw)
 
 
+# ── Companies, integrations and the secrets vault ─────────────────────────────
+# The vault is the most sensitive surface this CLI touches: company.secrets.write at
+# group scope, every write audited server-side. Two rules hold the whole design.
+#
+# A VALUE NEVER PASSES THROUGH ARGV. `set_secret` takes it as a parameter and the CLI
+# only ever fills that from stdin, because an argument is visible in shell history and,
+# on a shared box, in the process list. That is also why there is no --value flag to
+# forget: the safe path is the only path.
+#
+# A VALUE NEVER COMES BACK. The API returns metadata only — id, name, hint, timestamps
+# — so nothing here can print a credential even by accident, and rotation is the same
+# call as creation rather than a read-modify-write.
+
+
+def companies():
+    """Every company in the registry: id, legal_name, org_no, group_role."""
+    return get("/api/companies").get("companies") or []
+
+
+def resolve_company(ref):
+    """Accept a company id or a case-insensitive fragment of its legal name.
+
+    An id is taken as given — the caller may know one this listing does not show.
+    A fragment must match exactly one company, otherwise the error names the
+    candidates rather than picking for you: these calls write to a named company's
+    vault, and the wrong one is not a typo you notice afterwards.
+    """
+    rows = companies()
+    by_id = {c["id"]: c for c in rows}
+    if ref in by_id:
+        return ref
+    hits = [c for c in rows if ref.lower() in (c.get("legal_name") or "").lower()]
+    if len(hits) == 1:
+        return hits[0]["id"]
+    if not hits:
+        raise AuthError(f"Inget bolag matchar {ref!r}. Lista med: wsg arena companies")
+    lines = chr(10).join(f"  {c['id']}  {c.get('legal_name')}" for c in hits[:8])
+    raise AuthError(f"{len(hits)} bolag matchar {ref!r}, ange id:" + chr(10) + lines)
+
+
+def integrations(company_id):
+    """Integration rows for one company. Config is cleartext; credentials are not here."""
+    return get("/api/companies/integrations?" + parse.urlencode({"companyId": company_id})).get("integrations") or []
+
+
+def create_integration(company_id, key, instance, config=None, label=None):
+    """Create one integration row. `key` must be a platform the catalog knows —
+    an unknown key is accepted by the API's regex and then never pulled by anything."""
+    body = {"action": "create", "companyId": company_id, "key": key, "instance": instance}
+    if config is not None:
+        body["config"] = config
+    if label is not None:
+        body["label"] = label
+    return api("POST", "/api/companies/integrations", body=body)
+
+
+def update_integration(company_id, integration_id, config=None, label=None, enabled=None):
+    """Partial patch: an omitted field is left alone, which is also the API's contract."""
+    body = {"action": "update", "companyId": company_id, "id": integration_id}
+    if config is not None:
+        body["config"] = config
+    if label is not None:
+        body["label"] = label
+    if enabled is not None:
+        body["enabled"] = bool(enabled)
+    return api("POST", "/api/companies/integrations", body=body)
+
+
+def secrets(company_id):
+    """Secret METADATA for one company — never a value. Names, hints, who and when."""
+    return get("/api/companies/secrets?" + parse.urlencode({"companyId": company_id})).get("secrets") or []
+
+
+def set_secret(company_id, name, value, description=None, integration_id=None):
+    """Store or rotate one secret. Same call either way, because a stored value cannot
+    be read back to modify.
+
+    `integration_id` is a PARTIAL PATCH on the server: omitting it leaves an existing
+    link alone, and passing None explicitly detaches. So rotating a credential from a
+    script cannot silently orphan it, which is a bug the API itself once had.
+    """
+    if not value:
+        raise AuthError("tomt värde — vägrar skriva en tom secret")
+    body = {"action": "set", "companyId": company_id, "name": name, "value": value}
+    if description is not None:
+        body["description"] = description
+    if integration_id is not None:
+        body["integrationId"] = integration_id
+    return api("POST", "/api/companies/secrets", body=body)
+
+
+def attach_secret(company_id, name, integration_id):
+    """Re-parent an existing secret without knowing its value. `None` detaches."""
+    return api("POST", "/api/companies/secrets",
+               body={"action": "attach", "companyId": company_id, "name": name,
+                     "integrationId": integration_id})
+
+
 # ── Site Watch ────────────────────────────────────────────────────────────────
 # monitor_incident: severity acute|watch|info, status open|acknowledged|resolved.
 # "active" is the API's shorthand for status <> resolved.

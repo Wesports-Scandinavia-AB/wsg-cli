@@ -36,6 +36,11 @@ wsg arena status     who is signed in to Arena, session expiry
 wsg arena token      prints the Access JWT for Arena
 wsg arena whoami     calls Arena /api/me
 wsg arena get PATH   GET any Arena API path, prints JSON
+wsg arena companies      the registry: id, legal name, org no
+wsg arena integrations   integration rows for one company
+wsg arena integration-add    create one (--key, --instance, --config JSON)
+wsg arena secrets        secret names and metadata — never a value
+wsg arena secret-set     store or rotate a secret, value read from stdin
 wsg arena incidents  open Site Watch incidents and warnings
 wsg arena ack X      acknowledge an incident (id or domain)
 wsg arena resolve X  close an incident, --false-positive, --cause, --learning
@@ -135,6 +140,36 @@ from wsg import arena
 me = arena.get("/api/me")             # raises AuthError if login is needed
 arena.api("POST", "/api/...", body={...})
 ```
+
+## The secrets vault
+
+`secret-set` stores or rotates one credential in a company's vault. It needs
+`company.secrets.write` at group scope, and Arena audits every write.
+
+**The value is read from stdin and there is no `--value` flag.** An argument is
+visible in shell history and, on a shared machine, in the process list — so the
+safe path is the only path. Piped in, exactly one trailing line ending is stripped
+(the shell's, not the secret's); on a terminal you are prompted without echo.
+
+```
+wsg arena integration-add --company co_vartex --key garp --instance nps_zidcore     --config '{"db_host":"…","db_port":"1433","db_name":"…"}'
+
+printf '%s' "$PASSWORD" | wsg arena secret-set --company co_vartex     --name GARP_DB_PASSWORD --integration 01M2… --dry-run
+```
+
+`--dry-run` says whether it would create or rotate, and how many characters it
+read, without sending anything. Use it first: a value that arrived truncated or
+with a stray newline authenticates nowhere, and the vault cannot be read back to
+check.
+
+A stored value never comes back — the API returns metadata only (name, a short
+hint, timestamps). Rotation is the same command as creation. `--integration` is a
+partial patch server-side: omitting it leaves an existing link alone, so rotating
+a credential cannot silently orphan it.
+
+`--company` takes an id (`co_vartex`) or a unique fragment of a legal name. An
+ambiguous fragment lists the candidates and refuses, because these commands write
+to a named company's vault and the wrong one is not a mistake you notice later.
 
 `wsg arena incidents` lists Site Watch incidents (severity `acute`) and
 warnings (`watch`). Open ones by default; `--status resolved --days 7` for
