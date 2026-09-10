@@ -297,6 +297,64 @@ def cmd_arena_secret_set(a):
     return 0
 
 
+def cmd_arena_consumers(a):
+    try:
+        rows = arena.consumers()
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    for c in rows:
+        if a.consumer and a.consumer not in (c.get("slug"), c.get("id")):
+            continue
+        print(f"{c.get('slug')}  id={c.get('id')}")
+        for g in c.get("grants") or []:
+            print(f"    secret    {g.get('company_id')}  {g.get('secret_name')}")
+        for g in c.get("platformGrants") or c.get("platform_grants") or []:
+            # Group-wide by construction: this shape has no company column.
+            print(f"    platform  every company  key={g.get('integration_key')}")
+    return 0
+
+
+def cmd_arena_grant(a):
+    remove = a.fn_action == "remove"
+    shapes = [bool(a.key and a.all_companies), bool(a.key and a.company), bool(a.secret and a.company)]
+    if sum(shapes) != 1:
+        print("Ange exakt en form: --key med --all-companies, --key med --company, "
+              "eller --secret med --company.", file=sys.stderr)
+        return 2
+    try:
+        consumer = arena.resolve_consumer(a.consumer)
+        company = arena.resolve_company(a.company) if a.company else None
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    what = (f"plattformsgrant {a.key} för ALLA bolag" if a.all_companies
+            else f"integrationsgrant {a.key} på {company}" if a.key
+            else f"secret {a.secret} på {company}")
+    if a.dry_run:
+        print(f"[torrkörning] Skulle {'ta bort' if remove else 'ge'} {consumer['slug']}: {what}")
+        return 0
+    try:
+        r = arena.grant(consumer["id"], integration_key=a.key, secret_name=a.secret,
+                        company_id=company, all_companies=a.all_companies, remove=remove)
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    changed = r.get("added") if not remove else r.get("removed")
+    verb = "Borttagen" if remove else "Given"
+    if changed is False:
+        print(f"Oförändrad — {consumer['slug']} hade redan detta läge: {what}")
+    else:
+        print(f"{verb}: {consumer['slug']} → {what}")
+    if a.all_companies and not remove:
+        print("Plattformsgrant gäller även bolag som läggs till senare, utan ny åtgärd.",
+              file=sys.stderr)
+    return 0
+
+
 def cmd_arena_incidents(a):
     try:
         if a.id:
@@ -614,6 +672,28 @@ def _add_arena_commands(sub):
     s.add_argument("--description", help="what this credential is, shown in the UI")
     s.add_argument("--dry-run", action="store_true", help="say what would be written, send nothing")
     s.set_defaults(fn=cmd_arena_secret_set)
+
+    s = sub.add_parser("consumers", help="machine consumers (Access service tokens) and what they may read")
+    s.add_argument("--consumer", metavar="SLUG", help="show only this one")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_arena_consumers)
+
+    def _grant_args(s):
+        s.add_argument("--consumer", required=True, metavar="SLUG", help="consumer slug or id")
+        s.add_argument("--key", help="platform key, e.g. garp")
+        s.add_argument("--company", metavar="REF", help=co_help)
+        s.add_argument("--secret", metavar="NAME", help="a single secret name")
+        s.add_argument("--all-companies", action="store_true",
+                       help="with --key: every company that has this platform, including future ones")
+        s.add_argument("--dry-run", action="store_true", help="say what would change, send nothing")
+
+    s = sub.add_parser("grant-add", help="let a machine consumer read secrets (needs company.secrets.write)")
+    _grant_args(s)
+    s.set_defaults(fn=cmd_arena_grant, fn_action="add")
+
+    s = sub.add_parser("grant-remove", help="withdraw a machine consumer's grant")
+    _grant_args(s)
+    s.set_defaults(fn=cmd_arena_grant, fn_action="remove")
 
     s = sub.add_parser("incidents", help="Site Watch incidents (acute) and warnings (watch); open ones by default")
     s.add_argument("--status", default="active", help="active (default, = not resolved), open, acknowledged, resolved, all")

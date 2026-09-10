@@ -266,6 +266,47 @@ def attach_secret(company_id, name, integration_id):
                      "integrationId": integration_id})
 
 
+# ── Machine consumers and their grants ────────────────────────────────────────
+# Who may read the vault over the machine API, and how widely. Three shapes exist
+# server-side, narrowest first: one secret, one company's integration, or a PLATFORM
+# grant covering every company that has an integration with that key.
+#
+# A platform grant is the wide one and it keeps widening: it covers companies
+# onboarded AFTER it was given, with no edit and no notification. That is the point
+# for a pipeline that runs group-wide, and the reason this function makes you pass
+# all_companies explicitly rather than inferring it from a missing company.
+
+
+def consumers():
+    """Machine consumers with their grants. Metadata only — no secret values."""
+    return get("/api/machine-admin/consumers").get("consumers") or []
+
+
+def resolve_consumer(ref):
+    """Accept a consumer id or its slug."""
+    rows = consumers()
+    for c in rows:
+        if c.get("id") == ref or c.get("slug") == ref:
+            return c
+    known = ", ".join(sorted(c.get("slug") or "?" for c in rows))
+    raise AuthError(f"Ingen consumer {ref!r}. Finns: {known}")
+
+
+def grant(consumer_id, *, integration_key=None, secret_name=None, company_id=None,
+          all_companies=False, remove=False):
+    """Add or remove one grant. Exactly one shape per call, which the API enforces."""
+    body = {"action": "remove" if remove else "add", "consumerId": consumer_id}
+    if all_companies:
+        body["allCompanies"] = True
+    if company_id:
+        body["companyId"] = company_id
+    if integration_key:
+        body["integrationKey"] = integration_key
+    if secret_name:
+        body["name"] = secret_name
+    return api("POST", "/api/machine-admin/grants", body=body)
+
+
 # ── Site Watch ────────────────────────────────────────────────────────────────
 # monitor_incident: severity acute|watch|info, status open|acknowledged|resolved.
 # "active" is the API's shorthand for status <> resolved.

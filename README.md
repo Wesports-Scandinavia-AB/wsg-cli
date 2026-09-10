@@ -41,6 +41,8 @@ wsg arena integrations   integration rows for one company
 wsg arena integration-add    create one (--key, --instance, --config JSON)
 wsg arena secrets        secret names and metadata — never a value
 wsg arena secret-set     store or rotate a secret, value read from stdin
+wsg arena consumers      machine consumers and what they may read
+wsg arena grant-add      let a consumer read secrets (grant-remove withdraws)
 wsg arena incidents  open Site Watch incidents and warnings
 wsg arena ack X      acknowledge an incident (id or domain)
 wsg arena resolve X  close an incident, --false-positive, --cause, --learning
@@ -170,6 +172,25 @@ a credential cannot silently orphan it.
 `--company` takes an id (`co_vartex`) or a unique fragment of a legal name. An
 ambiguous fragment lists the candidates and refuses, because these commands write
 to a named company's vault and the wrong one is not a mistake you notice later.
+
+## Machine grants
+
+`grant-add` decides what a machine consumer (a Dagster pipeline, say) may read from
+the vault. Three shapes, narrowest first:
+
+```
+--secret NAME --company REF     one secret
+--key KEY --company REF         every secret linked to that company's integration
+--key KEY --all-companies       the same, for every company that has that platform
+```
+
+The last one is wide and stays wide: it covers companies onboarded **after** the
+grant, with no edit and no notification. That is the point for a pipeline that runs
+group-wide, and the reason `--all-companies` has to be typed rather than inferred
+from an omitted `--company`. `--dry-run` prints what would change and sends nothing.
+
+Both wider shapes resolve when the secret is read, so a disabled integration
+delivers nothing and revoking is immediate.
 
 `wsg arena incidents` lists Site Watch incidents (severity `acute`) and
 warnings (`watch`). Open ones by default; `--status resolved --days 7` for
