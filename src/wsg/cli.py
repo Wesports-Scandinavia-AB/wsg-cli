@@ -3,6 +3,7 @@ import json
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from . import arena, auth, intune
 from .scopes import DEFAULT_SCOPES
@@ -85,6 +86,102 @@ def cmd_graph_whoami(a):
 
 def cmd_graph_logout(a):
     print("Cache borttagen." if auth.logout() else "Ingen cache fanns.")
+    return 0
+
+
+def cmd_graph_sendmail(a):
+    """Send mail as the signed-in user via POST /me/sendMail.
+
+    NOT a draft and not the M365 connector: sendMail delivers, and a copy lands in
+    Sent Items unless --no-save. The body is read from stdin, the same way secret-set
+    reads a value — a message worth sending is longer than an argument should be, and
+    a here-doc keeps line breaks intact where a shell argument mangles them.
+
+    Attachments go inline as #microsoft.graph.fileAttachment, base64 in contentBytes,
+    which is why Graph caps the whole request at roughly 3 MB. Above that the file has
+    to go up through createUploadSession against a draft, or into OneDrive as a link —
+    neither of which this command pretends to do, so it refuses up front instead of
+    failing halfway with an error nobody can act on.
+    """
+    import base64
+    import mimetypes
+
+    recipients = [x.strip() for x in (a.to or "").split(",") if x.strip()]
+    cc = [x.strip() for x in (a.cc or "").split(",") if x.strip()]
+    if not recipients:
+        print("--to kraver minst en adress (kommaseparerat for flera)", file=sys.stderr)
+        return 2
+    if sys.stdin.isatty():
+        print("Brodtexten lases fran stdin. Pipa in den, t.ex. med en here-doc.", file=sys.stderr)
+        return 2
+    body_text = sys.stdin.read()
+    if not body_text.strip():
+        print("Tom brodtext, avbryter.", file=sys.stderr)
+        return 2
+
+    attachments = []
+    total = 0
+    for path in a.attach or []:
+        f = Path(path)
+        if not f.is_file():
+            print(f"Bilagan finns inte: {path}", file=sys.stderr)
+            return 2
+        raw = f.read_bytes()
+        total += len(raw)
+        ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+        attachments.append({
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": f.name,
+            "contentType": ctype,
+            "contentBytes": base64.b64encode(raw).decode(),
+        })
+    # Base64 costs a third on top, and Graph rejects the whole request rather than the
+    # attachment, so the limit is checked against the ENCODED size before sending.
+    if total * 4 // 3 > 3 * 1024 * 1024:
+        print(f"Bilagorna ar {total // 1024} kB, for stort for ett inline-utskick "
+              "(~3 MB efter base64). Lagg filen i OneDrive och skicka en lank.",
+              file=sys.stderr)
+        return 2
+
+    message = {
+        "subject": a.subject or "",
+        "body": {"contentType": "HTML" if a.html else "Text", "content": body_text},
+        "toRecipients": [{"emailAddress": {"address": x}} for x in recipients],
+    }
+    if cc:
+        message["ccRecipients"] = [{"emailAddress": {"address": x}} for x in cc]
+    if attachments:
+        message["attachments"] = attachments
+    payload = {"message": message, "saveToSentItems": not a.no_save}
+
+    if a.dry_run:
+        preview = dict(message)
+        if attachments:
+            # The base64 never helps a human read the plan; the size does.
+            preview["attachments"] = [
+                {"name": att["name"], "contentType": att["contentType"],
+                 "base64Bytes": len(att["contentBytes"])}
+                for att in attachments
+            ]
+        print("[torrkorning] POST /me/sendMail - inget skickat")
+        print(json.dumps({"message": preview, "saveToSentItems": payload["saveToSentItems"]},
+                         indent=2, ensure_ascii=False))
+        return 0
+
+    try:
+        auth.graph("POST", "/me/sendMail", body=payload)
+    except Exception as e:  # urllib raises HTTPError; its body carries Graph's reason
+        detail = ""
+        read = getattr(e, "read", None)
+        if callable(read):
+            try:
+                detail = ": " + read().decode(errors="replace")[:400]
+            except Exception:
+                detail = ""
+        print(f"Sandningen misslyckades{detail or ': ' + str(e)}", file=sys.stderr)
+        return 2
+    print(f"Skickat till {', '.join(recipients)}"
+          + ("" if a.no_save else " (kopia i Skickat)"))
     return 0
 
 
@@ -613,6 +710,17 @@ def _add_graph_commands(sub, visible=True):
 
     s = sub.add_parser("whoami", **h("call Graph /me"))
     s.set_defaults(fn=cmd_graph_whoami)
+
+    s = sub.add_parser("sendmail", **h("send mail as yourself via /me/sendMail; body read from stdin"))
+    s.add_argument("--to", required=True, help="recipient, or several comma-separated")
+    s.add_argument("--cc", help="cc recipients, comma-separated")
+    s.add_argument("--subject", required=True)
+    s.add_argument("--attach", action="append", metavar="FILE",
+                   help="attach a file inline (repeatable; ~3 MB total after base64)")
+    s.add_argument("--html", action="store_true", help="send the body as HTML instead of plain text")
+    s.add_argument("--no-save", action="store_true", help="do not keep a copy in Sent Items")
+    s.add_argument("--dry-run", action="store_true", help="print the exact request and send nothing")
+    s.set_defaults(fn=cmd_graph_sendmail)
 
     s = sub.add_parser("logout", **h("delete the cached token"))
     s.set_defaults(fn=cmd_graph_logout)

@@ -29,6 +29,7 @@ wsg graph login      prints a URL, open it in your browser, sign in
 wsg graph status     who is signed in, token expiry, granted scopes
 wsg graph token      prints an access token, refreshed silently
 wsg graph whoami     calls Graph /me
+wsg graph sendmail   send mail as yourself, body from stdin, --dry-run first
 wsg graph logout     deletes the cache
 
 wsg arena login      sign in to WeSports Arena through Cloudflare Access
@@ -142,6 +143,30 @@ from wsg import arena
 me = arena.get("/api/me")             # raises AuthError if login is needed
 arena.api("POST", "/api/...", body={...})
 ```
+
+## Sending mail
+
+`sendmail` posts to `/me/sendMail` as the signed-in user. It delivers — it does not
+create a draft — and keeps a copy in Sent Items unless you pass `--no-save`.
+
+```
+wsg graph sendmail --to someone@example.com --subject "Subject" --dry-run <<'EOF'
+Body here, line breaks intact.
+EOF
+```
+
+The body is read from stdin so a here-doc keeps its formatting, which a shell
+argument would mangle. `--dry-run` prints the exact request and sends nothing; use
+it first, because there is no unsend.
+
+Attachments go inline as `#microsoft.graph.fileAttachment` with base64 in
+`contentBytes`, so Graph caps the whole request at roughly 3 MB. `--attach` is
+repeatable and the limit is checked against the *encoded* size before sending —
+base64 costs a third on top, and Graph rejects the entire request rather than the
+attachment. Above that ceiling the file needs `createUploadSession` against a draft,
+or OneDrive and a link; this command refuses up front rather than failing halfway.
+
+Needs `Mail.Send`, which is in the default scope set.
 
 ## The secrets vault
 
