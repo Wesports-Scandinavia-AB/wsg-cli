@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import arena, auth, intune
+from . import arena, auth, intune, users
 from .scopes import DEFAULT_SCOPES
 
 
@@ -683,6 +683,267 @@ def _add_intune_commands(sub):
     s.set_defaults(fn=cmd_intune_sync)
 
 
+def _ts(s, with_time=True):
+    """Graph timestamps are ISO 8601 in UTC; show them as local wall clock."""
+    if not s:
+        return "-"
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return s
+    return d.strftime("%Y-%m-%d %H:%M" if with_time else "%Y-%m-%d")
+
+
+def _age(s):
+    if not s:
+        return ""
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    days = (datetime.now(d.tzinfo) - d).days
+    return f" ({days} dagar sedan)" if days >= 1 else " (idag)"
+
+
+def cmd_user_find(a):
+    try:
+        rows = users.find(a.query, limit=a.top)
+    except users.UserError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("Ingen användare matchade.")
+        return 0
+    for u in sorted(rows, key=lambda x: (x.get("displayName") or "").casefold()):
+        state = "aktivt" if u.get("accountEnabled") else "BLOCKERAT"
+        print(f"{state:<11}{u.get('displayName')}  <{u.get('userPrincipalName')}>  {u.get('id')}")
+    return 0
+
+
+def cmd_user_show(a):
+    try:
+        u = users.resolve(a.user)
+        lic = users.licenses(u["id"])
+        mgr = users.manager(u["id"])
+        methods = users.auth_methods(u["id"]) if a.auth_methods else None
+        recent, window = ([], None) if a.no_audit else users.audits(u["id"], days=a.days, limit=5)
+    except users.UserError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps({"user": u, "licenses": lic, "manager": mgr,
+                          "authMethods": methods, "recentAudits": recent},
+                         indent=2, ensure_ascii=False))
+        return 0
+
+    sia = u.get("signInActivity") or {}
+    synced = u.get("onPremisesSyncEnabled")
+    rows = [
+        ("konto", "AKTIVERAT" if u.get("accountEnabled") else "BLOCKERAT (inloggning spärrad)"),
+        ("id", u.get("id")),
+        ("upn", u.get("userPrincipalName")),
+        ("mail", u.get("mail")),
+        ("typ", f"{u.get('userType') or '?'}, "
+                + ("synkat från lokalt AD" if synced else "molnkonto")),
+        ("titel", " / ".join(x for x in (u.get("jobTitle"), u.get("department"),
+                                         u.get("companyName")) if x)),
+        ("chef", f"{mgr.get('displayName')} <{mgr.get('userPrincipalName')}>" if mgr else "-"),
+        ("anställd", u.get("employeeId")),
+        ("slutdatum", _ts(u.get("employeeLeaveDateTime"), False)
+                      if u.get("employeeLeaveDateTime") else None),
+        ("skapat", _ts(u.get("createdDateTime"))),
+        ("lösenord ändrat", _ts(u.get("lastPasswordChangeDateTime"))
+                            + _age(u.get("lastPasswordChangeDateTime"))),
+        # lastSignIn* count attempts, failed ones included; only lastSuccessful*
+        # says the account actually let someone in.
+        ("senast lyckad inloggning", _ts(sia.get("lastSuccessfulSignInDateTime"))
+                                     + _age(sia.get("lastSuccessfulSignInDateTime"))),
+        ("senaste försök", _ts(sia.get("lastSignInDateTime"))
+                           + _age(sia.get("lastSignInDateTime"))),
+        ("  varav token/app", _ts(sia.get("lastNonInteractiveSignInDateTime"))
+                              + _age(sia.get("lastNonInteractiveSignInDateTime"))),
+        ("licenser", ", ".join(x.get("skuPartNumber") or "?" for x in lic) or "inga"),
+        ("licenser borttagna", _ts(users.offboarded(u)) + _age(users.offboarded(u))
+                               if users.offboarded(u) else None),
+        ("sessioner spärrade", _ts(u.get("signInSessionsValidFromDateTime"))
+                               + _age(u.get("signInSessionsValidFromDateTime"))),
+        ("sam-konto", u.get("onPremisesSamAccountName")),
+        ("senaste synk", _ts(u.get("onPremisesLastSyncDateTime")) if synced else None),
+        ("ou", u.get("onPremisesDistinguishedName")),
+    ]
+    if u.get("proxyAddresses") and a.verbose:
+        rows.append(("adresser", ", ".join(u["proxyAddresses"])))
+    if methods is not None:
+        kinds = sorted({(m.get("@odata.type") or "").split(".")[-1] for m in methods})
+        rows.append(("mfa-metoder", ", ".join(kinds) or "inga"))
+    elif a.auth_methods:
+        rows.append(("mfa-metoder", "kunde inte läsas - kräver scope "
+                                    "UserAuthenticationMethod.Read.All"))
+
+    rows = [(k, v) for k, v in rows if v not in (None, "", "-")]
+    w = max(len(k) for k, _ in rows) + 2
+    print(f"{u.get('displayName')}")
+    for label, value in rows:
+        print(f"  {label:<{w}}{value}")
+
+    if not u.get("accountEnabled") and synced:
+        print("\nKontot är synkat från lokalt AD. Spärren sattes då nästan säkert i AD -\n"
+              "Entra-loggen visar bara AD Connect som skrev över värdet.")
+    if recent:
+        print(f"\nSenaste ändringar (sedan {_ts(window, False)}):")
+        _print_audits(recent, verbose=False)
+        print(f"\n  Hela historiken: wsg user audit {u.get('userPrincipalName')}")
+    elif not a.no_audit:
+        print(f"\nInga katalogändringar loggade sedan {_ts(window, False)}.")
+    return 0
+
+
+def _print_audits(rows, verbose=True):
+    for r in rows:
+        head = (f"{_ts(r.get('activityDateTime'))}  {r.get('activityDisplayName')}"
+                f"  av {users.audit_initiator(r)}")
+        result = r.get("result")
+        if result and result != "success":
+            head += f"  [{result}]"
+        print(f"  {head}")
+        for target, prop, old, new in users.audit_changes(r):
+            if not verbose and prop in ("Included Updated Properties", "TargetId.UserType"):
+                continue
+            arrow = f"{old or '(tomt)'} -> {new or '(tomt)'}" if old != new else (new or "")
+            # A consent record carries every scope twice; unabridged it buries the
+            # rest of the trail.
+            if not verbose and len(arrow) > 160:
+                arrow = arrow[:160] + f"… (+{len(arrow) - 160} tecken, -v för allt)"
+            print(f"      {prop}: {arrow}")
+        if verbose and r.get("additionalDetails"):
+            extra = ", ".join(f"{d.get('key')}={d.get('value')}"
+                              for d in r["additionalDetails"] if d.get("value"))
+            if extra:
+                print(f"      ({extra})")
+
+
+def cmd_user_audit(a):
+    try:
+        u = users.resolve(a.user)
+        rows, window = users.audits(u["id"], days=a.days, limit=a.top,
+                                    as_initiator=a.by_user)
+    except users.UserError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    what = "Ändringar gjorda AV" if a.by_user else "Ändringar PÅ"
+    print(f"{what} {u.get('displayName')} <{u.get('userPrincipalName')}>, "
+          f"sedan {_ts(window, False)}: {len(rows)} poster")
+    if not rows:
+        print("Inga poster. Katalogloggen sparas 30 dagar med Entra ID P1/P2, annars 7 -\n"
+              "en äldre ändring finns inte kvar att hämta ur Entra.")
+        return 0
+    _print_audits(rows, verbose=a.verbose)
+    return 0
+
+
+def cmd_user_signins(a):
+    try:
+        u = users.resolve(a.user)
+        rows, window = users.signins(u["id"], days=a.days, limit=a.top,
+                                     failed_only=a.failed, kinds=a.kinds)
+    except users.UserError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print(f"Inga inloggningar loggade sedan {_ts(window, False)}.")
+        return 0
+    for r in rows:
+        st = r.get("status") or {}
+        loc = r.get("location") or {}
+        where = ", ".join(x for x in (loc.get("city"), loc.get("countryOrRegion")) if x)
+        verdict = "ok" if st.get("errorCode") == 0 else f"FEL {st.get('errorCode')}"
+        kind = "interaktiv" if "interactiveUser" in (r.get("signInEventTypes") or []) else "token"
+        print(f"{_ts(r.get('createdDateTime'))}  {verdict:<9} {kind:<11}"
+              f"{r.get('appDisplayName')}  {r.get('ipAddress') or '-'}  {where or '-'}")
+        if st.get("errorCode") and (st.get("failureReason") or "").lower() != "other.":
+            print(f"      {st.get('failureReason')}")
+    return 0
+
+
+def cmd_user_groups(a):
+    try:
+        u = users.resolve(a.user)
+        rows = users.groups(u["id"])
+    except users.UserError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    for g in sorted(rows, key=lambda x: (x.get("displayName") or "").casefold()):
+        kind = (g.get("@odata.type") or "").split(".")[-1]
+        tag = "roll" if kind == "directoryRole" else (
+            "M365" if "Unified" in (g.get("groupTypes") or []) else
+            "distribution" if g.get("mailEnabled") and not g.get("securityEnabled") else
+            "säkerhet")
+        src = " (AD)" if g.get("onPremisesSyncEnabled") else ""
+        print(f"{tag:<13}{g.get('displayName')}{src}  {g.get('id')}")
+    return 0
+
+
+def _add_user_commands(sub):
+    def user_arg(s):
+        s.add_argument("user", help="UPN, object id, or part of a display name")
+
+    s = sub.add_parser("find", help="search the directory by name, UPN or mail")
+    s.add_argument("query")
+    s.add_argument("--top", type=int, default=25)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_user_find)
+
+    s = sub.add_parser("show", help="account state: enabled, licences, last sign-in, "
+                                    "password age, and the latest changes")
+    user_arg(s)
+    s.add_argument("--days", type=int, default=30, help="window for the change list, default 30")
+    s.add_argument("--no-audit", action="store_true", help="skip the change list")
+    s.add_argument("--auth-methods", action="store_true",
+                   help="also list registered MFA methods (extra consent)")
+    s.add_argument("-v", "--verbose", action="store_true", help="also proxy addresses")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_user_show)
+
+    s = sub.add_parser("audit", help="who changed this account, when, and what")
+    user_arg(s)
+    s.add_argument("--days", type=int, default=30, help="default 30, which is the retention")
+    s.add_argument("--top", type=int, default=100)
+    s.add_argument("--by-user", action="store_true",
+                   help="changes this account made, instead of changes made to it")
+    s.add_argument("-v", "--verbose", action="store_true", help="every modified property")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_user_audit)
+
+    s = sub.add_parser("signins", help="sign-in log for one account")
+    user_arg(s)
+    s.add_argument("--days", type=int, default=7)
+    s.add_argument("--top", type=int, default=50)
+    s.add_argument("--failed", action="store_true", help="only failed sign-ins")
+    s.add_argument("--kinds", choices=("all", "interactive", "noninteractive"),
+                   default="all",
+                   help="Graph returns interactive sign-ins only unless asked; "
+                        "default here is all of them")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_user_signins)
+
+    s = sub.add_parser("groups", help="group and directory role memberships")
+    user_arg(s)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_user_groups)
+
+
 def _add_graph_commands(sub, visible=True):
     """Graph subcommands. Registered under `wsg graph` and, for compatibility with
     scripts written against 0.1 (`wsg token --header`), as hidden top-level aliases."""
@@ -846,10 +1107,13 @@ def main(argv=None):
                     "Services: graph (Microsoft Graph via Entra), arena (WeSports Arena via Cloudflare Access).",
     )
     # metavar hides the compatibility aliases from the usage line.
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,arena,intune}")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,user,arena,intune}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
+
+    us = sub.add_parser("user", help="M365/Entra accounts: state, licences, sign-ins, audit trail")
+    _add_user_commands(us.add_subparsers(dest="user_cmd", required=True))
 
     ar = sub.add_parser("arena", help="WeSports Arena via Cloudflare Access (needs cloudflared)")
     _add_arena_commands(ar.add_subparsers(dest="arena_cmd", required=True))

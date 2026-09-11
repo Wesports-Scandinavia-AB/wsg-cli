@@ -50,6 +50,12 @@ wsg arena resolve X  close an incident, --false-positive, --cause, --learning
 wsg arena reopen X   undo a resolve
 wsg arena logout     deletes the Arena session
 
+wsg user find X        search the directory by name, UPN or mail
+wsg user show X        account state, licences, sign-in history, last changes
+wsg user audit X       who changed the account, when, and what
+wsg user signins X     sign-in log, interactive and token refreshes
+wsg user groups X      group and directory role memberships
+
 wsg intune apps        managed apps with their assignments
 wsg intune app-status  per-user install status for one app
 wsg intune intent      what the service intends for a user on a device
@@ -262,3 +268,88 @@ Graph beta retires endpoints without notice: `deviceStatuses`, `installSummary`
 and `getDeviceInstallStatusReport` are all gone, which is why `app-status` goes
 through `reports/getUserInstallStatusReport` and why every failure prints the
 Graph error body rather than a bare status code.
+
+## Scripts
+
+Standalone tools that do not need a Graph token. They sit in `scripts/` and are
+run directly, not through `wsg`.
+
+### az-vm-diskreport.sh
+
+Where the disk on an Azure Windows VM went. The scan runs as SYSTEM on the guest
+through `az vm run-command`, so it needs no agent, no RDP session and no inbound
+port — only Reader plus
+`Microsoft.Compute/virtualMachines/runCommand/action`.
+
+```
+scripts/az-vm-diskreport.sh -g RG-EXAMPLE -n vm-example
+scripts/az-vm-diskreport.sh -g RG -n VM -s users --top 20
+scripts/az-vm-diskreport.sh -g RG -n VM -s all > report.txt
+```
+
+Four sections. `volumes` and `profiles` answer in seconds; `tree` and `users`
+walk every file and take upwards of ten minutes on a full disk, so redirect them
+to a file rather than watching the terminal.
+
+`tree` buckets by the first two path segments, `users` groups
+`AppData\<Local|Roaming>\<vendor>\<product>` and sums each app over every
+profile — which is what turns "lots of big profiles" into a named cause. On the
+session host this was written against, it named Teams at 83 GB spread over the
+classic and the new client.
+
+Three things the script exists to get right:
+
+`Get-ChildItem -Recurse` follows junctions on Windows PowerShell 5.1, and every
+user profile carries legacy ones such as `Application Data`. The walk re-enters
+the same tree until it hits `MAX_PATH`, counting profiles many times over — a
+first pass on a 511 GB disk reported a single folder at 1 013 GB. The walker
+here skips `ReparsePoint` entries instead. Check the result: `tree`'s total
+should land within a gigabyte of size minus free from `volumes`.
+
+`run-command` truncates its output at roughly 4 KB. Everything is aggregated on
+the guest and only a ranked head comes back; never stream a file list through
+it.
+
+`Win32_UserProfile.LastUseTime` is touched by background servicing, so on a busy
+session host every profile looks used within the last few days and the property
+cannot find stale ones. `profiles` compares ProfileList registrations against
+the directories that actually exist instead. A large gap means profiles were
+deleted without their directories, and a pile of `TEMP.<name>.NNN` directories
+means profile loads have been failing for a long time — usually an FSLogix agent
+whose services run without `HKLM:\SOFTWARE\FSLogix\Profiles`, leaving every
+session on a local profile that nothing ever prunes.
+
+On Git Bash, `az` rewrites anything shaped like a POSIX path: resource IDs need
+`MSYS_NO_PATHCONV=1` and `--scripts @file` needs a native Windows path from
+`cygpath -w`. The script does both.
+
+## Users
+
+`wsg user show` answers "what state is this account in, and who touched it" in
+one call. `X` is a UPN, an object id, or enough of a display name to be unique -
+an ambiguous name lists the candidates rather than guessing.
+
+```
+wsg user show person@example.com
+wsg user audit person@example.com --days 30 -v
+wsg user signins person@example.com --failed
+```
+
+Four things the raw Graph output gets wrong if you read it too quickly:
+
+- **`lastSignInDateTime` counts failed attempts.** A blocked account keeps
+  showing recent sign-ins because a client somewhere is still retrying.
+  `senast lyckad inloggning` (`lastSuccessfulSignInDateTime`) is the one that
+  means someone got in.
+- **Non-interactive sign-ins are hidden by default.** Graph returns interactive
+  sign-ins only unless the filter asks for more, so `wsg user signins` runs both
+  queries and merges them. `--kinds interactive` gets the old behaviour.
+- **The audit log is not history.** Entra keeps directory audits 30 days with
+  P1/P2, 7 without, and refuses a query that reaches further back instead of
+  returning what it has - so the commands clamp to the real cut-off and print
+  the window they actually covered. For an older offboarding, `wsg user show`
+  falls back to `licenser borttagna` and `sessioner spärrade`, which are stored
+  on the user object and do not expire.
+- **A synced account was probably changed in AD, not in Entra.** When
+  `typ` says `synkat från lokalt AD`, the Entra audit record names AD Connect,
+  and the person who made the change is only in the on-prem AD security log.
