@@ -345,11 +345,33 @@ account's coverage as everyone's. Measured against a live 30-day sweep the two
 differ by more than half the window: 12 days of real coverage, 30 days if you
 take the flattering number.
 
-What going direct costs: Ongoing knows a channel only as a bare `marketPlace`
-string, so you get codes without names — the names live in Garp's salesperson
-register. And Ongoing knows nothing about the webshop or the ERP, so a silent
-channel here is a fact, not a diagnosis: it cannot tell "Garp never released it"
-from "nobody ordered".
+What going direct costs: Ongoing knows nothing about the webshop or the ERP, so a
+silent channel here is a fact, not a diagnosis — it cannot tell "Garp never
+released it" from "nobody ordered".
+
+### Channel names and groups
+
+Ongoing has no marketplace register. `marketPlace` is a bare code on the order and
+nothing enumerates it: `/orders/classes` and `/orders/types` both come back empty
+on this instance. The names come from pulse, which maps every code to a storefront
+in `MARKETPLACE_MAP` and groups the storefronts in its storefront-groups
+migration. `scripts/channels-from-pulse.py` reads both into
+`%LOCALAPPDATA%\wsg\channels.json`; run it again when pulse gains a storefront.
+
+A code the map has not heard of prints as a bare code and is named at the bottom
+of the output. That is deliberate: a channel pulse was never told about should
+look new, not quietly borrow a neighbour's name.
+
+The map is stamped with the goods owner whose numbering it is, and is not applied
+to the others. The empty code is why — on Vartex it means the vartex.se dealer
+portal, but a Rawbike order with no `marketPlace` is simply Rawbike's, and
+labelling it vartex.se would be a plain lie.
+
+Groups cover only the domains that migration named, so most channels land under
+"Ogrupperade i pulse". Matching is on the exact domain and nothing else: pulse
+calls two of the channels "traningsmaskiner DK" and "traningsmaskiner NO", which
+are labels rather than domains, and guessing that they belong with
+traningsmaskiner.com would be inventing the answer instead of reporting it.
 
 ### Credentials
 

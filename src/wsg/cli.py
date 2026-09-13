@@ -1279,6 +1279,23 @@ def cmd_ongoing_accounts(a):
     return 0
 
 
+def _label(code, names, account=None):
+    """A channel as `code name`, or the bare code when the map has never heard of it.
+
+    The map is one goods owner's numbering, so it is only applied to that owner's
+    rows. That matters most for the EMPTY code: on Vartex it means the vartex.se
+    dealer portal, but on Rawbike or Living Sport an order with no marketPlace is
+    simply their own — labelling it vartex.se would be a plain lie.
+    """
+    owner = names.get("__account__")
+    if owner and account and owner.lower() != account.lower():
+        return code or "(utan kanal)"
+    name = (names.get(code or "") or {}).get("name")
+    if not name:
+        return code or "(utan kanal)"
+    return f"{(code or '—'):5}{name}"
+
+
 def cmd_ongoing_last(a):
     try:
         result = ongoing.last_per_channel(a.account, days=a.days, max_orders=a.top)
@@ -1289,6 +1306,8 @@ def cmd_ongoing_last(a):
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     rows = result["channels"]
+    # Names come from a local map built out of pulse; missing is normal, not an error.
+    names = ongoing.channel_names()
 
     window = f"senaste {a.days} dygnen" if a.days else f"de {a.top} senaste ordrarna"
     print(f"LAGRET   senaste order per kanal, ur {window}")
@@ -1311,16 +1330,47 @@ def cmd_ongoing_last(a):
         owner = f" (goodsOwnerId {acc['goodsOwnerId']})" if acc.get("goodsOwnerId") else ""
         n = f"{len(mine)} {'kanal' if len(mine) == 1 else 'kanaler'}"
         print(f"{acc['name'].upper()}{owner} — {n}")
-        for r in mine:
+        w = max([len(_label(r["channel"], names, acc["name"])) for r in mine] + [22])
+
+        def line(r):
             # referenceNumber where there is one, otherwise the order number — which
             # on some accounts is a customer name, so the column is "whatever the
             # warehouse calls this order" rather than an order number.
             ref = r.get("reference") or r.get("orderNumber") or ""
-            print(f"  {(r['channel'] or '(utan kanal)'):18}{_for(r['createdAt']):>13}"
+            print(f"  {_label(r['channel'], names, acc['name']):{w}}{_for(r['createdAt']):>13}"
                   f"  {ref:16} {r.get('status') or ''}")
+
+        # Storefront groups come from pulse's migration and cover only the domains it
+        # named, so most channels have none. Group order is fixed rather than derived:
+        # a block that moves between runs is a block you have to re-find every time.
+        owner_ok = not names.get("__account__") or \
+            names["__account__"].lower() == acc["name"].lower()
+        buckets = {}
+        for r in mine:
+            g = (names.get(r["channel"] or "") or {}).get("group") if owner_ok else None
+            buckets.setdefault(g, []).append(r)
+        order = [g for g in ("Vartex Outdoor", "Vartex Fitness", "Vartex MC") if g in buckets]
+        order += sorted(g for g in buckets if g and g not in order)
+        for g in order:
+            print(f"  ── {g}")
+            for r in buckets[g]:
+                line(r)
+        if buckets.get(None):
+            if order:
+                print("  ── Ogrupperade i pulse")
+            for r in buckets[None]:
+                line(r)
         print()
     # A channel absent here is not idle. Whether that absence carries any
     # information at all depends on whether the sweep was cut short.
+    owner = names.get("__account__")
+    unknown = sorted({r["channel"] for r in rows
+                      if (not owner or r["account"].lower() == owner.lower())
+                      and not (names.get(r["channel"] or "") or {}).get("name")})
+    if unknown and names:
+        # A code the map has not heard of is a channel nobody told pulse about.
+        print(f"Utan namn i kanalkartan: {', '.join(unknown)} "
+              f"— lägg till i pulse och kör scripts/channels-from-pulse.py.\n")
     print(f"{len(rows)} {'kanal' if len(rows) == 1 else 'kanaler'} totalt.", end=" ")
     if result.get("capped"):
         print(f"Hämtningen slog i taket på {a.top} ordrar, så en kanal som saknas "
