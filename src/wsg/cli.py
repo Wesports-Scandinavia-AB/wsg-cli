@@ -1301,15 +1301,27 @@ def cmd_ongoing_last(a):
     if not rows:
         print("  Inga ordrar i fönstret.")
         return 0
-    multi = len({r["account"] for r in rows}) > 1
-    for r in rows:
-        acc = f"{r['account']:10} " if multi else ""
-        ref = r.get("reference") or r.get("orderNumber") or ""
-        print(f"  {acc}{(r['channel'] or '(utan kanal)'):18}{_for(r['createdAt']):>13}"
-              f"  {ref:16} {r.get('status') or ''}")
+    # Grouped per goods owner rather than one flat age-sorted list: these are separate
+    # legal entities sharing a warehouse, and a row means nothing until you know whose
+    # it is. Group order is config order, which puts the main goods owner first.
+    for acc in result.get("accounts") or [{"name": r["account"]} for r in rows]:
+        mine = [r for r in rows if r["account"] == acc["name"]]
+        if not mine:
+            continue
+        owner = f" (goodsOwnerId {acc['goodsOwnerId']})" if acc.get("goodsOwnerId") else ""
+        n = f"{len(mine)} {'kanal' if len(mine) == 1 else 'kanaler'}"
+        print(f"{acc['name'].upper()}{owner} — {n}")
+        for r in mine:
+            # referenceNumber where there is one, otherwise the order number — which
+            # on some accounts is a customer name, so the column is "whatever the
+            # warehouse calls this order" rather than an order number.
+            ref = r.get("reference") or r.get("orderNumber") or ""
+            print(f"  {(r['channel'] or '(utan kanal)'):18}{_for(r['createdAt']):>13}"
+                  f"  {ref:16} {r.get('status') or ''}")
+        print()
     # A channel absent here is not idle. Whether that absence carries any
     # information at all depends on whether the sweep was cut short.
-    print(f"\n{len(rows)} {'kanal' if len(rows) == 1 else 'kanaler'}.", end=" ")
+    print(f"{len(rows)} {'kanal' if len(rows) == 1 else 'kanaler'} totalt.", end=" ")
     if result.get("capped"):
         print(f"Hämtningen slog i taket på {a.top} ordrar, så en kanal som saknas "
               f"säger ingenting — höj --top.")
