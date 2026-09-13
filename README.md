@@ -62,6 +62,10 @@ wsg intune intent      what the service intends for a user on a device
 wsg intune store-app   add a Microsoft Store app (new) by Store id
 wsg intune win32       publish an .intunewin package
 wsg intune sync        ask a device to check in now
+
+wsg ongoing accounts   the configured Ongoing accounts (never the key)
+wsg ongoing last       how long since the warehouse last got an order, per channel
+
 ```
 
 The 0.1 spellings `wsg login`, `wsg token`, `wsg status`, `wsg whoami` and
@@ -174,6 +178,43 @@ or OneDrive and a link; this command refuses up front rather than failing halfwa
 
 Needs `Mail.Send`, which is in the default scope set.
 
+## The work calendar
+
+`calendar mirror` blocks time on your work calendar from a booking that lives in a
+private one. It reads the Google event as JSON on stdin, the same way `sendmail`
+reads a body, because the booking already exists over there and retyping it into
+arguments is where two calendars start to drift apart.
+
+```
+pkj calendar show <id> --json | wsg calendar mirror
+pkj calendar add -s Tandläkare --start "imorgon 09" --work      # the same thing in one go
+```
+
+**The title never comes along.** Every mirrored event is called `Upptagen` and
+carries no description, no location and no guests, with `showAs: busy` and
+`sensitivity: private`. What is on a private calendar stays there; the work
+calendar learns only that the time is taken.
+
+Running it twice does not book it twice. Graph has `transactionId` for this: the
+same id posted again hands back the event it already made, so a mirror is safe to
+re-run from a script that cannot remember what it did last time.
+
+Times go over as the instant they are, in UTC. Wall-clock plus a timezone is how a
+booking ends up an hour out on the far side of a clock change. All-day events are
+the exception, since a day starts at midnight where you live rather than in UTC,
+so those carry the mailbox's own timezone — the string Graph itself reports, and
+therefore one Graph accepts.
+
+Recurring series are refused. Google's `RRULE` and Graph's `patternedRecurrence`
+are different models, and a half-right translation of an every-other-week rule is
+worse than an honest no: mirror the individual occurrences you want blocked.
+
+`calendar show <google-id>` says whether a booking is mirrored and where.
+`calendar unmirror <google-id> --yes` removes the block and leaves the Google
+event alone.
+
+Needs `Calendars.ReadWrite`.
+
 ## The secrets vault
 
 `secret-set` stores or rotates one credential in a company's vault. It needs
@@ -268,6 +309,68 @@ Graph beta retires endpoints without notice: `deviceStatuses`, `installSummary`
 and `getDeviceInstallStatusReport` are all gone, which is why `app-status` goes
 through `reports/getUserInstallStatusReport` and why every failure prints the
 Graph error body rather than a bare status code.
+
+## Ongoing WMS
+
+`wsg ongoing` goes straight at the warehouse over the Goods Owner REST API, with
+no backend in between. It answers one thing well: has the warehouse actually got
+an order, and when was the last one.
+
+```
+wsg ongoing accounts
+wsg ongoing last --days 30 --top 5000
+wsg ongoing last --account rawbike
+```
+
+```
+LAGRET   senaste order per kanal, ur senaste 30 dygnen
+         täcker tillbaka till 2026-09-01 11:18 (12 d 9 h sedan, svagast: vartex)
+
+  vartex     63                     6 d 22 h  500020943        Skickad
+  vartex     89                       16 min  3752764          Frisläppt
+
+31 kanaler. Hämtningen slog i taket på 5000 ordrar, så en kanal som saknas säger ingenting — höj --top.
+```
+
+**Read the coverage line before the list.** There is no "latest per channel" query
+in Ongoing, so this sweeps recent orders and groups them client-side, which means
+an absent channel may be silent or may simply not have been fetched. Two numbers
+keep that honest: how far back the sweep reached, and whether `--top` cut it
+short. When it did, absence carries no information at all.
+
+The reach is the **weakest account's**, not the oldest order seen. Accounts are
+swept separately and a quiet one covers the whole window while a busy one is cut
+off after days — reporting the oldest row anywhere would advertise the quiet
+account's coverage as everyone's. Measured against a live 30-day sweep the two
+differ by more than half the window: 12 days of real coverage, 30 days if you
+take the flattering number.
+
+What going direct costs: Ongoing knows a channel only as a bare `marketPlace`
+string, so you get codes without names — the names live in Garp's salesperson
+register. And Ongoing knows nothing about the webshop or the ERP, so a silent
+channel here is a fact, not a diagnosis: it cannot tell "Garp never released it"
+from "nobody ordered".
+
+### Credentials
+
+Ongoing issues API users, not user sessions, so there is no signing in as
+yourself: it is a stored credential per goods owner, and the separate legal
+entities have their own. `WSG_ONGOING_URL/_USER/_KEY/_GOODS_OWNER` for one
+account, otherwise `%LOCALAPPDATA%\wsg\ongoing.json` with an `accounts` list
+(override the path with `WSG_ONGOING_CONFIG`).
+
+`scripts/ongoing-config-from-azure.ps1` builds that file from the `Ongoing__*`
+app settings on `fa-example`, printing only the account names. Run it again
+after a key rotation. Everyone sharing a key is the same identity in Ongoing's
+log, which is Ongoing's model rather than a shortcut taken here — and the reason
+this module reads and never writes.
+
+Timestamps are warehouse local time. One carrying an offset is taken as given; a
+bare one is read as this machine's local clock. Windows ships no tz database for
+`zoneinfo` and this package has no dependencies, so that assumption is the limit
+rather than a lookup — and outgoing time filters are sent in local time for the
+same reason, since a UTC boundary would shift the window by the offset every
+time, always in the same direction.
 
 ## Scripts
 

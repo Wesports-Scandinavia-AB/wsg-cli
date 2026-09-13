@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import arena, auth, intune, mscal, users
+from . import arena, auth, intune, mscal, ongoing, users
 from .scopes import DEFAULT_SCOPES
 
 
@@ -1255,6 +1255,83 @@ def _add_calendar_commands(sub):
     s.set_defaults(fn=cmd_calendar_unmirror)
 
 
+# ── Ongoing WMS ───────────────────────────────────────────────────────────────
+# Our own client, straight at the warehouse. Ongoing can say whether it got an
+# order; it cannot say why it did not, because it knows nothing about the webshop
+# or the ERP. Read it as evidence, not as a verdict.
+
+
+def cmd_ongoing_accounts(a):
+    try:
+        rows = ongoing.accounts()
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        # The key never leaves the config file, not even into a script's stdout.
+        print(json.dumps([{k: v for k, v in r.items() if k != "key"} for r in rows],
+                         indent=2, ensure_ascii=False))
+        return 0
+    print(f"konfiguration  {ongoing.config_path()}\n")
+    for r in rows:
+        print(f"  {r['name']:14} {r['url']:52} goodsOwnerId={r['goodsOwnerId']}  "
+              f"api-användare {r['user']}")
+    return 0
+
+
+def cmd_ongoing_last(a):
+    try:
+        result = ongoing.last_per_channel(a.account, days=a.days, max_orders=a.top)
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    rows = result["channels"]
+
+    window = f"senaste {a.days} dygnen" if a.days else f"de {a.top} senaste ordrarna"
+    print(f"LAGRET   senaste order per kanal, ur {window}")
+    if result.get("reach"):
+        # The weakest account's reach — that is the coverage of the whole answer.
+        who = f", svagast: {result['reachAccount']}" if result.get("reachAccount") else ""
+        print(f"         täcker tillbaka till {_ts(result['reach'])} "
+              f"({_for(result['reach'])} sedan{who})")
+    print()
+    if not rows:
+        print("  Inga ordrar i fönstret.")
+        return 0
+    multi = len({r["account"] for r in rows}) > 1
+    for r in rows:
+        acc = f"{r['account']:10} " if multi else ""
+        ref = r.get("reference") or r.get("orderNumber") or ""
+        print(f"  {acc}{(r['channel'] or '(utan kanal)'):18}{_for(r['createdAt']):>13}"
+              f"  {ref:16} {r.get('status') or ''}")
+    # A channel absent here is not idle. Whether that absence carries any
+    # information at all depends on whether the sweep was cut short.
+    print(f"\n{len(rows)} kanaler.", end=" ")
+    if result.get("capped"):
+        print(f"Hämtningen slog i taket på {a.top} ordrar, så en kanal som saknas "
+              f"säger ingenting — höj --top.")
+    else:
+        print("Ingen kanal utöver dessa har en order i fönstret.")
+    return 0
+
+
+def _add_ongoing_commands(sub):
+    s = sub.add_parser("accounts", help="the configured Ongoing accounts (never the key)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_ongoing_accounts)
+
+    s = sub.add_parser("last", help="how long since the warehouse last got an order, per channel")
+    s.add_argument("--account", help="one configured account; default is all of them")
+    s.add_argument("--days", type=int, help="look back N days instead of the newest --top orders")
+    s.add_argument("--top", type=int, default=ongoing.DEFAULT_MAX_ORDERS, metavar="N",
+                   help=f"how many recent orders to sweep (default {ongoing.DEFAULT_MAX_ORDERS})")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_ongoing_last)
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1267,7 +1344,7 @@ def main(argv=None):
                     "Services: graph (Microsoft Graph via Entra), arena (WeSports Arena via Cloudflare Access).",
     )
     # metavar hides the compatibility aliases from the usage line.
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,user,arena,intune,calendar}")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,user,arena,intune,ongoing,calendar}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
@@ -1280,6 +1357,9 @@ def main(argv=None):
 
     it = sub.add_parser("intune", help="Intune app management: list, status, publish Store and Win32 apps")
     _add_intune_commands(it.add_subparsers(dest="intune_cmd", required=True))
+
+    og = sub.add_parser("ongoing", help="Ongoing WMS directly: what the warehouse has actually received")
+    _add_ongoing_commands(og.add_subparsers(dest="ongoing_cmd", required=True))
 
     ca = sub.add_parser("calendar", help="mirror a private booking onto the work calendar as busy")
     _add_calendar_commands(ca.add_subparsers(dest="calendar_cmd", required=True))
