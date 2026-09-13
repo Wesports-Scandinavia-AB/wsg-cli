@@ -1351,24 +1351,28 @@ def cmd_ongoing_last(a):
             buckets.setdefault(g, []).append(r)
         order = [g for g in ("Vartex Outdoor", "Vartex Fitness", "Vartex MC") if g in buckets]
         order += sorted(g for g in buckets if g and g not in order)
-        def header(title, bucket):
-            # The freshest channel in the group, as the group's own proof of life:
-            # one block can be minutes old while the block above it is weeks, and
-            # that comparison is the reason for grouping at all. Rows arrive
-            # oldest-first, so the newest is the last of them.
-            newest = bucket[-1]
-            # _label pads the code into a column; a header wants it tight.
-            who = " ".join(_label(newest["channel"], names, acc["name"]).split())
-            print(f"  ── {title}  —  senast {_for(newest['createdAt'])}: {who}")
-
-        for g in order:
-            header(g, buckets[g])
-            for r in buckets[g]:
-                line(r)
+        blocks = [(g, buckets[g]) for g in order]
         if buckets.get(None):
-            if order:
-                header("Ogrupperade i pulse", buckets[None])
-            for r in buckets[None]:
+            blocks.append(("Ogrupperade i pulse" if order else None, buckets[None]))
+
+        # Summary first: one line per group with its freshest order. A group that is
+        # minutes old next to one that is hours old is the comparison worth making,
+        # and it should not require reading to the end of every block to find. Same
+        # order as the detail below, so a summary line maps onto a block by position
+        # rather than by searching.
+        if len(blocks) > 1:
+            gw = max(len(g or "") for g, _ in blocks)
+            for g, bucket in blocks:
+                newest = bucket[-1]           # rows are oldest-first
+                # _label pads the code into a column; a summary line wants it tight.
+                who = " ".join(_label(newest["channel"], names, acc["name"]).split())
+                print(f"  {(g or ''):{gw}}  {_for(newest['createdAt']):>13}  {who}")
+            print()
+
+        for g, bucket in blocks:
+            if g:
+                print(f"  ── {g}")
+            for r in bucket:
                 line(r)
         print()
     # A channel absent here is not idle. Whether that absence carries any
