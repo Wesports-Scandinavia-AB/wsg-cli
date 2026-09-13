@@ -1,11 +1,12 @@
 import argparse
 import json
+import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from . import arena, auth, intune, users
+from . import arena, auth, intune, mscal, users
 from .scopes import DEFAULT_SCOPES
 
 
@@ -1095,6 +1096,165 @@ def _add_arena_commands(sub):
     s.set_defaults(fn=cmd_arena_logout)
 
 
+# ── Shared time formatting ───────────────────────────────────────────────────
+# Used by the Ongoing commands; kept general because timestamps from any of these
+# APIs arrive in the same handful of shapes.
+
+
+def _dt(s):
+    """Parse an API timestamp. .NET writes up to 7 fractional digits, which
+    fromisoformat rejects before 3.11, so trim to microseconds."""
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    m = re.match(r"^(.*\.\d{6})\d*(.*)$", s)
+    if m:
+        s = m.group(1) + m.group(2)
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _for(s):
+    """How long ago, as a duration a human reads at a glance."""
+    d = _dt(s)
+    if not d:
+        return "-"
+    secs = (datetime.now(d.tzinfo) - d).total_seconds()
+    if secs < 0:
+        return "nyss"
+    if secs < 3600:
+        return f"{int(secs // 60)} min"
+    if secs < 86400:
+        return f"{int(secs // 3600)} h {int(secs % 3600 // 60)} min"
+    return f"{int(secs // 86400)} d {int(secs % 86400 // 3600)} h"
+
+
+def _clock(s):
+    d = _dt(s)
+    return d.astimezone().strftime("%H:%M") if d else "-"
+
+
+
+
+
+# ── The work calendar ─────────────────────────────────────────────────────────
+# REKONSTRUERAD 2026-09-13 efter att originalet raderats av misstag. Logiken i
+# mscal.py är orörd; det här är bara CLI-lagret, återskapat från README:ns
+# beskrivning och mscal:s API. Jämför med vad du hade innan du litar på det.
+
+
+def cmd_calendar_mirror(a):
+    """Block the time on the work calendar from a Google event read on stdin.
+
+    The event comes in as JSON rather than as arguments because the booking
+    already exists on the other calendar, and retyping it into arguments is
+    exactly where two calendars start to drift.
+    """
+    if sys.stdin.isatty():
+        print("Eventet läses som JSON från stdin, t.ex.:\n"
+              "  pkj calendar show <id> --json | wsg calendar mirror",
+              file=sys.stderr)
+        return 2
+    try:
+        ev = json.loads(sys.stdin.read() or "{}")
+    except ValueError as e:
+        print(f"Kunde inte tolka JSON från stdin: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(ev, dict) or not ev.get("id"):
+        print("Ingen Google-event i indatan (saknar 'id').", file=sys.stderr)
+        return 2
+
+    try:
+        body = mscal.body_for(ev)
+        if a.dry_run:
+            print("[torrkörning] POST /me/events — inget bokat")
+            print(json.dumps(body, indent=2, ensure_ascii=False))
+            return 0
+        made = mscal.mirror(ev)
+    except mscal.MirrorError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    when = (made.get("start") or {}).get("dateTime") or "?"
+    print(f"{mscal.TITLE} {_ts(when)} — {(ev.get('summary') or 'namnlös bokning')} "
+          f"speglad. id={made.get('id', '')[:24]}")
+    return 0
+
+
+def cmd_calendar_show(a):
+    """Whether a Google event has a block on the work calendar, and which."""
+    try:
+        rows = mscal.find(a.google_id)
+    except mscal.MirrorError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("Ingen spegling av det eventet.")
+        return 1
+    for ev in rows:
+        start = (ev.get("start") or {}).get("dateTime")
+        end = (ev.get("end") or {}).get("dateTime")
+        print(f"  {ev.get('subject')}  {_ts(start)} – {_ts(end)}  "
+              f"{ev.get('showAs')}/{ev.get('sensitivity')}")
+        print(f"  {'':4}id={ev.get('id')}")
+    # More than one means an earlier run got past transactionId somehow; say so
+    # rather than let the count pass unnoticed.
+    if len(rows) > 1:
+        print(f"\n{len(rows)} speglingar av samma event — en av dem är övertalig.")
+    return 0
+
+
+def cmd_calendar_unmirror(a):
+    """Remove the block; the Google event is left alone."""
+    try:
+        rows = mscal.find(a.google_id)
+    except (mscal.MirrorError, auth.AuthError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if not rows:
+        print("Ingen spegling att ta bort.")
+        return 0
+    if not a.yes:
+        for ev in rows:
+            print(f"  {ev.get('subject')}  {_ts((ev.get('start') or {}).get('dateTime'))}")
+        print(f"\n{len(rows)} bokning(ar) skulle tas bort. Kör om med --yes.")
+        return 1
+    try:
+        gone = mscal.unmirror(a.google_id)
+    except mscal.MirrorError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(f"{gone} spegling(ar) borttagna. Google-eventet är orört.")
+    return 0
+
+
+def _add_calendar_commands(sub):
+    s = sub.add_parser("mirror", help="block the time on the work calendar; reads a Google event on stdin")
+    s.add_argument("--dry-run", action="store_true", help="print the Graph body and book nothing")
+    s.set_defaults(fn=cmd_calendar_mirror)
+
+    s = sub.add_parser("show", help="whether a Google event is mirrored, and where")
+    s.add_argument("google_id", metavar="GOOGLE-ID")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_calendar_show)
+
+    s = sub.add_parser("unmirror", help="remove the block; the Google event is left alone")
+    s.add_argument("google_id", metavar="GOOGLE-ID")
+    s.add_argument("--yes", action="store_true", help="actually delete; without it, only lists")
+    s.set_defaults(fn=cmd_calendar_unmirror)
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1107,7 +1267,7 @@ def main(argv=None):
                     "Services: graph (Microsoft Graph via Entra), arena (WeSports Arena via Cloudflare Access).",
     )
     # metavar hides the compatibility aliases from the usage line.
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,user,arena,intune}")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,user,arena,intune,calendar}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
@@ -1120,6 +1280,9 @@ def main(argv=None):
 
     it = sub.add_parser("intune", help="Intune app management: list, status, publish Store and Win32 apps")
     _add_intune_commands(it.add_subparsers(dest="intune_cmd", required=True))
+
+    ca = sub.add_parser("calendar", help="mirror a private booking onto the work calendar as busy")
+    _add_calendar_commands(ca.add_subparsers(dest="calendar_cmd", required=True))
 
     _add_graph_commands(sub, visible=False)   # wsg login / token / status / whoami / logout
 
