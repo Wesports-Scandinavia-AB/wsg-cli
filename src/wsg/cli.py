@@ -1351,13 +1351,23 @@ def cmd_ongoing_last(a):
             buckets.setdefault(g, []).append(r)
         order = [g for g in ("Vartex Outdoor", "Vartex Fitness", "Vartex MC") if g in buckets]
         order += sorted(g for g in buckets if g and g not in order)
+        def header(title, bucket):
+            # The freshest channel in the group, as the group's own proof of life:
+            # one block can be minutes old while the block above it is weeks, and
+            # that comparison is the reason for grouping at all. Rows arrive
+            # oldest-first, so the newest is the last of them.
+            newest = bucket[-1]
+            # _label pads the code into a column; a header wants it tight.
+            who = " ".join(_label(newest["channel"], names, acc["name"]).split())
+            print(f"  ── {title}  —  senast {_for(newest['createdAt'])}: {who}")
+
         for g in order:
-            print(f"  ── {g}")
+            header(g, buckets[g])
             for r in buckets[g]:
                 line(r)
         if buckets.get(None):
             if order:
-                print("  ── Ogrupperade i pulse")
+                header("Ogrupperade i pulse", buckets[None])
             for r in buckets[None]:
                 line(r)
         print()
