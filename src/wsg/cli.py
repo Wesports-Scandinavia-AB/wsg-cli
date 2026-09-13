@@ -1381,6 +1381,7 @@ def cmd_ongoing_last(a):
     unknown = sorted({r["channel"] for r in rows
                       if (not owner or r["account"].lower() == owner.lower())
                       and not (names.get(r["channel"] or "") or {}).get("name")})
+    unknown = [u for u in unknown if u]      # the empty code is a channel, not a gap
     if unknown and names:
         # A code the map has not heard of is a channel nobody told pulse about.
         print(f"Utan namn i kanalkartan: {', '.join(unknown)} "
