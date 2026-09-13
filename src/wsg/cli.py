@@ -1309,7 +1309,7 @@ def cmd_ongoing_last(a):
               f"  {ref:16} {r.get('status') or ''}")
     # A channel absent here is not idle. Whether that absence carries any
     # information at all depends on whether the sweep was cut short.
-    print(f"\n{len(rows)} kanaler.", end=" ")
+    print(f"\n{len(rows)} {'kanal' if len(rows) == 1 else 'kanaler'}.", end=" ")
     if result.get("capped"):
         print(f"Hämtningen slog i taket på {a.top} ordrar, så en kanal som saknas "
               f"säger ingenting — höj --top.")
