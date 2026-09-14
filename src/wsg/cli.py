@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import arena, auth, intune, mscal, ongoing, users
+from . import arena, auth, garp, intune, mscal, ongoing, users
 from .scopes import DEFAULT_SCOPES
 
 
@@ -1255,6 +1255,63 @@ def _add_calendar_commands(sub):
     s.set_defaults(fn=cmd_calendar_unmirror)
 
 
+# ── Garp ERP ──────────────────────────────────────────────────────────────────
+# The ERP half of the same question. `wsg ongoing last` says whether the warehouse
+# got the order; this says whether Garp ever sent it. Read together they locate the
+# stop, which neither can do alone.
+
+
+def cmd_garp_last(a):
+    try:
+        rows = garp.last_per_channel(a.company, days=a.days)
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+
+    names = ongoing.channel_names()
+    print(f"GARP   senaste order per kanal, senaste {a.days} dygnen\n")
+    waiting_total = 0
+    for comp in sorted({(r["company"], r["companyName"]) for r in rows}):
+        mine = [r for r in rows if r["company"] == comp[0]]
+        if not mine:
+            continue
+        # Letter codes are named B2B salespeople with their own rhythm; numeric ones
+        # are the webshops and marketplaces this is really about.
+        mine = [r for r in mine if a.all or r["channel"].isdigit() or r["waiting"]]
+        print(f"{comp[1].upper()} ({comp[0]}) — {len(mine)} kanaler")
+        w = max([len(_label(r["channel"], names, None)) for r in mine] + [22]) if mine else 22
+        for r in sorted(mine, key=lambda r: r["createdAt"] or ""):
+            waiting_total += r["waiting"]
+            # A queue that is not draining is the finding; say how old its head is.
+            q = ""
+            if r["waiting"]:
+                q = f"  väntar {r['waiting']:>3}"
+                if r["oldestWaitingAt"]:
+                    q += f", äldsta {_for(r['oldestWaitingAt'])}"
+            print(f"  {_label(r['channel'], names, None):{w}}{_for(r['createdAt']):>13}"
+                  f"  {str(r['order'] or ''):>10}{q}")
+        print()
+
+    if waiting_total:
+        print(f"{waiting_total} ordrar utan plocklista. Det är överlämningen till lagret: "
+              f"Garp har tagit emot dem men inte skickat dem vidare.")
+    else:
+        print("Inga ordrar väntar på plocklista.")
+    return 1 if waiting_total else 0
+
+
+def _add_garp_commands(sub):
+    s = sub.add_parser("last", help="latest order per channel in Garp, and what has no picking list")
+    s.add_argument("--company", help="002 / 013, or a configured name; default is both")
+    s.add_argument("--days", type=int, default=2, metavar="N", help="look back N days (default 2)")
+    s.add_argument("--all", action="store_true", help="include B2B salespeople with nothing waiting")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_garp_last)
+
+
 # ── Ongoing WMS ───────────────────────────────────────────────────────────────
 # Our own client, straight at the warehouse. Ongoing can say whether it got an
 # order; it cannot say why it did not, because it knows nothing about the webshop
@@ -1466,7 +1523,7 @@ def main(argv=None):
                     "Services: graph (Microsoft Graph via Entra), arena (WeSports Arena via Cloudflare Access).",
     )
     # metavar hides the compatibility aliases from the usage line.
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,user,arena,intune,ongoing,calendar}")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,user,arena,intune,ongoing,garp,calendar}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
@@ -1482,6 +1539,9 @@ def main(argv=None):
 
     og = sub.add_parser("ongoing", help="Ongoing WMS directly: what the warehouse has actually received")
     _add_ongoing_commands(og.add_subparsers(dest="ongoing_cmd", required=True))
+
+    ga = sub.add_parser("garp", help="Garp ERP, read-only: what the ERP took in and has not handed over")
+    _add_garp_commands(ga.add_subparsers(dest="garp_cmd", required=True))
 
     ca = sub.add_parser("calendar", help="mirror a private booking onto the work calendar as busy")
     _add_calendar_commands(ca.add_subparsers(dest="calendar_cmd", required=True))
