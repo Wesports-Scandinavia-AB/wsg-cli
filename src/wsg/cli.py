@@ -1298,7 +1298,10 @@ def _label(code, names, account=None):
 
 def cmd_ongoing_last(a):
     try:
-        result = ongoing.last_per_channel(a.account, days=a.days, max_orders=a.top)
+        if a.sweep or not ongoing.channel_names():
+            result = ongoing.last_per_channel(a.account, days=a.days, max_orders=a.top)
+        else:
+            result = ongoing.last_by_query(a.account)
     except auth.AuthError as e:
         print(str(e), file=sys.stderr)
         return 2
@@ -1309,8 +1312,26 @@ def cmd_ongoing_last(a):
     # Names come from a local map built out of pulse; missing is normal, not an error.
     names = ongoing.channel_names()
 
-    window = f"senaste {a.days} dygnen" if a.days else f"de {a.top} senaste ordrarna"
-    print(f"LAGRET   senaste order per kanal, ur {window}")
+    # Asking per channel reaches every code the register has ever had, including ones
+    # retired years ago — MP Cdon.dk last sold 853 days ago. A dead code is not a quiet
+    # channel, and listing them buries the ones that mean something. The cutoff is
+    # generous enough that a genuinely seasonal channel survives it.
+    dormant = []
+    if result.get("mode") == "query" and not a.all:
+        keep = []
+        for r in rows:
+            age = _dt(r["createdAt"])
+            days_ago = (datetime.now(age.tzinfo) - age).days if age else 0
+            (keep if days_ago <= a.dormant else dormant).append(r)
+        rows = keep
+
+    if result.get("mode") == "query":
+        # One query per known channel: no window to disclose, because each answer is
+        # that channel's latest order however old it is.
+        print(f"LAGRET   senaste order per kanal, en fråga per kanal ur registret")
+    else:
+        window = f"senaste {a.days} dygnen" if a.days else f"de {a.top} senaste ordrarna"
+        print(f"LAGRET   senaste order per kanal, ur {window}")
     if result.get("reach"):
         # The weakest account's reach — that is the coverage of the whole answer.
         who = f", svagast: {result['reachAccount']}" if result.get("reachAccount") else ""
@@ -1398,7 +1419,13 @@ def cmd_ongoing_last(a):
         print(f"Utan namn i kanalkartan: {', '.join(unknown)} "
               f"— lägg till i pulse och kör scripts/channels-from-pulse.py.\n")
     print(f"{len(rows)} {'kanal' if len(rows) == 1 else 'kanaler'} totalt.", end=" ")
-    if result.get("capped"):
+    if result.get("mode") == "query":
+        if dormant:
+            print(f"{len(dormant)} vilande (ingen order på {a.dormant} dygn, --all visar dem).", end=" ")
+        # The register is the channel list here, so a channel outside it is invisible
+        # — the opposite blind spot to the sweep's, and worth naming as such.
+        print("Kanaler utanför Garps register syns inte — kör --sweep för att leta.")
+    elif result.get("capped"):
         print(f"Hämtningen slog i taket på {a.top} ordrar, så en kanal som saknas "
               f"säger ingenting — höj --top.")
     else:
@@ -1416,6 +1443,11 @@ def _add_ongoing_commands(sub):
     s.add_argument("--days", type=int, help="look back N days instead of the newest --top orders")
     s.add_argument("--top", type=int, default=ongoing.DEFAULT_MAX_ORDERS, metavar="N",
                    help=f"how many recent orders to sweep (default {ongoing.DEFAULT_MAX_ORDERS})")
+    s.add_argument("--all", action="store_true", help="include dormant channels")
+    s.add_argument("--dormant", type=int, default=90, metavar="DAYS",
+                   help="a channel with no order in this many days is dormant (default 90)")
+    s.add_argument("--sweep", action="store_true",
+                   help="fetch every order in the window instead of one per known channel")
     s.add_argument("-s", "--summary", action="store_true",
                    help="one line per group, newest and oldest; no channel rows")
     s.add_argument("--json", action="store_true")
