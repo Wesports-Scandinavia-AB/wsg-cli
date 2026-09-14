@@ -1360,15 +1360,26 @@ def cmd_ongoing_last(a):
         # and it should not require reading to the end of every block to find. Same
         # order as the detail below, so a summary line maps onto a block by position
         # rather than by searching.
-        if len(blocks) > 1:
+        if len(blocks) > 1 or a.summary:
             gw = max(len(g or "") for g, _ in blocks)
+            # _label pads the code into a column; a summary line wants it tight, but
+            # the "äldst" half still has to line up across rows to be scannable.
+            tight = lambda r: " ".join(_label(r["channel"], names, acc["name"]).split())
+            nw = max(len(tight(b[-1])) for _, b in blocks)
             for g, bucket in blocks:
                 newest = bucket[-1]           # rows are oldest-first
-                # _label pads the code into a column; a summary line wants it tight.
-                who = " ".join(_label(newest["channel"], names, acc["name"]).split())
-                print(f"  {(g or ''):{gw}}  {_for(newest['createdAt']):>13}  {who}")
+                who = f"{tight(newest):{nw}}" if a.summary else tight(newest)
+                # The oldest is the one worth acting on, so a summary that hides the
+                # rows still has to say how far behind the group's slowest channel is.
+                oldest = bucket[0]
+                behind = ""
+                if len(bucket) > 1 and a.summary:
+                    behind = f"   äldst {_for(oldest['createdAt']):>11}: {tight(oldest)}"
+                print(f"  {(g or ''):{gw}}  {_for(newest['createdAt']):>13}  {who}{behind}")
             print()
 
+        if a.summary:
+            continue
         for g, bucket in blocks:
             if g:
                 print(f"  ── {g}")
@@ -1405,6 +1416,8 @@ def _add_ongoing_commands(sub):
     s.add_argument("--days", type=int, help="look back N days instead of the newest --top orders")
     s.add_argument("--top", type=int, default=ongoing.DEFAULT_MAX_ORDERS, metavar="N",
                    help=f"how many recent orders to sweep (default {ongoing.DEFAULT_MAX_ORDERS})")
+    s.add_argument("-s", "--summary", action="store_true",
+                   help="one line per group, newest and oldest; no channel rows")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_ongoing_last)
 
