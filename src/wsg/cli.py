@@ -1296,8 +1296,13 @@ def cmd_garp_last(a):
         print()
 
     if waiting_total:
-        print(f"{waiting_total} ordrar utan plocklista. Det är överlämningen till lagret: "
-              f"Garp har tagit emot dem men inte skickat dem vidare.")
+        # Saying "the handover is broken" here was wrong: orders wait on stock, on
+        # holds, on split deliveries, and the count sits in the dozens on a healthy
+        # day. Only the warehouse can settle it, so point at it instead of guessing.
+        print(f"{waiting_total} ordrar saknar plocklista. Det är inte ett fel i sig — "
+              f"ordrar väntar också på lagersaldo och spärrar.")
+        print("Jämför med `wsg ongoing last`: får lagret ordrar nu hålls de av något "
+              "annat skäl, är lagret tyst samtidigt är det överlämningen som står.")
     else:
         print("Inga ordrar väntar på plocklista.")
     return 1 if waiting_total else 0
