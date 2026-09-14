@@ -12,6 +12,8 @@ DEFAULT_SCOPES = [
     "User.Read",
     "Files.ReadWrite",
     "Mail.Send",
+    # Mail.ReadWrite behövs för createReply/drafts, dvs. svara i tråd
+    "Mail.ReadWrite",
     "MailboxSettings.Read",
     # Directory
     "User.Read.All",
