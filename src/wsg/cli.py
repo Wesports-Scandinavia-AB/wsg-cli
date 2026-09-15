@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import arena, auth, garp, intune, mscal, ongoing, users
+from . import arena, auth, garp, garpdb, intune, mscal, ongoing, users
 from .scopes import DEFAULT_SCOPES
 
 
@@ -1317,6 +1317,123 @@ def _add_garp_commands(sub):
     s.set_defaults(fn=cmd_garp_last)
 
 
+# ── Garp SQL ──────────────────────────────────────────────────────────────────
+# The same box as `wsg garp`, the other door. The REST API on 8443 answers what
+# Garp was built to answer; the SQL mirror on 1433 answers the rest, and carries
+# the integration databases that never went near the ERP.
+
+
+def _print_rows(rows, empty="Inga rader."):
+    """Left-align text, right-align numbers, and let the widest value set the column."""
+    if not rows:
+        print(empty)
+        return
+    cols = list(rows[0].keys())
+    numeric = {c: all(isinstance(r.get(c), (int, float)) or r.get(c) is None for r in rows)
+               for c in cols}
+    def cell(v):
+        return "" if v is None else str(v)
+    width = {c: max([len(c)] + [len(cell(r.get(c))) for r in rows]) for c in cols}
+    print("  ".join(c.ljust(width[c]) if not numeric[c] else c.rjust(width[c]) for c in cols))
+    print("  ".join("-" * width[c] for c in cols))
+    for r in rows:
+        print("  ".join(cell(r.get(c)).ljust(width[c]) if not numeric[c]
+                        else cell(r.get(c)).rjust(width[c]) for c in cols))
+
+
+def cmd_garpdb_check(a):
+    try:
+        row = garpdb.check()
+    except garpdb.GarpDbError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    print(f"Server:    {row.get('server_name')}")
+    print(f"Version:   {row.get('version')}")
+    print(f"Login:     {row.get('login_name')}")
+    print(f"Databas:   {row.get('database_name')}")
+    reads = "ja" if row.get("datareader") else "nej"
+    denied = "ja" if row.get("denydatawriter") else "nej"
+    print(f"Lasratt:   {reads}    skrivsparr: {denied}")
+    if row.get("sysadmin"):
+        # Worth saying plainly: the read-only promise in the module docstring
+        # rests on db_denydatawriter, and sysadmin ignores it.
+        print("\nVARNING: det har loginet ar sysadmin. Skrivsparren galler inte for det.")
+    return 0
+
+
+def cmd_garpdb_databases(a):
+    try:
+        rows = garpdb.databases()
+    except garpdb.GarpDbError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    open_ = [r for r in rows if r.get("has_access")]
+    shut = [r for r in rows if not r.get("has_access")]
+    for r in rows:
+        r["has_access"] = "ja" if r["has_access"] else "nej"
+    _print_rows(rows, "Inga databaser.")
+    print(f"\n{len(open_)} oppna for loginet, {len(shut)} stangda.")
+    return 0
+
+
+def cmd_garpdb_tables(a):
+    try:
+        rows = garpdb.tables(a.db)
+    except garpdb.GarpDbError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    _print_rows(rows, "Databasen har inga tabeller, eller inga som loginet ser.")
+    return 0
+
+
+def cmd_garpdb_query(a):
+    sql = a.sql
+    if not sql:
+        if sys.stdin.isatty():
+            print("Ge fragan som argument eller pipa in den pa stdin.", file=sys.stderr)
+            return 2
+        sql = sys.stdin.read()
+    try:
+        rows = garpdb.query(sql, a.db, timeout=a.timeout)
+    except garpdb.GarpDbError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    _print_rows(rows)
+    if rows:
+        print(f"\n{len(rows)} rader.")
+    return 0
+
+
+def _add_garpdb_commands(sub):
+    s = sub.add_parser("check", help="who the login is on the instance, and what it may do")
+    s.set_defaults(fn=cmd_garpdb_check)
+
+    s = sub.add_parser("databases", help="every database on the instance, and which ones the login may open")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_garpdb_databases)
+
+    s = sub.add_parser("tables", help="tables in one database with row counts and size")
+    s.add_argument("--db", help=f"database to read (default {garpdb.DEFAULT_DATABASE})")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_garpdb_tables)
+
+    s = sub.add_parser("query", help="run one SELECT; the statement may also come from stdin")
+    s.add_argument("sql", nargs="?", help="the SELECT to run; omit it to read from stdin")
+    s.add_argument("--db", help=f"database to read (default {garpdb.DEFAULT_DATABASE})")
+    s.add_argument("--timeout", type=int, default=180, metavar="S", help="seconds to wait (default 180)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_garpdb_query)
+
+
 # ── Ongoing WMS ───────────────────────────────────────────────────────────────
 # Our own client, straight at the warehouse. Ongoing can say whether it got an
 # order; it cannot say why it did not, because it knows nothing about the webshop
@@ -1528,7 +1645,7 @@ def main(argv=None):
                     "Services: graph (Microsoft Graph via Entra), arena (WeSports Arena via Cloudflare Access).",
     )
     # metavar hides the compatibility aliases from the usage line.
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,user,arena,intune,ongoing,garp,calendar}")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,user,arena,intune,ongoing,garp,garpdb,calendar}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
@@ -1547,6 +1664,10 @@ def main(argv=None):
 
     ga = sub.add_parser("garp", help="Garp ERP, read-only: what the ERP took in and has not handed over")
     _add_garp_commands(ga.add_subparsers(dest="garp_cmd", required=True))
+
+    gd = sub.add_parser("garpdb", help="Garp's SQL Server directly, read-only: the ERP mirror and "
+                                       "the integration databases beside it")
+    _add_garpdb_commands(gd.add_subparsers(dest="garpdb_cmd", required=True))
 
     ca = sub.add_parser("calendar", help="mirror a private booking onto the work calendar as busy")
     _add_calendar_commands(ca.add_subparsers(dest="calendar_cmd", required=True))

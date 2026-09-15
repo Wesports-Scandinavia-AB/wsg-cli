@@ -66,6 +66,13 @@ wsg intune sync        ask a device to check in now
 wsg ongoing accounts   the configured Ongoing accounts (never the key)
 wsg ongoing last       how long since the warehouse last got an order, per channel
 
+wsg garp last          latest order per channel in Garp, and what has no picking list
+
+wsg garpdb check       who the login is on the SQL instance, and what it may do
+wsg garpdb databases   every database on the instance, and which ones you may open
+wsg garpdb tables      tables in one database with row counts and size
+wsg garpdb query SQL   run one SELECT, --db to pick the database, --json for JSON
+
 ```
 
 The 0.1 spellings `wsg login`, `wsg token`, `wsg status`, `wsg whoami` and
@@ -393,6 +400,65 @@ bare one is read as this machine's local clock. Windows ships no tz database for
 rather than a lookup — and outgoing time filters are sent in local time for the
 same reason, since a UTC boundary would shift the window by the offset every
 time, always in the same direction.
+
+## Garp SQL
+
+`wsg garp` asks the Business Server on 8443. `wsg garpdb` reads the SQL Server on
+the same host, `192.0.2.7\SQLEXPRESS` on 1433, where the ERP mirror lands next to
+the databases the integrations own — price engines, feeds, Quartz schedules, Svea
+reconciliation, e37 staging. Twelve business databases in all; `databases` lists
+them and says which ones your login may actually open.
+
+```
+wsg garpdb check
+wsg garpdb databases
+wsg garpdb tables --db PriceEngine
+wsg garpdb query "SELECT TOP 5 Ordernummer FROM OrderHuvud ORDER BY Ordernummer DESC"
+wsg garpdb query --db Quartz --json "SELECT * FROM QueuedJob" | jq .
+```
+
+A long statement is easier to pipe in than to quote:
+
+```powershell
+@'
+SELECT TOP 20 Artikelnr, [Benämning]
+FROM Artikel
+WHERE [Benämning] LIKE '%cykel%'
+'@ | wsg garpdb query
+```
+
+Garp's column names are Swedish and often contain spaces or a hyphen — `Benämning`,
+`Kod förs-rabatt`, `Lev-fl` — so bracket anything that is not a single plain word.
+Åäö survive the whole round trip, argument or stdin.
+
+### Credentials
+
+The login is `arena_dagster_read`: `db_datareader` and `db_denydatawriter` in
+every business database, so it reads everything and writes nothing. Put it in
+`%LOCALAPPDATA%\wsg\garpdb.json`:
+
+```json
+{
+  "user": "arena_dagster_read",
+  "password": "..."
+}
+```
+
+`server` and `database` may also go in that file; without them the defaults are
+`192.0.2.7\SQLEXPRESS,1433` and `NPS_Zidcore`. Every field can be overridden per
+call with `WSG_GARPDB_SERVER`, `_DATABASE`, `_USER` and `_PASSWORD`, which is
+what CI should use rather than writing the file.
+
+Only statements starting with `SELECT` or `WITH` leave the machine. That is a
+typo guard, not a permission model — the real protection is `db_denydatawriter`
+on the server, which no client can talk its way past. `wsg garpdb check` warns
+loudly if the configured login turns out to be `sysadmin`, because for such a
+login the deny does not apply and nothing here would stop a mistake.
+
+The queries run through `powershell.exe` and `System.Data.SqlClient` rather than
+pyodbc, which needs an ODBC driver this machine does not have. The instance sits
+on a private address behind a self-signed certificate, so certificate validation
+is off for that host and the server is unreachable from outside the VPN.
 
 ## Scripts
 
