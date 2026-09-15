@@ -14,6 +14,22 @@ def _scopes_arg(s):
     return [x.strip() for x in s.split(",") if x.strip()] if s else list(DEFAULT_SCOPES)
 
 
+def _stdin_text():
+    r"""Read stdin, minus the byte order mark PowerShell puts in front of a pipe.
+
+    `@'...'@ | wsg ...` writes a UTF-8 BOM before the first real byte, so the value
+    arrives as '﻿SELECT ...' or '﻿hunter2'. Nothing shows it: it is a
+    zero-width character, it survives .strip(), and every command here reads a
+    value whose exact bytes matter. A secret stored with one in front is quietly
+    the wrong secret, a password set that way cannot be typed at a login prompt,
+    and a mail body carries an invisible first character into every inbox.
+
+    Only the leading BOM goes. Trailing whitespace is each caller's business, and
+    they already disagree about it on purpose — a password may end in a space.
+    """
+    return sys.stdin.read().lstrip("﻿")
+
+
 def cmd_graph_login(a):
     scopes = _scopes_arg(a.scopes)
     try:
@@ -115,7 +131,7 @@ def cmd_graph_sendmail(a):
     if sys.stdin.isatty():
         print("Brodtexten lases fran stdin. Pipa in den, t.ex. med en here-doc.", file=sys.stderr)
         return 2
-    body_text = sys.stdin.read()
+    body_text = _stdin_text()
     if not body_text.strip():
         print("Tom brodtext, avbryter.", file=sys.stderr)
         return 2
@@ -359,7 +375,7 @@ def cmd_arena_secret_set(a):
     else:
         # A trailing newline from a pipe or heredoc is the shell's, not the secret's.
         # Anything else is kept: some credentials legitimately contain whitespace.
-        value = sys.stdin.read()
+        value = _stdin_text()
         # Exactly one trailing line ending is removed, because it belongs to the
         # pipe or heredoc rather than to the secret. Anything beyond that is kept:
         # a credential may legitimately end in whitespace, and silently trimming it
@@ -913,7 +929,7 @@ def _read_password(a, upn):
         return pw
     # One trailing line ending belongs to the pipe or heredoc, not to the
     # password. Anything beyond that is kept: a password may end in a space.
-    pw = sys.stdin.read()
+    pw = _stdin_text()
     for eol in ("\r\n", "\n", "\r"):
         if pw.endswith(eol):
             return pw[: -len(eol)]
@@ -1477,7 +1493,7 @@ def cmd_calendar_mirror(a):
               file=sys.stderr)
         return 2
     try:
-        ev = json.loads(sys.stdin.read() or "{}")
+        ev = json.loads(_stdin_text() or "{}")
     except ValueError as e:
         print(f"Kunde inte tolka JSON från stdin: {e}", file=sys.stderr)
         return 2
@@ -1717,7 +1733,7 @@ def cmd_garpdb_query(a):
         if sys.stdin.isatty():
             print("Ge fragan som argument eller pipa in den pa stdin.", file=sys.stderr)
             return 2
-        sql = sys.stdin.read()
+        sql = _stdin_text()
     try:
         rows = garpdb.query(sql, a.db, timeout=a.timeout)
     except garpdb.GarpDbError as e:
@@ -1953,7 +1969,10 @@ def _add_ongoing_commands(sub):
 
 
 def main(argv=None):
-    for stream in (sys.stdout, sys.stderr):
+    # stdin is in here too: what gets piped in is UTF-8 from every shell we use,
+    # while Python would otherwise decode it in the locale code page and turn a
+    # piped å into two characters. See _stdin_text for the other half of this.
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
