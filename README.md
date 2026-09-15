@@ -55,7 +55,7 @@ wsg user show X        account state, licences, sign-in history, last changes
 wsg user audit X       who changed the account, when, and what
 wsg user signins X     sign-in log, interactive and token refreshes
 wsg user groups X      group and directory role memberships
-wsg user password X    set a new password, generated or read from stdin
+wsg user password X    set a new password — in AD if the account is synced
 wsg user onprem-check  can we reach the DC, and does Entra Connect run there
 
 wsg intune apps        managed apps with their assignments
@@ -564,7 +564,9 @@ password manager. `--dry-run` shows the account and stops.
 By default the user must change the password at next sign-in; `--no-force-change`
 leaves it standing, and `--mfa` makes them pass MFA before the change.
 
-**Which half owns the password decides the command.** The environment is hybrid
+**Which half owns the password decides the route, and the command works it out.**
+A synced account goes to AD, a cloud account to Entra, and neither needs a flag.
+`--entra` forces the cloud route for the rare case that wants it. The environment is hybrid
 with password hash sync on and *password writeback off*, so for the ~480 synced
 accounts the password lives in on-prem AD: Entra refuses the write, and the next
 hash sync would overwrite it if it did not. The command reads
@@ -593,11 +595,12 @@ Three things worth knowing before the reset:
 
 ```
 wsg user onprem-check
-wsg user password person@example.com --on-prem --generate
-wsg user password person@example.com --on-prem --generate --sync
+wsg user password person@example.com --generate
+wsg user password person@example.com --generate --sync
 ```
 
-`--on-prem` opens a WinRM session to a domain controller and runs
+This is the default for a synced account; `--on-prem` only says it out loud. It
+opens a WinRM session to a domain controller and runs
 `Set-ADAccountPassword -Reset` there, then waits for Entra to show the new
 password date. The account is addressed by the `onPremisesDistinguishedName`
 Entra already holds, so the DC writes exactly the object the report was about
@@ -613,18 +616,24 @@ That is why the command verifies by polling `lastPasswordChangeDateTime` in
 Entra instead of trusting the sync cycle. Not seeing it inside `--wait` seconds
 is reported as "not yet", not as a failure - the AD write already happened.
 
+**Your own password is asked for at each run**, and is not stored. It is the
+credential that opens the session to the DC - a different secret from the new
+password being set, which still comes from `--generate` or stdin. Nothing is kept
+on disk because this machine is Entra joined but not a domain member, and a
+domain credential at rest there is worth more to an attacker than the
+convenience is worth to us. Where the command has to run unattended,
+`Get-Credential | Export-Clixml $env:LOCALAPPDATA\wsgd-cred.xml` writes a
+DPAPI-encrypted file, and its existence switches the prompt off.
+
 Setup, once per machine:
 
 ```
-wsg user onprem-check                  # says which of these is missing
-
-# the DC, into %LOCALAPPDATA%\wsg\onprem.json (or set WSG_AD_HOST)
-'{"host": "192.0.2.4"}' | Set-Content $env:LOCALAPPDATA\wsg\onprem.json
-
-# an AD account that may reset passwords, DPAPI-encrypted to you on this machine
-Get-Credential | Export-Clixml $env:LOCALAPPDATA\wsgd-cred.xml
+# the DC and the account that signs in to it, in %LOCALAPPDATA%\wsg\onprem.json
+{"host": "192.0.2.4", "user": "you@ad.example.com"}
 
 # only on a machine outside the domain: WinRM will not NTLM to an unknown host
-# without this. Elevated shell.
+# without this. Elevated shell, and scoped to the one address.
 Set-Item WSMan:\localhost\Client\TrustedHosts -Value 192.0.2.4 -Concatenate -Force
+
+wsg user onprem-check                  # says which of these is still missing
 ```

@@ -969,12 +969,16 @@ def cmd_user_password(a):
           f"lösenord ändrat {_ts(u.get('lastPasswordChangeDateTime'))}"
           f"{_age(u.get('lastPasswordChangeDateTime'))}", file=sys.stderr)
 
-    if a.on_prem:
-        if not synced:
-            print("        Molnkonto: det finns inte i AD, så --on-prem har inget att skriva "
-                  "till. Kör utan flaggan.", file=sys.stderr)
-            return 2
+    # Where the password lives decides the route, and the account says which that
+    # is — asking the operator to know would only be asking them to get it wrong.
+    # A synced account's password belongs to AD, so that is where the write goes;
+    # --entra forces the other way for the rare case that wants it.
+    if synced and not a.entra:
         return _password_on_prem(a, u, password)
+    if a.on_prem and not synced:
+        print("        Molnkonto: det finns inte i AD, så --on-prem har inget att skriva "
+              "till. Kör utan flaggan.", file=sys.stderr)
+        return 2
 
     if (u.get("userType") or "").casefold() == "guest":
         # A B2B guest has no password in this tenant at all: it authenticates in
@@ -998,8 +1002,8 @@ def cmd_user_password(a):
                   "        Entra tar inte emot bytet, och hash-synken skulle skriva över det "
                   "om den gjorde det.", file=sys.stderr)
             if not a.force:
-                print("Avbryter. Kör om med --on-prem, som byter i AD i stället "
-                      "(--force skickar till Entra ändå).", file=sys.stderr)
+                print("Avbryter. Utan --entra går kommandot till AD i stället, vilket är "
+                      "det du vill (--force skickar till Entra ändå).", file=sys.stderr)
                 return 2
         elif writeback is None:
             print("        Synkat konto: lösenordet ägs av lokalt AD. Om password writeback "
@@ -1069,9 +1073,15 @@ def _password_on_prem(a, u, password):
         print("        --mfa gäller bara Entra-vägen och ignoreras här: AD har ingen "
               "motsvarighet.", file=sys.stderr)
 
+    try:
+        cred = onprem.credential(a.ad_user)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
     if a.dry_run:
         try:
-            found = onprem.find_user(dc, identity)
+            found = onprem.find_user(dc, cred, identity)
         except onprem.OnPremError as e:
             print(str(e), file=sys.stderr)
             return 2
@@ -1090,7 +1100,7 @@ def _password_on_prem(a, u, password):
 
     before = u.get("lastPasswordChangeDateTime")
     try:
-        r = onprem.set_password(dc, identity, password,
+        r = onprem.set_password(dc, cred, identity, password,
                                 force_change=a.force_change, unlock=a.unlock)
     except onprem.OnPremError as e:
         print(str(e), file=sys.stderr)
@@ -1109,7 +1119,7 @@ def _password_on_prem(a, u, password):
 
     if a.sync:
         try:
-            sync = onprem.delta_sync(dc)
+            sync = onprem.delta_sync(dc, cred)
         except onprem.OnPremError as e:
             sync = {"ran": False, "reason": str(e)}
         if sync.get("ran"):
@@ -1171,10 +1181,13 @@ def cmd_user_onprem_check(a):
         print(str(e), file=sys.stderr)
         return 2
     print(f"Domänkontrollant: {dc}", file=sys.stderr)
-    print(f"Inloggning:       {onprem.cred_path()}"
-          + ("" if onprem.cred_path().exists() else "  (saknas)"), file=sys.stderr)
+    saved = onprem.cred_path().exists()
+    print("Inloggning:       "
+          + (f"sparad i {onprem.cred_path()}" if saved
+             else f"frågas vid körning ({onprem.ad_user(a.ad_user) or 'inget konto angivet'})"),
+          file=sys.stderr)
     try:
-        r = onprem.check(dc)
+        r = onprem.check(dc, onprem.credential(a.ad_user))
     except onprem.OnPremError as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -1253,11 +1266,17 @@ def _add_user_commands(sub):
                    help="also sign the account out everywhere; a reset alone leaves old "
                         "refresh tokens working")
     s.add_argument("--on-prem", dest="on_prem", action="store_true",
-                   help="reset in Active Directory over WinRM instead of in Entra; this is "
-                        "the only way for a synced account when writeback is off")
+                   help="reset in Active Directory over WinRM; this is already the default "
+                        "for a synced account, so the flag only makes it explicit")
+    s.add_argument("--entra", action="store_true",
+                   help="reset in Entra even for a synced account, where it is expected to "
+                        "fail while password writeback is off")
     s.add_argument("--host", metavar="DC",
                    help="domain controller to reset on, default WSG_AD_HOST or the "
                         "configured one")
+    s.add_argument("--ad-user", dest="ad_user", metavar="USER",
+                   help="AD account that signs in to the DC, e.g. you@ad.example.com; "
+                        "default WSG_AD_USER or the configured one")
     s.add_argument("--sync", action="store_true",
                    help="with --on-prem, also start a delta sync cycle (note: the password "
                         "itself rides hash sync, not this)")
@@ -1276,6 +1295,9 @@ def _add_user_commands(sub):
     s = sub.add_parser("onprem-check", help="can we reach the domain controller, and does "
                                             "Entra Connect run there")
     s.add_argument("--host", metavar="DC", help="default WSG_AD_HOST or the configured one")
+    s.add_argument("--ad-user", dest="ad_user", metavar="USER",
+                   help="AD account that signs in to the DC; default WSG_AD_USER or the "
+                        "configured one")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_user_onprem_check)
 
