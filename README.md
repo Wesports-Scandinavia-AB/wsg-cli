@@ -55,6 +55,8 @@ wsg user show X        account state, licences, sign-in history, last changes
 wsg user audit X       who changed the account, when, and what
 wsg user signins X     sign-in log, interactive and token refreshes
 wsg user groups X      group and directory role memberships
+wsg user password X    set a new password, generated or read from stdin
+wsg user onprem-check  can we reach the DC, and does Entra Connect run there
 
 wsg intune apps        managed apps with their assignments
 wsg intune app-status  per-user install status for one app
@@ -544,3 +546,85 @@ Four things the raw Graph output gets wrong if you read it too quickly:
 - **A synced account was probably changed in AD, not in Entra.** When
   `typ` says `synkat från lokalt AD`, the Entra audit record names AD Connect,
   and the person who made the change is only in the on-prem AD security log.
+
+### Resetting a password
+
+```
+wsg user password person@example.com --generate
+wsg user password person@example.com --generate --revoke-sessions
+pass show tempwd | wsg user password person@example.com -y
+```
+
+The password is generated here or read from stdin, and prompted for with echo
+off on a terminal. There is no `--value`: an argument lands in the shell history
+and in the process list, and this is a credential. `--generate` prints the new
+password on stdout and everything else on stderr, so it pipes straight into a
+password manager. `--dry-run` shows the account and stops.
+
+By default the user must change the password at next sign-in; `--no-force-change`
+leaves it standing, and `--mfa` makes them pass MFA before the change.
+
+**Which half owns the password decides the command.** The environment is hybrid
+with password hash sync on and *password writeback off*, so for the ~480 synced
+accounts the password lives in on-prem AD: Entra refuses the write, and the next
+hash sync would overwrite it if it did not. The command reads
+`passwordWritebackEnabled` from the tenant and stops rather than sending a
+request that fails, and points at `--on-prem`, which resets in AD instead. The
+257 cloud accounts go straight to Entra. Guest accounts are refused either way -
+a B2B guest authenticates in its own tenant and has no password here.
+
+Three things worth knowing before the reset:
+
+- **The scope is not the permission.** `User.ReadWrite.All` gets the request
+  through, but Entra still requires a directory role that may reset passwords -
+  Helpdesk, User or Password Administrator. Without one, Graph answers 403
+  *Insufficient privileges*, which reads exactly like missing consent. Resetting
+  an account that itself holds an admin role needs an equal or stronger role.
+- **A synced account belongs to AD.** With `typ: synkat från lokalt AD` the
+  password lives on-prem and the reset only goes through if password writeback
+  is on in Entra Connect - which it is not here, see above. Note that
+  `passwordSyncEnabled` is the other direction and says nothing about this.
+- **A new password does not sign anyone out.** Refresh tokens issued before the
+  reset keep working, which for a compromised account means the attacker stays
+  in. `--revoke-sessions` invalidates them; clients are out within the hour, and
+  access tokens already issued live until they expire.
+
+### Synced accounts: resetting in AD
+
+```
+wsg user onprem-check
+wsg user password person@example.com --on-prem --generate
+wsg user password person@example.com --on-prem --generate --sync
+```
+
+`--on-prem` opens a WinRM session to a domain controller and runs
+`Set-ADAccountPassword -Reset` there, then waits for Entra to show the new
+password date. The account is addressed by the `onPremisesDistinguishedName`
+Entra already holds, so the DC writes exactly the object the report was about
+rather than matching a name. A locked-out account is unlocked at the same time
+(`--no-unlock` leaves it), and the password takes the same route as everywhere
+else here: generator or stdin, into powershell.exe through an environment
+variable, to the DC inside the encrypted WinRM channel. Never argv.
+
+**A delta sync does not carry the password.** `--sync` starts
+`Start-ADSyncSyncCycle -PolicyType Delta`, which moves directory attributes;
+password hash sync is a separate channel that runs every 2 minutes on its own.
+That is why the command verifies by polling `lastPasswordChangeDateTime` in
+Entra instead of trusting the sync cycle. Not seeing it inside `--wait` seconds
+is reported as "not yet", not as a failure - the AD write already happened.
+
+Setup, once per machine:
+
+```
+wsg user onprem-check                  # says which of these is missing
+
+# the DC, into %LOCALAPPDATA%\wsg\onprem.json (or set WSG_AD_HOST)
+'{"host": "192.0.2.4"}' | Set-Content $env:LOCALAPPDATA\wsg\onprem.json
+
+# an AD account that may reset passwords, DPAPI-encrypted to you on this machine
+Get-Credential | Export-Clixml $env:LOCALAPPDATA\wsgd-cred.xml
+
+# only on a machine outside the domain: WinRM will not NTLM to an unknown host
+# without this. Elevated shell.
+Set-Item WSMan:\localhost\Client\TrustedHosts -Value 192.0.2.4 -Concatenate -Force
+```

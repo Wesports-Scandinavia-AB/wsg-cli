@@ -17,9 +17,16 @@ DEFAULT_SCOPES = [
     "MailboxSettings.Read",
     # Directory
     "User.Read.All",
+    # User.ReadWrite.All krävs för lösenordsreset (wsg user password) och för
+    # revokeSignInSessions. Scopet räcker inte i sig: kontot måste dessutom ha
+    # en roll som får återställa lösenord, t.ex. Helpdesk-administratör.
+    "User.ReadWrite.All",
     "Group.Read.All",
     "GroupMember.ReadWrite.All",
     "Directory.Read.All",
+    # Läser om password writeback är på, dvs. om ett synkat konto alls kan
+    # lösenordsbytas i Entra. Utan scopet hoppar wsg user password över kollen.
+    "OnPremDirectorySynchronization.Read.All",
     "Device.Read.All",
     "AuditLog.Read.All",
     "ServiceHealth.Read.All",

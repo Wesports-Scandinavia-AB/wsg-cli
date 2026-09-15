@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import arena, auth, garp, garpdb, intune, mscal, ongoing, users
+from . import arena, auth, garp, garpdb, intune, mscal, ongoing, onprem, users
 from .scopes import DEFAULT_SCOPES
 
 
@@ -896,6 +896,283 @@ def cmd_user_groups(a):
     return 0
 
 
+def _read_password(a, upn):
+    """The new password, from the generator, a terminal, or stdin - never argv.
+
+    An argument lands in the shell history and in the process list of every other
+    user on the machine, and this is a credential. Same reasoning as
+    `wsg arena secret-set`, which is why there is no --value here either.
+    """
+    if a.generate:
+        return users.generate_password(a.length)
+    if sys.stdin.isatty():
+        import getpass
+        pw = getpass.getpass(f"Nytt lösenord för {upn} (visas inte): ")
+        if pw and getpass.getpass("En gång till: ") != pw:
+            return None
+        return pw
+    # One trailing line ending belongs to the pipe or heredoc, not to the
+    # password. Anything beyond that is kept: a password may end in a space.
+    pw = sys.stdin.read()
+    for eol in ("\r\n", "\n", "\r"):
+        if pw.endswith(eol):
+            return pw[: -len(eol)]
+    return pw
+
+
+def _confirm(a, question):
+    if a.yes or not sys.stdin.isatty():
+        return True
+    return input(question).strip().lower() in ("j", "ja", "y", "yes")
+
+
+def cmd_user_password(a):
+    """Set a new password, in Entra or - for a synced account - in AD.
+
+    Which half of a hybrid tenant owns the password decides everything here, so
+    the command says which one it is talking to before it writes anything.
+    """
+    try:
+        u = users.resolve(a.user)
+    except users.UserError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    password = _read_password(a, u.get("userPrincipalName"))
+    if password is None:
+        print("Lösenorden skiljer sig, avbryter.", file=sys.stderr)
+        return 2
+    if not password:
+        print("Tomt lösenord, avbryter.", file=sys.stderr)
+        return 2
+
+    synced = u.get("onPremisesSyncEnabled")
+    print(f"Konto:  {u.get('displayName')} <{u.get('userPrincipalName')}>", file=sys.stderr)
+    print(f"        {'AKTIVERAT' if u.get('accountEnabled') else 'BLOCKERAT'}, "
+          f"{'synkat från lokalt AD' if synced else 'molnkonto'}, "
+          f"lösenord ändrat {_ts(u.get('lastPasswordChangeDateTime'))}"
+          f"{_age(u.get('lastPasswordChangeDateTime'))}", file=sys.stderr)
+
+    if a.on_prem:
+        if not synced:
+            print("        Molnkonto: det finns inte i AD, så --on-prem har inget att skriva "
+                  "till. Kör utan flaggan.", file=sys.stderr)
+            return 2
+        return _password_on_prem(a, u, password)
+
+    if (u.get("userType") or "").casefold() == "guest":
+        # A B2B guest has no password in this tenant at all: it authenticates in
+        # its home tenant, and the passwordProfile here is a stub Graph refuses to
+        # write. Worth catching by name, because the 403 does not explain it.
+        print("        Gästkonto: lösenordet ligger i gästens egen tenant och kan inte "
+              "sättas härifrån.", file=sys.stderr)
+        if not a.force:
+            print("Avbryter.", file=sys.stderr)
+            return 2
+
+    if synced:
+        # In a hybrid tenant this is where the command usually stops. Asking the
+        # tenant beats guessing, and beats sending a PATCH that Graph refuses with
+        # an error about "objects originated from an external service" that says
+        # nothing about writeback being the reason.
+        writeback = users.password_writeback()
+        if writeback is False:
+            print("        Synkat konto och password writeback är AVSLAGET i Entra Connect: "
+                  "lösenordet ägs av lokalt AD.\n"
+                  "        Entra tar inte emot bytet, och hash-synken skulle skriva över det "
+                  "om den gjorde det.", file=sys.stderr)
+            if not a.force:
+                print("Avbryter. Kör om med --on-prem, som byter i AD i stället "
+                      "(--force skickar till Entra ändå).", file=sys.stderr)
+                return 2
+        elif writeback is None:
+            print("        Synkat konto: lösenordet ägs av lokalt AD. Om password writeback "
+                  "är avslaget i Entra Connect tar Entra inte emot bytet.\n"
+                  "        (Kunde inte läsa sync-inställningarna — kräver "
+                  "OnPremDirectorySynchronization.Read.All.)", file=sys.stderr)
+        else:
+            print("        Synkat konto: lösenordet ägs av lokalt AD men writeback är på, "
+                  "så bytet skrivs tillbaka dit.", file=sys.stderr)
+
+    after = ("måste bytas vid nästa inloggning" if a.force_change else "gäller som det är")
+    print(f"Efteråt: {after}"
+          + (", med MFA innan bytet" if a.mfa else "")
+          + (", alla sessioner återkallas" if a.revoke_sessions else "")
+          + ".", file=sys.stderr)
+
+    if a.dry_run:
+        print(f"[torrkörning] {len(password)} tecken, inget skickat.", file=sys.stderr)
+        if a.generate:
+            print(password)
+        return 0
+
+    if not _confirm(a, "Sätt lösenordet i Entra? [j/N] "):
+        print("Avbryter.", file=sys.stderr)
+        return 1
+
+    try:
+        users.set_password(u["id"], password, force_change=a.force_change,
+                           force_change_with_mfa=a.mfa)
+    except users.UserError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    # The password is the only thing on stdout, so `wsg user password X --generate`
+    # can be piped into a password manager without the report coming with it.
+    if a.generate:
+        print(password)
+    print(f"Lösenordet är satt på {u.get('userPrincipalName')}.", file=sys.stderr)
+    return _revoke(a, u)
+
+
+def _password_on_prem(a, u, password):
+    """Reset a synced account where its password lives: in Active Directory.
+
+    Entra keeps the account's on-prem DN, so the DC is told exactly which object
+    to write rather than being asked to match a name.
+    """
+    identity = u.get("onPremisesDistinguishedName") or u.get("onPremisesSamAccountName")
+    if not identity:
+        print("        Kontot är märkt som synkat men saknar både DN och samAccountName "
+              "i Entra, så det går inte att peka ut i AD.", file=sys.stderr)
+        return 2
+    try:
+        dc = onprem.host(a.host)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    print(f"Skriver: {dc} (AD), {identity}", file=sys.stderr)
+    after = ("måste bytas vid nästa inloggning" if a.force_change else "gäller som det är")
+    print(f"Efteråt: {after}"
+          + (", kontot låses upp om det är låst" if a.unlock else "")
+          + (", delta-sync startas" if a.sync else "")
+          + (", alla sessioner återkallas i Entra" if a.revoke_sessions else "")
+          + ".", file=sys.stderr)
+    if a.mfa:
+        print("        --mfa gäller bara Entra-vägen och ignoreras här: AD har ingen "
+              "motsvarighet.", file=sys.stderr)
+
+    if a.dry_run:
+        try:
+            found = onprem.find_user(dc, identity)
+        except onprem.OnPremError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        print(f"[torrkörning] AD svarar: {found.get('samAccountName')}, "
+              f"{'aktivt' if found.get('enabled') else 'BLOCKERAT'}"
+              + (", LÅST" if found.get("lockedOut") else "")
+              + f", lösenord satt {found.get('pwdLastSet') or 'aldrig'}", file=sys.stderr)
+        print(f"[torrkörning] {len(password)} tecken, inget skrivet.", file=sys.stderr)
+        if a.generate:
+            print(password)
+        return 0
+
+    if not _confirm(a, f"Sätt lösenordet i AD på {dc}? [j/N] "):
+        print("Avbryter.", file=sys.stderr)
+        return 1
+
+    before = u.get("lastPasswordChangeDateTime")
+    try:
+        r = onprem.set_password(dc, identity, password,
+                                force_change=a.force_change, unlock=a.unlock)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    if a.generate:
+        print(password)
+    print(f"Lösenordet är satt i AD på {r.get('samAccountName') or identity}.", file=sys.stderr)
+    if isinstance(r.get("forceChange"), str):
+        print(f"  Men flaggan 'byt vid nästa inloggning' gick inte att sätta: "
+              f"{r['forceChange']}", file=sys.stderr)
+    if r.get("unlocked") is True:
+        print("  Kontot var låst och har låsts upp.", file=sys.stderr)
+    elif isinstance(r.get("unlocked"), str):
+        print(f"  Kontot är låst och gick inte att låsa upp: {r['unlocked']}", file=sys.stderr)
+
+    if a.sync:
+        try:
+            sync = onprem.delta_sync(dc)
+        except onprem.OnPremError as e:
+            sync = {"ran": False, "reason": str(e)}
+        if sync.get("ran"):
+            print(f"  Delta-sync startad: {sync.get('result')}. Den flyttar attribut, "
+                  f"inte lösenordet — det rider på hash-synken.", file=sys.stderr)
+        else:
+            print(f"  Ingen delta-sync: {sync.get('reason')}", file=sys.stderr)
+
+    rc = _wait_for_sync(u, before, a.wait)
+    return _revoke(a, u) or rc
+
+
+def _wait_for_sync(u, before, seconds):
+    """Poll Entra until the account's password date moves past what it was.
+
+    This is the only honest proof that the reset reached the cloud: password hash
+    sync runs on a 2-minute cycle of its own, and nothing on the AD side knows
+    whether it has been through. Not finding it inside the window is reported as
+    "not yet", never as a failure - the reset in AD already happened.
+    """
+    if not seconds:
+        return 0
+    print(f"Väntar på hash-synken (upp till {seconds}s)", end="", file=sys.stderr, flush=True)
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(15)
+        print(".", end="", file=sys.stderr, flush=True)
+        try:
+            now = users.resolve(u["id"]).get("lastPasswordChangeDateTime")
+        except users.UserError:
+            continue
+        if now and now != before:
+            print(f"\nEntra har det nya lösenordet: {_ts(now)}.", file=sys.stderr)
+            return 0
+    print(f"\nEntra visar fortfarande {_ts(before)}. Bytet i AD är gjort — hash-synken "
+          f"går var annan minut, så kolla igen med: wsg user show "
+          f"{u.get('userPrincipalName')}", file=sys.stderr)
+    return 0
+
+
+def _revoke(a, u):
+    if not a.revoke_sessions:
+        return 0
+    try:
+        users.revoke_sessions(u["id"])
+    except users.UserError as e:
+        print(f"Lösenordet är bytt men sessionerna lever kvar: {e}", file=sys.stderr)
+        return 1
+    print("Sessioner återkallade: utloggad från alla klienter inom en timme "
+          "(redan utfärdade access-tokens lever tills de går ut).", file=sys.stderr)
+    return 0
+
+
+def cmd_user_onprem_check(a):
+    """Whether the AD path is usable at all, before anyone needs it in a hurry."""
+    try:
+        dc = onprem.host(a.host)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    print(f"Domänkontrollant: {dc}", file=sys.stderr)
+    print(f"Inloggning:       {onprem.cred_path()}"
+          + ("" if onprem.cred_path().exists() else "  (saknas)"), file=sys.stderr)
+    try:
+        r = onprem.check(dc)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return 0
+    print(f"Ansluten som:     {r.get('whoami')} på {r.get('computer')} ({r.get('domain')})")
+    print(f"ActiveDirectory:  {'finns' if r.get('ad') else 'SAKNAS — RSAT-modulen behövs för lösenordsbyte'}")
+    print(f"ADSync:           {'finns — Entra Connect kör här' if r.get('adsync') else 'saknas — Entra Connect kör på en annan server'}")
+    if not r.get("adsync"):
+        print("                  (ingen delta-sync härifrån; hash-synken går ändå av sig själv)")
+    return 0
+
+
 def _add_user_commands(sub):
     def user_arg(s):
         s.add_argument("user", help="UPN, object id, or part of a display name")
@@ -943,6 +1220,48 @@ def _add_user_commands(sub):
     user_arg(s)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_user_groups)
+
+    s = sub.add_parser("password", help="set a new password on an account; the value is "
+                                        "read from stdin or generated, never an argument")
+    user_arg(s)
+    s.add_argument("--generate", action="store_true",
+                   help="generate a password and print it on stdout, instead of reading one")
+    s.add_argument("--length", type=int, default=20, metavar="N",
+                   help="length of the generated password, default 20")
+    s.add_argument("--no-force-change", dest="force_change", action="store_false",
+                   help="let the password stand; default is that the user must change it "
+                        "at next sign-in")
+    s.add_argument("--mfa", action="store_true",
+                   help="require MFA before that change (fails if the account has no method)")
+    s.add_argument("--revoke-sessions", action="store_true",
+                   help="also sign the account out everywhere; a reset alone leaves old "
+                        "refresh tokens working")
+    s.add_argument("--on-prem", dest="on_prem", action="store_true",
+                   help="reset in Active Directory over WinRM instead of in Entra; this is "
+                        "the only way for a synced account when writeback is off")
+    s.add_argument("--host", metavar="DC",
+                   help="domain controller to reset on, default WSG_AD_HOST or the "
+                        "configured one")
+    s.add_argument("--sync", action="store_true",
+                   help="with --on-prem, also start a delta sync cycle (note: the password "
+                        "itself rides hash sync, not this)")
+    s.add_argument("--wait", type=int, default=240, metavar="SEC",
+                   help="with --on-prem, wait this long for Entra to show the new password "
+                        "date; 0 skips the check (default 240)")
+    s.add_argument("--no-unlock", dest="unlock", action="store_false",
+                   help="with --on-prem, leave a locked-out account locked")
+    s.add_argument("--dry-run", action="store_true", help="show the account and stop")
+    s.add_argument("--force", action="store_true",
+                   help="send it even where it is known to fail: a synced account with "
+                        "writeback off, or a guest")
+    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_user_password)
+
+    s = sub.add_parser("onprem-check", help="can we reach the domain controller, and does "
+                                            "Entra Connect run there")
+    s.add_argument("--host", metavar="DC", help="default WSG_AD_HOST or the configured one")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_user_onprem_check)
 
 
 def _add_graph_commands(sub, visible=True):
