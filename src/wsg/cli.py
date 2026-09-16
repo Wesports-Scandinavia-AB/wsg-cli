@@ -1585,7 +1585,7 @@ def cmd_calendar_mirror(a):
 
     print(f"{ev.get('summary') or 'namnlös bokning'} speglad:")
     for block in made:
-        print(f"  {block.get('subject', '?'):9} {_event_ts(block.get('start'))} – "
+        print(f"  {block.get('subject', '?'):12} {_event_ts(block.get('start'))} – "
               f"{_event_ts(block.get('end'))[11:]}  id={block.get('id', '')[:24]}")
     # Travel was asked for but the event could not take it - say which, because
     # "speglad" on its own would read as if the half hours were there too.
@@ -1614,7 +1614,7 @@ def cmd_calendar_show(a):
     # blocks only reads as one thing when they are in the order they happen.
     rows.sort(key=lambda e: (e.get("start") or {}).get("dateTime") or "")
     for ev in rows:
-        print(f"  {ev.get('subject'):9} {_event_ts(ev.get('start'))} – "
+        print(f"  {ev.get('subject'):12} {_event_ts(ev.get('start'))} – "
               f"{_event_ts(ev.get('end'))[11:]}  "
               f"{ev.get('showAs')}/{ev.get('sensitivity')}")
         print(f"  {'':4}id={ev.get('id')}")
@@ -1643,7 +1643,7 @@ def cmd_calendar_unmirror(a):
         return 0
     if not a.yes:
         for ev in rows:
-            print(f"  {ev.get('subject'):9} {_event_ts(ev.get('start'))}")
+            print(f"  {ev.get('subject'):12} {_event_ts(ev.get('start'))}")
         print(f"\n{len(rows)} bokning(ar) skulle tas bort. Kör om med --yes.")
         return 1
     try:

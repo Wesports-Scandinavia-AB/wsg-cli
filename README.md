@@ -199,8 +199,8 @@ pkj calendar show <id> --json | wsg calendar mirror
 pkj calendar add -s Tandläkare --start "imorgon 09" --work      # the same thing in one go
 ```
 
-**The title never comes along.** The mirrored booking is called `Upptagen` and
-carries no description, no location and no guests, with `showAs: busy` and
+**The title never comes along.** The mirrored booking is called `🔒 Upptagen`
+and carries no description, no location and no guests, with `showAs: busy` and
 `sensitivity: private`. What is on a private calendar stays there; the work
 calendar learns only that the time is taken.
 
@@ -208,10 +208,13 @@ calendar learns only that the time is taken.
 block called `Restid`, so the trip there and back is not bookable either:
 
 ```
-09:15 Blodtryckskontroll  (Google)   ->   08:45-09:15  Restid     (Outlook)
-                                          09:15-09:45  Upptagen
-                                          09:45-10:15  Restid
+09:15 Blodtryckskontroll  (Google)   ->   08:45-09:15  🚗 Restid    (Outlook)
+                                          09:15-09:45  🔒 Upptagen
+                                          09:45-10:15  🚗 Restid
 ```
+
+The emoji is the only decoration either title carries, and it is chosen to say
+as little as the words do: a closed lock and a car.
 
 `--restid 45m` moves it, `--no-restid` books the appointment alone. The travel
 blocks carry the same link as the booking, so `show` lists all three and

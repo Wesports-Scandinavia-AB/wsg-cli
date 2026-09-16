@@ -43,8 +43,10 @@ from .auth import graph
 NAMESPACE = "66f5a359-4659-4830-9070-00047ec6ac6e"
 LINK = "String {%s} Name pkj-google-id" % NAMESPACE
 
-TITLE = "Upptagen"
-TRAVEL_TITLE = "Restid"
+# The emoji is part of what colleagues see, so it has to say as little as the
+# words do: a closed lock and a car, not a hint of what the time is for.
+TITLE = "🔒 Upptagen"
+TRAVEL_TITLE = "🚗 Restid"
 TRAVEL_DEFAULT = 30
 
 
