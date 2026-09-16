@@ -1502,6 +1502,23 @@ def _clock(s):
 # beskrivning och mscal:s API. Jämför med vad du hade innan du litar på det.
 
 
+def _event_ts(block, with_time=True):
+    """One side of a Graph event as local wall clock.
+
+    Graph puts the zone in a sibling field rather than on the timestamp, so the
+    naive string reaching _ts was taken for local time and printed unconverted -
+    a booking at 09:15 read as 07:15. Only UTC is resolved here: that is what
+    mirroring writes for a timed block, and an all-day one already carries the
+    mailbox's own wall clock, which is the right thing to show as it stands.
+    """
+    when = (block or {}).get("dateTime")
+    if not when:
+        return "-"
+    if (block.get("timeZone") or "").upper() == "UTC" and not when.endswith(("Z", "+00:00")):
+        when += "+00:00"
+    return _ts(when, with_time)
+
+
 def _minutes(text):
     """'30m', '1h', '1h30m', '90min', or a bare number of minutes."""
     s = (text or "").strip().lower().replace(" ", "").replace("min", "m")
@@ -1568,10 +1585,8 @@ def cmd_calendar_mirror(a):
 
     print(f"{ev.get('summary') or 'namnlös bokning'} speglad:")
     for block in made:
-        when = (block.get("start") or {}).get("dateTime") or "?"
-        until = (block.get("end") or {}).get("dateTime") or "?"
-        print(f"  {block.get('subject', '?'):9} {_ts(when)} – {_clock(until)}  "
-              f"id={block.get('id', '')[:24]}")
+        print(f"  {block.get('subject', '?'):9} {_event_ts(block.get('start'))} – "
+              f"{_event_ts(block.get('end'))[11:]}  id={block.get('id', '')[:24]}")
     # Travel was asked for but the event could not take it - say which, because
     # "speglad" on its own would read as if the half hours were there too.
     if travel and len(made) == 1:
@@ -1595,10 +1610,12 @@ def cmd_calendar_show(a):
     if not rows:
         print("Ingen spegling av det eventet.")
         return 1
+    # Graph hands them back in its own order; a booking flanked by two Restid
+    # blocks only reads as one thing when they are in the order they happen.
+    rows.sort(key=lambda e: (e.get("start") or {}).get("dateTime") or "")
     for ev in rows:
-        start = (ev.get("start") or {}).get("dateTime")
-        end = (ev.get("end") or {}).get("dateTime")
-        print(f"  {ev.get('subject')}  {_ts(start)} – {_ts(end)}  "
+        print(f"  {ev.get('subject'):9} {_event_ts(ev.get('start'))} – "
+              f"{_event_ts(ev.get('end'))[11:]}  "
               f"{ev.get('showAs')}/{ev.get('sensitivity')}")
         print(f"  {'':4}id={ev.get('id')}")
     # A booking plus its two Restid blocks is three rows and entirely normal, so
@@ -1626,7 +1643,7 @@ def cmd_calendar_unmirror(a):
         return 0
     if not a.yes:
         for ev in rows:
-            print(f"  {ev.get('subject')}  {_ts((ev.get('start') or {}).get('dateTime'))}")
+            print(f"  {ev.get('subject'):9} {_event_ts(ev.get('start'))}")
         print(f"\n{len(rows)} bokning(ar) skulle tas bort. Kör om med --yes.")
         return 1
     try:
