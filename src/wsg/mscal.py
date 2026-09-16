@@ -1,9 +1,15 @@
 """
 Mirror a private calendar booking onto the work calendar over Graph.
 
-The point is to block the time, not to tell the office what it is: every mirrored
-event is called "Upptagen" and carries no description, no location and no guests.
-A title from a private calendar never reaches a calendar colleagues can open.
+The point is to block the time, not to tell the office what it is: the mirrored
+booking is called "Upptagen" and carries no description, no location and no
+guests. A title from a private calendar never reaches a calendar colleagues can
+open.
+
+**Travel.** A booking can be flanked by half an hour of "Restid" either side, so
+the trip there and back is not bookable either. Those blocks say only that word,
+carry the same link as the booking, and are therefore cleared by the same
+`unmirror`. All-day events do not get them.
 
 Two problems this has to get right, both of which bite silently.
 
@@ -25,7 +31,7 @@ worse than an honest no.
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib import parse
 from urllib.error import HTTPError
 
@@ -38,6 +44,8 @@ NAMESPACE = "66f5a359-4659-4830-9070-00047ec6ac6e"
 LINK = "String {%s} Name pkj-google-id" % NAMESPACE
 
 TITLE = "Upptagen"
+TRAVEL_TITLE = "Restid"
+TRAVEL_DEFAULT = 30
 
 
 class MirrorError(Exception):
@@ -68,6 +76,59 @@ def _moment(block):
     if block.get("date"):
         return block["date"] + "T00:00:00", None, True
     raise MirrorError("Eventet har varken dateTime eller date.")
+
+
+def _instant(block):
+    """One side of a Google event as an aware UTC moment. None if all-day.
+
+    Travel time is arithmetic on a real instant, so it needs the datetime that
+    _moment throws away once it has formatted it.
+    """
+    if block.get("dateTime"):
+        when = datetime.fromisoformat(block["dateTime"].replace("Z", "+00:00"))
+        return when.astimezone(timezone.utc)
+    return None
+
+
+def _timed_block(gid, subject, start, end, suffix):
+    """A fixed-time block on the work calendar, linked to a Google event."""
+    # The suffix is what keeps the three transaction ids apart, so it has to
+    # survive the length cap: trim the id, never the suffix.
+    tx = ("pkj-" + gid)[:256 - len(suffix)] + suffix
+    return {
+        "subject": subject,
+        "start": {"dateTime": start.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"},
+        "end": {"dateTime": end.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"},
+        "isAllDay": False,
+        "showAs": "busy",
+        "sensitivity": "private",
+        "isReminderOn": False,
+        "responseRequested": False,
+        "transactionId": tx,
+        # The same link as the booking itself, so find() and unmirror() treat
+        # the travel as part of it rather than as strays nobody owns.
+        "singleValueExtendedProperties": [{"id": LINK, "value": gid}],
+    }
+
+
+def travel_bodies_for(ev, minutes=TRAVEL_DEFAULT):
+    """The Restid blocks either side of a booking, earliest first.
+
+    Empty for an all-day event: there is no journey to midnight, and half an
+    hour before one only takes a bite out of the evening before.
+    """
+    if minutes <= 0:
+        return []
+    gid = (ev.get("id") or "").strip()
+    start = _instant(ev.get("start") or {})
+    end = _instant(ev.get("end") or {})
+    if start is None or end is None:
+        return []
+    gap = timedelta(minutes=minutes)
+    return [
+        _timed_block(gid, TRAVEL_TITLE, start - gap, start, "-pre"),
+        _timed_block(gid, TRAVEL_TITLE, end, end + gap, "-post"),
+    ]
 
 
 def body_for(ev, zone=None):
@@ -110,12 +171,37 @@ def find(google_id):
     return (got or {}).get("value") or []
 
 
-def mirror(ev, zone=None):
-    """Put the block on the work calendar. Returns the Graph event."""
-    try:
-        return graph("POST", "/me/events", body=body_for(ev, zone))
-    except HTTPError as e:
-        raise MirrorError("Graph nekade bokningen: %s" % _error(e))
+def bodies_for(ev, zone=None, travel=0):
+    """Every Graph body for one Google event, in time order.
+
+    The booking itself always; a Restid block either side of it when asked for
+    one. body_for is what validates, so it runs whatever the travel setting is.
+    """
+    main = body_for(ev, zone)
+    either_side = travel_bodies_for(ev, travel)
+    if not either_side:
+        return [main]
+    before, after = either_side
+    return [before, main, after]
+
+
+def mirror(ev, zone=None, travel=0):
+    """Put the blocks on the work calendar. Returns the Graph events, in time order.
+
+    A POST that fails partway leaves what it already booked: every block carries
+    the link, so `unmirror` clears the lot, and the error says how many are out
+    there rather than letting them sit unmentioned.
+    """
+    made = []
+    for body in bodies_for(ev, zone, travel):
+        try:
+            made.append(graph("POST", "/me/events", body=body))
+        except HTTPError as e:
+            extra = ("" if not made else
+                     " %d block ligger redan på kalendern - ta bort dem med "
+                     "wsg calendar unmirror." % len(made))
+            raise MirrorError("Graph nekade bokningen: %s.%s" % (_error(e), extra))
+    return made
 
 
 def unmirror(google_id):

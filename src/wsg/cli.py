@@ -1502,6 +1502,29 @@ def _clock(s):
 # beskrivning och mscal:s API. Jämför med vad du hade innan du litar på det.
 
 
+def _minutes(text):
+    """'30m', '1h', '1h30m', '90min', or a bare number of minutes."""
+    s = (text or "").strip().lower().replace(" ", "").replace("min", "m")
+    if not s:
+        raise ValueError("ingen tid angiven")
+    if s.isdigit():
+        return int(s)
+    total, digits = 0, ""
+    for ch in s:
+        if ch.isdigit():
+            digits += ch
+        elif ch in "hm":
+            if not digits:
+                raise ValueError(f"{text!r}: saknar siffra före {ch!r}")
+            total += int(digits) * (60 if ch == "h" else 1)
+            digits = ""
+        else:
+            raise ValueError(f"{text!r}: förstår inte {ch!r}")
+    if digits:
+        raise ValueError(f"{text!r}: {digits} utan enhet")
+    return total
+
+
 def cmd_calendar_mirror(a):
     """Block the time on the work calendar from a Google event read on stdin.
 
@@ -1524,12 +1547,18 @@ def cmd_calendar_mirror(a):
         return 2
 
     try:
-        body = mscal.body_for(ev)
+        travel = 0 if a.no_restid else _minutes(a.restid)
+    except ValueError as e:
+        print(f"--restid {e}", file=sys.stderr)
+        return 2
+
+    try:
+        bodies = mscal.bodies_for(ev, travel=travel)
         if a.dry_run:
-            print("[torrkörning] POST /me/events — inget bokat")
-            print(json.dumps(body, indent=2, ensure_ascii=False))
+            print(f"[torrkörning] {len(bodies)} × POST /me/events — inget bokat")
+            print(json.dumps(bodies, indent=2, ensure_ascii=False))
             return 0
-        made = mscal.mirror(ev)
+        made = mscal.mirror(ev, travel=travel)
     except mscal.MirrorError as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -1537,9 +1566,16 @@ def cmd_calendar_mirror(a):
         print(str(e), file=sys.stderr)
         return 2
 
-    when = (made.get("start") or {}).get("dateTime") or "?"
-    print(f"{mscal.TITLE} {_ts(when)} — {(ev.get('summary') or 'namnlös bokning')} "
-          f"speglad. id={made.get('id', '')[:24]}")
+    print(f"{ev.get('summary') or 'namnlös bokning'} speglad:")
+    for block in made:
+        when = (block.get("start") or {}).get("dateTime") or "?"
+        until = (block.get("end") or {}).get("dateTime") or "?"
+        print(f"  {block.get('subject', '?'):9} {_ts(when)} – {_clock(until)}  "
+              f"id={block.get('id', '')[:24]}")
+    # Travel was asked for but the event could not take it - say which, because
+    # "speglad" on its own would read as if the half hours were there too.
+    if travel and len(made) == 1:
+        print("  (heldag, så ingen restid)")
     return 0
 
 
@@ -1565,10 +1601,16 @@ def cmd_calendar_show(a):
         print(f"  {ev.get('subject')}  {_ts(start)} – {_ts(end)}  "
               f"{ev.get('showAs')}/{ev.get('sensitivity')}")
         print(f"  {'':4}id={ev.get('id')}")
-    # More than one means an earlier run got past transactionId somehow; say so
-    # rather than let the count pass unnoticed.
-    if len(rows) > 1:
-        print(f"\n{len(rows)} speglingar av samma event — en av dem är övertalig.")
+    # A booking plus its two Restid blocks is three rows and entirely normal, so
+    # only a repeated subject means an earlier run got past transactionId.
+    seen = {}
+    for ev in rows:
+        seen[ev.get("subject")] = seen.get(ev.get("subject"), 0) + 1
+    doubled = [s for s, n in seen.items()
+               if n > (2 if s == mscal.TRAVEL_TITLE else 1)]
+    if doubled:
+        print(f"\n{', '.join(doubled)} finns i fler exemplar än det ska — "
+              f"övertaligt, städa med unmirror och spegla om.")
     return 0
 
 
@@ -1598,7 +1640,10 @@ def cmd_calendar_unmirror(a):
 
 def _add_calendar_commands(sub):
     s = sub.add_parser("mirror", help="block the time on the work calendar; reads a Google event on stdin")
-    s.add_argument("--dry-run", action="store_true", help="print the Graph body and book nothing")
+    s.add_argument("--restid", metavar="LEN", default="30m",
+                   help="travel time blocked either side: 30m, 1h, 45 (default: 30m)")
+    s.add_argument("--no-restid", action="store_true", help="the booking only, no travel time")
+    s.add_argument("--dry-run", action="store_true", help="print the Graph bodies and book nothing")
     s.set_defaults(fn=cmd_calendar_mirror)
 
     s = sub.add_parser("show", help="whether a Google event is mirrored, and where")
