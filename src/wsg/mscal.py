@@ -162,15 +162,50 @@ def body_for(ev, zone=None):
     }
 
 
+def _find_by_title(google_id):
+    """Every mirror of one Google event, found without the property index.
+
+    The two titles are the only other thing a block is known by, and there are
+    few enough of them in a mailbox to list: the link is then matched here rather
+    than by Graph. Wider and slower than the $filter, and it does not care
+    whether the extended property happens to be searchable this second.
+    """
+    flt = "subject eq '%s' or subject eq '%s'" % (TITLE, TRAVEL_TITLE)
+    exp = "singleValueExtendedProperties($filter=id eq '%s')" % LINK
+    url = ("/me/events?$filter=" + parse.quote(flt, safe="")
+           + "&$expand=" + parse.quote(exp, safe="") + "&$top=100")
+    out = []
+    while url:
+        try:
+            got = graph("GET", url) or {}
+        except HTTPError as e:
+            raise MirrorError("Reservsökningen misslyckades: %s" % _error(e))
+        for ev in got.get("value") or []:
+            if any((prop or {}).get("value") == google_id
+                   for prop in ev.get("singleValueExtendedProperties") or []):
+                out.append(ev)
+        url = got.get("@odata.nextLink")
+    return out
+
+
 def find(google_id):
-    """Every mirror of one Google event. A list, because a search can only say so."""
+    """Every mirror of one Google event. A list, because a search can only say so.
+
+    Nothing found is checked a second way before it is believed. The $filter on
+    the extended property has been seen to answer empty for an event that had
+    three blocks on the calendar, and the same call a second later found all
+    three - so an empty answer is not evidence of an empty calendar. This is the
+    read that runs before a write, and "ingen spegling" is exactly what makes
+    mirroring again look safe; transactionId was all that stood between that and
+    six blocks. A second opinion is two requests, and only on the empty path.
+    """
     flt = "singleValueExtendedProperties/any(ep:ep/id eq '%s' and ep/value eq '%s')" % (
         LINK, google_id.replace("'", "''"))
     try:
         got = graph("GET", "/me/events?$filter=" + parse.quote(flt, safe=""))
     except HTTPError as e:
         raise MirrorError("Sökningen misslyckades: %s" % _error(e))
-    return (got or {}).get("value") or []
+    return ((got or {}).get("value") or []) or _find_by_title(google_id)
 
 
 def bodies_for(ev, zone=None, travel=0):
@@ -199,11 +234,32 @@ def mirror(ev, zone=None, travel=0):
         try:
             made.append(graph("POST", "/me/events", body=body))
         except HTTPError as e:
-            extra = ("" if not made else
-                     " %d block ligger redan på kalendern - ta bort dem med "
-                     "wsg calendar unmirror." % len(made))
-            raise MirrorError("Graph nekade bokningen: %s.%s" % (_error(e), extra))
+            raise _refused(ev, e, made)
     return made
+
+
+def _refused(ev, e, made):
+    """What a rejected POST should say, which is not always what Graph said.
+
+    A reused transactionId is the duplicate guard holding, not a failure: the
+    block is already on the calendar. Nobody typed that id, so passing Graph's
+    sentence about it on to the user says nothing they can act on - and getting
+    here at all means find() answered empty for something that is mirrored,
+    which is the part worth printing.
+    """
+    reason = _error(e)
+    if "transactionid" in reason.lower() and not made:
+        here = find((ev.get("id") or "").strip())
+        if here:
+            return MirrorError(
+                "Redan speglad: %d block ligger på jobbkalendern sedan tidigare, "
+                "och Graph vägrar lägga dem en gång till. wsg calendar show visar "
+                "dem; ska de läggas om, ta bort dem med wsg calendar unmirror "
+                "först." % len(here))
+    extra = ("" if not made else
+             " %d block ligger redan på kalendern - ta bort dem med "
+             "wsg calendar unmirror." % len(made))
+    return MirrorError("Graph nekade bokningen: %s.%s" % (reason, extra))
 
 
 def unmirror(google_id):
