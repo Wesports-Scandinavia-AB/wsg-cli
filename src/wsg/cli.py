@@ -3,7 +3,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import arena, auth, garp, garpdb, intune, mscal, ongoing, onprem, users
@@ -1519,6 +1519,34 @@ def _event_ts(block, with_time=True):
     return _ts(when, with_time)
 
 
+def _block_when(ev):
+    """The when-column for one block on the work calendar, both ends of it.
+
+    `_event_ts(start) + _event_ts(end)[11:]` was right for the ordinary case, a
+    booking inside one day, and wrong for everything else. The slice throws away
+    the end's date, so a block over four days printed as a block of no length at
+    all - "2027-05-20 02:00 - 02:00" for Thursday through Sunday. And an all-day
+    block comes back from Graph normalised to UTC midnight however it was
+    written, so resolving it to local wall clock walked it to 02:00 and hung its
+    last day over into a fifth. An all-day block is its dates: Graph ends it at
+    the midnight after the last one, the same exclusive shape Google uses.
+    """
+    start, end = ev.get("start") or {}, ev.get("end") or {}
+    if ev.get("isAllDay"):
+        first, last = _dt(start.get("dateTime")), _dt(end.get("dateTime"))
+        if not first or not last:
+            return "-"
+        last -= timedelta(days=1)
+        if first.date() == last.date():
+            return f"{first:%Y-%m-%d} heldag"
+        return f"{first:%Y-%m-%d} – {last:%Y-%m-%d} heldag"
+    lo, hi = _event_ts(start), _event_ts(end)
+    if lo == "-" or hi == "-":
+        return f"{lo} – {hi}"
+    # Same day is the common case and reads better without the date repeated.
+    return f"{lo} – {hi[11:]}" if lo[:10] == hi[:10] else f"{lo} – {hi}"
+
+
 def _minutes(text):
     """'30m', '1h', '1h30m', '90min', or a bare number of minutes."""
     s = (text or "").strip().lower().replace(" ", "").replace("min", "m")
@@ -1585,8 +1613,8 @@ def cmd_calendar_mirror(a):
 
     print(f"{ev.get('summary') or 'namnlös bokning'} speglad:")
     for block in made:
-        print(f"  {block.get('subject', '?'):12} {_event_ts(block.get('start'))} – "
-              f"{_event_ts(block.get('end'))[11:]}  id={block.get('id', '')[:24]}")
+        print(f"  {block.get('subject', '?'):12} {_block_when(block)}"
+              f"  id={block.get('id', '')[:24]}")
     # Travel was asked for but the event could not take it - say which, because
     # "speglad" on its own would read as if the half hours were there too.
     if travel and len(made) == 1:
@@ -1614,8 +1642,7 @@ def cmd_calendar_show(a):
     # blocks only reads as one thing when they are in the order they happen.
     rows.sort(key=lambda e: (e.get("start") or {}).get("dateTime") or "")
     for ev in rows:
-        print(f"  {ev.get('subject'):12} {_event_ts(ev.get('start'))} – "
-              f"{_event_ts(ev.get('end'))[11:]}  "
+        print(f"  {ev.get('subject'):12} {_block_when(ev)}  "
               f"{ev.get('showAs')}/{ev.get('sensitivity')}")
         print(f"  {'':4}id={ev.get('id')}")
     # A booking plus its two Restid blocks is three rows and entirely normal, so
@@ -1643,7 +1670,9 @@ def cmd_calendar_unmirror(a):
         return 0
     if not a.yes:
         for ev in rows:
-            print(f"  {ev.get('subject'):12} {_event_ts(ev.get('start'))}")
+            # The list read before deleting, so it shows what is going in full
+            # rather than a start time that hides three of the four days.
+            print(f"  {ev.get('subject'):12} {_block_when(ev)}")
         print(f"\n{len(rows)} bokning(ar) skulle tas bort. Kör om med --yes.")
         return 1
     try:
