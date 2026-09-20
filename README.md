@@ -75,6 +75,12 @@ wsg garpdb databases   every database on the instance, and which ones you may op
 wsg garpdb tables      tables in one database with row counts and size
 wsg garpdb query SQL   run one SELECT, --db to pick the database, --json for JSON
 
+wsg planner plans      the Planner boards you can see, grouped by owner
+wsg planner tasks X    one board, in board order, by bucket — --all for completed
+wsg planner mine       tasks assigned to you, nearest due first
+wsg planner task ID    one task with its description and checklist
+wsg planner link X     the address of one board, --bare for the URL alone
+
 ```
 
 The 0.1 spellings `wsg login`, `wsg token`, `wsg status`, `wsg whoami` and
@@ -241,6 +247,70 @@ worse than an honest no: mirror the individual occurrences you want blocked.
 event alone.
 
 Needs `Calendars.ReadWrite`.
+
+## Planner
+
+`wsg planner` reads the Planner boards, and only reads them — nothing here
+writes a task, moves one, or ticks a box.
+
+```
+wsg planner plans                    every board you can see, grouped by owner
+wsg planner tasks "Vartex Service"   one board, in board order, by bucket
+wsg planner tasks <plan-id> --all    completed tasks included
+wsg planner mine                     what is assigned to you, nearest due first
+wsg planner task <task-id>           one task with description and checklist
+wsg planner link "Vartex Service"    the board's address, to paste somewhere
+wsg planner plans --link             the whole list with addresses, not ids
+wsg planner task <task-id> --link    a link to that one card
+```
+
+`tasks` takes a plan id or a fragment of the title. A fragment that matches more
+than one board lists them with their ids and stops, rather than printing the
+wrong board — "Vartex" alone matches four.
+
+Open tasks only, unless `--all`. A task is `○` not started, `◐` in progress or
+`●` done, which is the whole of what Planner tracks: `percentComplete` is 0,
+1–99 or 100 and there is no separate status field. Buckets and tasks print in
+board order, taken from the `orderHint` strings rather than sorted by title —
+a board sorted alphabetically is one nobody recognises.
+
+Due dates print as the date Planner itself shows. They are stored as midnight
+UTC with no time of day, so converting them to local time is a conversion of
+something that was never a moment; west of Greenwich it lands a day early and
+the task reads as overdue before it is.
+
+`plans` groups by what owns the board. That is usually a group or a team, but a
+personal board is owned by the account that made it and a shared list by a
+roster — a roster is not a directory object and has no name to look up, so it
+prints as "Delad lista".
+
+What you see is what you are a member of. A board someone only sent a link to is
+not in `plans`, and Graph answers that with an empty list rather than an error,
+so a missing board looks exactly like an empty one. Reading it by its plan id
+still works.
+
+### Links
+
+Graph hands out no `webUrl` for a plan or a task the way it does for a file or a
+calendar event, so `link` assembles the address instead of reading it:
+
+```
+https://planner.cloud.microsoft/webui/plan/<plan-id>/view/board?tid=<tenant>
+```
+
+The tenant comes from the `tid` claim in your own cached token. It matters when
+you are signed into more than one: without it the web app picks whichever
+session it finds first and says you have no access to a board you can read
+perfectly well.
+
+`--bare` prints the URL and nothing else, for piping into a mail or `clip`.
+`--legacy` builds the old `tasks.office.com` form instead, which still redirects
+— and which is the only one that opens a task without knowing its board, should
+the new host ever move again.
+
+Needs `Tasks.Read`, which was added to the default scopes later than most of
+them. An account that signed in before that gets HTTP 403 from every command
+here until `wsg graph login` runs once more, and the error says so.
 
 ## The secrets vault
 
