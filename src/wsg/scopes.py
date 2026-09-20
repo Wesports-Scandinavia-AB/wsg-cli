@@ -30,6 +30,10 @@ DEFAULT_SCOPES = [
     "Device.Read.All",
     "AuditLog.Read.All",
     "ServiceHealth.Read.All",
+    # Planner. Tasks.Read täcker både /me/planner/plans och en enskild board;
+    # namnen på tilldelade och på ägargruppen kommer från User.Read.All och
+    # Group.Read.All ovan, inte härifrån.
+    "Tasks.Read",
     # Intune
     "DeviceManagementManagedDevices.Read.All",
     "DeviceManagementManagedDevices.ReadWrite.All",

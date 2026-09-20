@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import arena, auth, garp, garpdb, intune, mscal, ongoing, onprem, users
+from . import arena, auth, garp, garpdb, intune, mscal, ongoing, onprem, planner, users
 from .scopes import DEFAULT_SCOPES
 
 
@@ -1703,6 +1703,212 @@ def _add_calendar_commands(sub):
     s.set_defaults(fn=cmd_calendar_unmirror)
 
 
+# ── Planner ───────────────────────────────────────────────────────────────────
+# Read-only: which boards exist, what is on them, and what is assigned to me.
+# Everything prints in board order, because a Planner board is a thing people
+# have arranged on purpose and an alphabetical list of it is unrecognisable.
+
+# ○ not started, ◐ in progress, ● done: the three states percentComplete has.
+_MARKS = {"ej påbörjad": "○", "pågår": "◐", "klar": "●"}
+
+
+def _due(s):
+    """The date Planner itself shows, as a plain date.
+
+    A due date is set without a time and stored as midnight UTC, so running it
+    through the local zone converts something that was never a moment. West of
+    Greenwich it lands on the day before, and the task then reads as overdue a
+    day early — which is why this takes the date part rather than calling _ts.
+    """
+    return (s or "")[:10]
+
+
+def _due_note(s):
+    """' förfaller 2026-09-30 (om 5 dagar)', or the same in red-hot past tense."""
+    day = _due(s)
+    if not day:
+        return ""
+    try:
+        left = (datetime.strptime(day, "%Y-%m-%d").date() - datetime.now().date()).days
+    except ValueError:
+        return f"  förfaller {day}"
+    if left < 0:
+        return f"  FÖRSENAD sedan {day} ({-left} dagar)"
+    when = "idag" if left == 0 else ("imorgon" if left == 1 else f"om {left} dagar")
+    return f"  förfaller {day} ({when})"
+
+
+def _task_line(t, indent="  "):
+    mark = _MARKS.get(planner.progress(t), "·")
+    who = ", ".join(t.get("_assignees") or []) or "ingen tilldelad"
+    return f"{indent}{mark} {t.get('title')}\n{indent}    {who}{_due_note(t.get('dueDateTime'))}"
+
+
+def cmd_planner_plans(a):
+    try:
+        rows = planner.plans()
+    except planner.PlannerError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("Inga planer. Planner visar bara boards i grupper du är medlem i —\n"
+              "en board du fått en länk till syns inte här.")
+        return 0
+    by_group = {}
+    for p in rows:
+        by_group.setdefault(p.get("_owner_name") or "-", []).append(p)
+    for group in sorted(by_group, key=str.casefold):
+        print(group)
+        for p in sorted(by_group[group], key=lambda x: (x.get("title") or "").casefold()):
+            trailer = planner.url(p["id"], legacy=a.legacy) if a.link else p.get("id")
+            print(f"  {p.get('title')}  {trailer}")
+    return 0
+
+
+def cmd_planner_link(a):
+    """The address of one board, to paste into a mail or a chat."""
+    try:
+        plan = planner.resolve_plan(a.plan)
+        link = planner.url(plan["id"], legacy=a.legacy)
+    except planner.PlannerError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.bare:
+        print(link)
+        return 0
+    print(f"{plan.get('title')}  ({plan.get('_owner_name')})")
+    print(link)
+    return 0
+
+
+def cmd_planner_tasks(a):
+    try:
+        plan = planner.resolve_plan(a.plan)
+        rows = planner.tasks(plan["id"], include_done=a.all)
+        cols = planner.buckets(plan["id"])
+    except planner.PlannerError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    print(f"{plan.get('title')}  ({plan.get('_owner_name')})\n")
+    if not rows:
+        print("Inget öppet på den planen." if not a.all else "Planen är tom.")
+        return 0
+    names = {b["id"]: b.get("name") or "-" for b in cols}
+    order = [b["id"] for b in cols] + [None]        # None: tasks with no bucket
+    for bucket_id in order:
+        here = [t for t in rows if (t.get("bucketId") or None) == bucket_id]
+        if not here:
+            continue
+        print(names.get(bucket_id, "(ingen hink)"))
+        for t in here:
+            print(_task_line(t))
+        print()
+    return 0
+
+
+def cmd_planner_mine(a):
+    try:
+        rows = planner.my_tasks(include_done=a.all)
+        titles = {p["id"]: p.get("title") for p in planner.plans()}
+    except planner.PlannerError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("Inget tilldelat dig." if not a.all else "Inget tilldelat dig, klart eller ej.")
+        return 0
+    for t in rows:
+        mark = _MARKS.get(planner.progress(t), "·")
+        plan = titles.get(t.get("planId"), t.get("planId") or "-")
+        print(f"{mark} {t.get('title')}\n    {plan}{_due_note(t.get('dueDateTime'))}")
+    return 0
+
+
+def cmd_planner_task(a):
+    try:
+        t = planner.task(a.task_id)
+    except planner.PlannerError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(t, indent=2, ensure_ascii=False))
+        return 0
+    print(f"{t.get('title')}")
+    print(f"  status     {planner.progress(t)} ({t.get('percentComplete') or 0} %)")
+    print(f"  tilldelad  {', '.join(t.get('_assignees') or []) or 'ingen'}")
+    if t.get("dueDateTime"):
+        print(f"  {_due_note(t.get('dueDateTime')).strip()}")
+    print(f"  skapad     {_ts(t.get('createdDateTime'), with_time=False)}")
+    desc = (t.get("_details") or {}).get("description")
+    if desc:
+        print("\n" + desc.strip())
+    items = planner.checklist(t)
+    if items:
+        print()
+        for done, title in items:
+            print(f"  [{'x' if done else ' '}] {title}")
+    if a.link:
+        # The card's own address needs the board it sits on, which the task
+        # carries; the legacy form opens a task without one.
+        print("\n" + planner.url(t.get("planId"), task_id=t.get("id"), legacy=a.legacy))
+    return 0
+
+
+def _add_planner_commands(sub):
+    s = sub.add_parser("plans", help="the Planner boards you can see, by group")
+    s.add_argument("--link", action="store_true", help="print each board's address instead of its id")
+    s.add_argument("--legacy", action="store_true", help="link through tasks.office.com instead")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_planner_plans)
+
+    s = sub.add_parser("link", help="the address of one board, to paste somewhere")
+    s.add_argument("plan", metavar="PLAN", help="plan id or a fragment of its title")
+    s.add_argument("--bare", action="store_true", help="the URL alone, nothing else — for piping")
+    s.add_argument("--legacy", action="store_true", help="link through tasks.office.com instead")
+    s.set_defaults(fn=cmd_planner_link)
+
+    s = sub.add_parser("tasks", help="one board, in board order, grouped by bucket")
+    s.add_argument("plan", metavar="PLAN", help="plan id or a fragment of its title")
+    s.add_argument("--all", action="store_true", help="include completed tasks")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_planner_tasks)
+
+    s = sub.add_parser("mine", help="tasks assigned to you, across every board, nearest due first")
+    s.add_argument("--all", action="store_true", help="include completed tasks")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_planner_mine)
+
+    s = sub.add_parser("task", help="one task with its description and checklist")
+    s.add_argument("task_id", metavar="TASK-ID")
+    s.add_argument("--link", action="store_true", help="also print the address of the card itself")
+    s.add_argument("--legacy", action="store_true", help="link through tasks.office.com instead")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_planner_task)
+
+
 # ── Garp ERP ──────────────────────────────────────────────────────────────────
 # The ERP half of the same question. `wsg ongoing last` says whether the warehouse
 # got the order; this says whether Garp ever sent it. Read together they locate the
@@ -2096,7 +2302,8 @@ def main(argv=None):
                     "Services: graph (Microsoft Graph via Entra), arena (WeSports Arena via Cloudflare Access).",
     )
     # metavar hides the compatibility aliases from the usage line.
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="{graph,user,arena,intune,ongoing,garp,garpdb,calendar}")
+    sub = p.add_subparsers(dest="cmd", required=True,
+                           metavar="{graph,user,arena,intune,ongoing,garp,garpdb,calendar,planner}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
@@ -2122,6 +2329,9 @@ def main(argv=None):
 
     ca = sub.add_parser("calendar", help="mirror a private booking onto the work calendar as busy")
     _add_calendar_commands(ca.add_subparsers(dest="calendar_cmd", required=True))
+
+    pl = sub.add_parser("planner", help="Planner boards, read-only: what is on them and what is mine")
+    _add_planner_commands(pl.add_subparsers(dest="planner_cmd", required=True))
 
     _add_graph_commands(sub, visible=False)   # wsg login / token / status / whoami / logout
 
