@@ -1462,6 +1462,477 @@ def _revoke(a, u):
     return 0
 
 
+# ── creating an account ───────────────────────────────────────────────────────
+
+# AD's own rule, and the one that is easy to trip over: 20 characters, and none
+# of the punctuation it reserves. A dot is legal, which is what the convention
+# in this directory uses.
+_SAM_OK = re.compile(r"^[A-Za-z0-9._-]{1,20}$")
+
+
+class _SpecError(Exception):
+    pass
+
+
+def _derive(a):
+    """UPN, samAccountName, CN and display name from what little was given.
+
+    Only the UPN is required. The rest follows from it by the convention the
+    directory already uses - firstname.lastname - and each part can be
+    overridden on its own. Deriving a person's name from an address is
+    guesswork, so the plan prints every field before anything is written.
+    """
+    upn = (a.upn or "").strip()
+    local, _, suffix = upn.partition("@")
+    if not local or not suffix:
+        raise _SpecError(f"{upn!r} är inget UPN. Ange hela adressen, "
+                         f"t.ex. person@example.com.")
+
+    first, _, last = local.partition(".")
+    given = a.given_name or (first.title() if first else None)
+    surname = a.surname or (last.replace(".", " ").title() if last else None)
+    display = a.display_name or (" ".join(x for x in (given, surname) if x) or local)
+
+    sam = (a.sam or local).lower()
+    if not _SAM_OK.match(sam):
+        why = "är längre än 20 tecken" if len(sam) > 20 else "har tecken AD inte tar"
+        raise _SpecError(f"samAccountName {sam!r} {why}. Ange ett kortare med --sam.")
+
+    return {
+        "Name": a.cn or display,          # the CN, which must be unique in the OU
+        "SamAccountName": sam,
+        "UserPrincipalName": upn,
+        "DisplayName": display,
+        "GivenName": given,
+        "Surname": surname,
+        "EmailAddress": None if a.no_mail else (a.mail or upn),
+        "Title": a.title,
+        "Department": a.department,
+        "Company": a.company,
+        "Office": a.office,
+        "MobilePhone": a.mobile,
+        "OfficePhone": a.office_phone,
+        "EmployeeID": a.employee_id,
+        "Description": a.description,
+        "Manager": a.manager,
+        "ou": a.ou or onprem.default_ou(),
+        "like": a.like,
+        "groups": list(a.group or []),
+        "copyGroups": bool(a.like) and a.copy_groups,
+        "enabled": not a.disabled,
+        "forceChange": a.force_change,
+    }
+
+
+def _verified_suffix(upn):
+    """Whether Entra will keep this UPN or rewrite it on the way in.
+
+    (None, None) when the tenant cannot be asked. An unverified suffix is not
+    refused by AD and not refused by the sync either - Connect simply replaces
+    it - so it is worth one call while the account can still be renamed.
+    """
+    domains = users.verified_domains()
+    if domains is None:
+        return None, None
+    suffix = upn.rpartition("@")[2].casefold()
+    return any(d.casefold() == suffix for d in domains), domains
+
+
+def cmd_user_create(a):
+    """Create an account in AD, which is where a synced account has to start.
+
+    A cloud account cannot be adopted by AD afterwards without a hard match on
+    immutableId, so in a hybrid tenant this is the only sane birthplace. What
+    follows - licence, mailbox, Entra groups - waits for the sync and is not
+    this command's business.
+    """
+    try:
+        spec = _derive(a)
+    except _SpecError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    upn = spec["UserPrincipalName"]
+
+    # Entra first, and read-only. If the name is taken up there, creating it in
+    # AD makes a second object that the sync collides with rather than merges,
+    # and that mess is left behind for someone to clean up by hand.
+    try:
+        clash = [u for u in users.find(upn, limit=5)
+                 if (u.get("userPrincipalName") or "").casefold() == upn.casefold()]
+    except users.UserError as e:
+        print(f"Kunde inte fråga Entra om {upn} redan finns: {e}", file=sys.stderr)
+        return 1
+    if clash:
+        u = clash[0]
+        print(f"{upn} finns redan i Entra: {u.get('displayName')}, "
+              f"{'synkat från lokalt AD' if u.get('onPremisesSyncEnabled') else 'molnkonto'}, "
+              f"{'aktiverat' if u.get('accountEnabled') else 'BLOCKERAT'}.\n"
+              f"Kör wsg user show {upn}.", file=sys.stderr)
+        return 2
+
+    verified, domains = _verified_suffix(upn)
+    if verified is False:
+        print(f"@{upn.rpartition('@')[2]} är inte en verifierad domän i tenanten. AD tar "
+              f"emot den ändå, men Entra Connect byter då UPN till "
+              f"...@<tenant>.onmicrosoft.com, och adressen ni lämnar ut fungerar inte.\n"
+              f"Verifierade: {', '.join(sorted(domains)) or 'inga'}", file=sys.stderr)
+        if not a.force:
+            print("Avbryter (--force skapar ändå).", file=sys.stderr)
+            return 2
+
+    try:
+        dc = onprem.host(a.host)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    password = _read_password(a, upn)
+    if password is None:
+        print("Lösenorden skiljer sig, avbryter.", file=sys.stderr)
+        return 2
+    if not password:
+        print("Tomt lösenord, avbryter.", file=sys.stderr)
+        return 2
+
+    try:
+        cred = onprem.credential(a.ad_user)
+        pre = onprem.precheck(dc, cred, spec["SamAccountName"], upn, spec["ou"], a.like)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    # The OU may have come from the template rather than from a flag, and the
+    # plan has to name the one that will actually be written to.
+    if pre.get("ou"):
+        spec["ou"] = pre["ou"]
+    ou = spec["ou"]
+
+    print(f"Skapar: {spec['DisplayName']} <{upn}>", file=sys.stderr)
+    print(f"        {dc} ({pre.get('domain') or 'AD'}), sam {spec['SamAccountName']}",
+          file=sys.stderr)
+    print(f"        OU {ou or 'SAKNAS'}", file=sys.stderr)
+    for label, key in (("förnamn", "GivenName"), ("efternamn", "Surname"),
+                       ("titel", "Title"), ("avdelning", "Department"),
+                       ("företag", "Company"), ("kontor", "Office"),
+                       ("mobil", "MobilePhone"), ("telefon", "OfficePhone"),
+                       ("mail", "EmailAddress"),
+                       ("anställningsnr", "EmployeeID"), ("chef", "Manager"),
+                       ("beskrivning", "Description")):
+        if spec.get(key):
+            print(f"        {label:<15}{spec[key]}", file=sys.stderr)
+
+    if pre.get("likeError"):
+        print(f"Mallkontot {a.like!r} gick inte att läsa i AD: {pre['likeError']}",
+              file=sys.stderr)
+        return 2
+    like_groups = pre.get("likeGroups") or []
+    if a.like:
+        print(f"Mall:   {pre.get('likeDn')}", file=sys.stderr)
+        print(f"        {len(like_groups)} grupp(er)"
+              + (" kopieras" if spec["copyGroups"] else " kopieras INTE (--no-copy-groups)"),
+              file=sys.stderr)
+    for g in (like_groups if spec["copyGroups"] else []) + spec["groups"]:
+        print(f"        + {g}", file=sys.stderr)
+
+    stop = False
+    if not ou:
+        print(f"Ingen OU angiven. Sätt --ou, lägg \"ou\" i {onprem.config_path()}, "
+              f"eller peka ut ett mallkonto med --like.\n"
+              f"Utan OU hamnar kontot i domänens standardcontainer, som Entra Connect "
+              f"oftast inte synkar alls — då finns kontot i AD och ingen annanstans.",
+              file=sys.stderr)
+        stop = True
+    elif pre.get("ouOk") is False:
+        print(f"OU:n finns inte i AD: {ou}", file=sys.stderr)
+        stop = True
+    candidates = []
+    seen = set()
+    for c in (pre.get("clash") or []):
+        # The same object comes back once per scope that could see it.
+        if c.get("dn") in seen:
+            continue
+        seen.add(c.get("dn"))
+        candidates.append(c)
+
+    if pre.get("samTaken") or pre.get("upnTaken"):
+        taken = []
+        if pre.get("samTaken"):
+            taken.append(f"samAccountName {spec['SamAccountName']}")
+        if pre.get("upnTaken"):
+            taken.append(f"UPN {upn}")
+        print(f"Upptaget i skogen: {' och '.join(taken)}.", file=sys.stderr)
+        for c in candidates:
+            print(_clash_line(c), file=sys.stderr)
+        if a.adopt and len(candidates) == 1 and not candidates[0].get("deleted"):
+            return _adopt(a, spec, candidates[0], password, dc, cred, pre)
+        if a.adopt and len(candidates) != 1:
+            print(f"  --adopt tar bara ett objekt i taget, och det här är "
+                  f"{len(candidates)}. Peka ut rätt objekt för hand.", file=sys.stderr)
+        elif a.adopt:
+            print("  --adopt kan inte återanvända ett raderat objekt. Återställ det först "
+                  "med Restore-ADObject, eller välj ett annat namn.", file=sys.stderr)
+        else:
+            print("  Är det samma person som kommer tillbaka, är det objektet vi ska "
+                  "använda: --adopt\n  flyttar in det i rätt OU igen i stället för att "
+                  "skapa ett andra konto. Ett\n  offboardat konto utanför synkens "
+                  "OU-filter syns inte i Entra, men AD vaktar\n  ändå dess UPN.",
+                  file=sys.stderr)
+        stop = True
+    if pre.get("problems"):
+        print("Namnkollen nådde inte hela skogen:", file=sys.stderr)
+        _problems(pre["problems"])
+        print("  Namnet kan vara upptaget där ändå — då faller New-ADUser på "
+              "\"not unique forest-wide\".", file=sys.stderr)
+    suffixes = pre.get("suffixes") or []
+    if suffixes and upn.rpartition("@")[2].casefold() not in {x.casefold() for x in suffixes}:
+        print(f"Obs: @{upn.rpartition('@')[2]} är inget registrerat UPN-suffix i skogen "
+              f"({', '.join(suffixes)}). AD skriver det ändå.", file=sys.stderr)
+    if stop:
+        return 2
+
+    print(f"Efteråt: kontot är {'aktiverat' if spec['enabled'] else 'BLOCKERAT'}, "
+          f"lösenordet "
+          + ("måste bytas vid första inloggningen" if spec["forceChange"]
+             else "gäller som det är")
+          + (", delta-sync startas" if a.sync else "")
+          + ".", file=sys.stderr)
+
+    if a.dry_run:
+        print(f"[torrkörning] {len(password)} tecken, inget skrivet.", file=sys.stderr)
+        if a.generate:
+            print(password)
+        return 0
+
+    if not _confirm(a, f"Skapa kontot i AD på {dc}? [j/N] "):
+        print("Avbryter.", file=sys.stderr)
+        return 1
+
+    try:
+        r = onprem.create_user(dc, cred, spec, password)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    # Same split as everywhere else here: the password alone on stdout, so it
+    # pipes into a password manager without the report coming with it.
+    if a.generate:
+        print(password)
+    print(f"Skapat i AD: {r.get('dn')}", file=sys.stderr)
+    print(f"  {r.get('sam')}  {r.get('upn')}  "
+          f"{'aktiverat' if r.get('enabled') else 'BLOCKERAT'}  {r.get('guid')}",
+          file=sys.stderr)
+    if r.get("groups"):
+        print(f"  {len(r['groups'])} grupp(er) tillagda.", file=sys.stderr)
+    for g, why in (r.get("groupErrors") or {}).items():
+        print(f"  Gruppen gick inte att lägga till: {g}\n    {why}", file=sys.stderr)
+
+    if a.sync:
+        try:
+            sync = onprem.delta_sync(dc, cred)
+        except onprem.OnPremError as e:
+            sync = {"ran": False, "reason": str(e)}
+        if sync.get("ran"):
+            print(f"  Delta-sync startad: {sync.get('result')}.", file=sys.stderr)
+        else:
+            print(f"  Ingen delta-sync: {sync.get('reason')}", file=sys.stderr)
+
+    rc = _wait_for_user(upn, a.wait if a.wait is not None else (300 if a.sync else 0))
+    print("Kvar i molnet när kontot har synkat: licens — och därmed postlådan i "
+          "Exchange Online — Entra-grupper och MFA-registrering. Finns Exchange kvar "
+          "on-prem skapas postlådan där med Enable-RemoteMailbox, inte härifrån.",
+          file=sys.stderr)
+    return rc
+
+
+def _adopt(a, spec, found, password, dc, cred, pre):
+    """Put the account AD already has back into service, rather than adding a second.
+
+    The same person returning should get the same object: the SID goes with it,
+    and with the SID every on-prem permission ever granted to them. What this
+    cannot bring back is the cloud side - the Entra object was deleted when the
+    account fell out of the sync scope, so the mailbox that comes with the new
+    licence is a new and empty one.
+    """
+    ou = spec["ou"]
+    print(f"\nÅteranvänder det befintliga kontot i stället för att skapa ett nytt.",
+          file=sys.stderr)
+    print(f"        {found.get('dn')}", file=sys.stderr)
+    if found.get("enabled"):
+        print("        Kontot är AKTIVT där det står — det har aldrig stängts av, bara "
+              "flyttats.", file=sys.stderr)
+    parent = found.get("dn", "").split(",", 1)[-1]
+    if ou and parent.casefold() != ou.casefold():
+        print(f"        flyttas till  {ou}", file=sys.stderr)
+    else:
+        print(f"        står redan i  {ou}", file=sys.stderr)
+
+    like_groups = pre.get("likeGroups") or []
+    want = (like_groups if spec["copyGroups"] else []) + spec["groups"]
+    for g in want:
+        print(f"        + {g}", file=sys.stderr)
+    print("        Grupper det redan har rörs inte — läs dem efteråt med "
+          "wsg user onprem-find, gammal åtkomst följer med objektet.", file=sys.stderr)
+    print(f"Efteråt: {'aktiverat' if spec['enabled'] else 'BLOCKERAT'}, nytt lösenord som "
+          + ("måste bytas vid första inloggningen" if spec["forceChange"]
+             else "gäller som det är")
+          + (", delta-sync startas" if a.sync else "")
+          + ".", file=sys.stderr)
+
+    if a.dry_run:
+        print(f"[torrkörning] {len(password)} tecken, inget skrivet.", file=sys.stderr)
+        if a.generate:
+            print(password)
+        return 0
+
+    if not _confirm(a, f"Återanvänd {found.get('dn')}? [j/N] "):
+        print("Avbryter.", file=sys.stderr)
+        return 1
+
+    try:
+        r = onprem.adopt_user(dc, cred, found["dn"], spec, password)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    if a.generate:
+        print(password)
+    print(f"Återanvänt: {r.get('dn')}", file=sys.stderr)
+    print(f"  {r.get('sam')}  {r.get('upn')}  "
+          f"{'aktiverat' if r.get('enabled') else 'BLOCKERAT'}  {r.get('guid')}",
+          file=sys.stderr)
+    if r.get("moved"):
+        print(f"  Flyttat från {r.get('wasDn')}", file=sys.stderr)
+    if r.get("wasEnabled") and not r.get("enabled"):
+        print("  Var aktivt, är nu blockerat.", file=sys.stderr)
+    had = r.get("hadGroups") or []
+    if had:
+        print(f"  Hade redan {len(had)} grupp(er) sedan förra gången:", file=sys.stderr)
+        for g in had:
+            print(f"    {g}", file=sys.stderr)
+    if r.get("groups"):
+        print(f"  {len(r['groups'])} grupp(er) tillagda.", file=sys.stderr)
+    for g, why in (r.get("groupErrors") or {}).items():
+        print(f"  Gruppen gick inte att lägga till: {g}\n    {why}", file=sys.stderr)
+    if isinstance(r.get("forceChange"), str):
+        print(f"  Flaggan 'byt vid nästa inloggning' gick inte att sätta: "
+              f"{r['forceChange']}", file=sys.stderr)
+
+    if a.sync:
+        try:
+            sync = onprem.delta_sync(dc, cred)
+        except onprem.OnPremError as e:
+            sync = {"ran": False, "reason": str(e)}
+        if sync.get("ran"):
+            print(f"  Delta-sync startad: {sync.get('result')}.", file=sys.stderr)
+        else:
+            print(f"  Ingen delta-sync: {sync.get('reason')}", file=sys.stderr)
+
+    rc = _wait_for_user(spec["UserPrincipalName"],
+                        a.wait if a.wait is not None else (300 if a.sync else 0))
+    print("Kvar i molnet: licens, Entra-grupper och MFA. Entra-objektet som fanns förr "
+          "är sedan länge borta, så det blir ett nytt konto där uppe med en ny, tom "
+          "postlåda — SID:et som följer med objektet gäller bara on-prem.",
+          file=sys.stderr)
+    return rc
+
+
+def _wait_for_user(upn, seconds):
+    """Poll Entra until the sync has carried the new account across.
+
+    Not finding it inside the window is reported as "not yet", never as a
+    failure: the account exists in AD either way, and a scheduled cycle can be
+    half an hour away when no delta was started.
+    """
+    if not seconds:
+        return 0
+    print(f"Väntar på synken (upp till {seconds}s)", end="", file=sys.stderr, flush=True)
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(15)
+        print(".", end="", file=sys.stderr, flush=True)
+        try:
+            u = users.resolve(upn)
+        except users.UserError:
+            continue
+        print(f"\nKontot finns i Entra: {u.get('userPrincipalName')}  {u.get('id')}",
+              file=sys.stderr)
+        if not u.get("onPremisesSyncEnabled"):
+            print("  Men det är inte märkt som synkat, så det är ett annat objekt än "
+                  "det som just skapades.", file=sys.stderr)
+        return 0
+    print(f"\nInte i Entra ännu. Kontot finns i AD — synkcykeln går var 30:e minut när "
+          f"ingen delta startas. Kolla igen med: wsg user show {upn}", file=sys.stderr)
+    return 0
+
+
+def _problems(problems):
+    """Name every scope of the search that did not answer.
+
+    A forest-wide check that quietly skipped a domain is worse than no check:
+    it reports a free name with the same words either way.
+    """
+    for why in problems or []:
+        print(f"  kunde inte söka: {why}", file=sys.stderr)
+
+
+def _clash_line(c):
+    """One line about an object that already holds the name we want."""
+    what = []
+    if c.get("deleted"):
+        what.append("RADERAT, ligger kvar i papperskorgen")
+    elif c.get("enabled") is False:
+        what.append("BLOCKERAT")
+    elif c.get("enabled"):
+        what.append("aktivt")
+    if (c.get("class") or "user") != "user":
+        what.append(c["class"])
+    seen = c.get("lastLogon")
+    if seen:
+        what.append(f"senast inloggad {_ts(seen, with_time=False)}")
+    return (f"  {c.get('dn')}\n"
+            f"    {', '.join(what) or 'okänt tillstånd'}"
+            + (f"  [sedd i {c['source']}]" if c.get("source") else "")
+            + (f"\n    upn {c['upn']}" if c.get("upn") else "")
+            + (f"  sam {c['sam']}" if c.get("sam") else ""))
+
+
+def cmd_user_onprem_find(a):
+    """Who in the forest already answers to this name, deleted objects included.
+
+    The question this exists for is "why is the name taken": AD enforces UPN
+    uniqueness forest-wide, and the object holding it is regularly one nobody
+    remembers - offboarded out of the sync scope, or deleted and still held by
+    the Recycle Bin, in either case invisible from Entra.
+    """
+    try:
+        dc = onprem.host(a.host)
+        cred = onprem.credential(a.ad_user)
+        got = onprem.search(dc, cred, a.query)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    hits = got.get("hits") or []
+    problems = got.get("problems") or []
+    if a.json:
+        print(json.dumps(got, indent=2, ensure_ascii=False))
+        return 0
+    _problems(problems)
+    if not hits:
+        # A scope that could not be read is not the same answer as an empty one,
+        # and only the second one is worth acting on.
+        print(f"Inget objekt i skogen matchar {a.query!r}"
+              + (", i de delar som gick att läsa." if problems else "."), file=sys.stderr)
+        return 1
+    seen = set()
+    for c in hits:
+        if c.get("dn") in seen:
+            continue
+        seen.add(c.get("dn"))
+        print(f"{c.get('name') or c.get('sam') or '(namnlöst)'}")
+        print(_clash_line(c))
+    return 0
+
+
 def cmd_user_onprem_check(a):
     """Whether the AD path is usable at all, before anyone needs it in a hurry."""
     try:
@@ -1580,6 +2051,89 @@ def _add_user_commands(sub):
                         "writeback off, or a guest")
     s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
     s.set_defaults(fn=cmd_user_password)
+
+    s = sub.add_parser("create", help="create an account in on-prem AD, where a synced "
+                                      "account has to start; the password is read from "
+                                      "stdin or generated, never an argument")
+    s.add_argument("upn", help="the full UPN, e.g. person@example.com")
+    s.add_argument("--ou", metavar="DN",
+                   help="OU to create it in; default WSG_AD_OU, the configured one, or "
+                        "the OU the --like account sits in")
+    s.add_argument("--like", metavar="USER",
+                   help="an existing AD account to copy the OU and the group memberships "
+                        "from (samAccountName, UPN or DN)")
+    s.add_argument("--no-copy-groups", dest="copy_groups", action="store_false",
+                   help="with --like, take the OU but not the groups")
+    s.add_argument("--group", action="append", metavar="GROUP",
+                   help="add to this AD group; repeatable")
+    s.add_argument("--sam", metavar="NAME",
+                   help="samAccountName; default is the part of the UPN before the @, "
+                        "which AD caps at 20 characters")
+    s.add_argument("--cn", metavar="NAME",
+                   help="the CN, which has to be unique inside the OU; default is the "
+                        "display name")
+    s.add_argument("--display-name", dest="display_name", metavar="NAME",
+                   help="default is the given name and surname derived from the UPN")
+    s.add_argument("--given-name", dest="given_name", metavar="NAME")
+    s.add_argument("--surname", metavar="NAME")
+    s.add_argument("--title", metavar="TITLE")
+    s.add_argument("--department", metavar="NAME")
+    s.add_argument("--company", metavar="NAME")
+    s.add_argument("--office", metavar="NAME")
+    s.add_argument("--mobile", metavar="NUMBER")
+    s.add_argument("--office-phone", dest="office_phone", metavar="NUMBER",
+                   help="AD telephoneNumber, which Graph reports as businessPhones; often\n"
+                        "the same number as --mobile")
+    s.add_argument("--employee-id", dest="employee_id", metavar="ID")
+    s.add_argument("--description", metavar="TEXT")
+    s.add_argument("--manager", metavar="USER",
+                   help="the manager's AD account (samAccountName, UPN or DN)")
+    s.add_argument("--mail", metavar="ADDRESS",
+                   help="the mail attribute; default is the UPN")
+    s.add_argument("--no-mail", dest="no_mail", action="store_true",
+                   help="leave the mail attribute empty")
+    s.add_argument("--disabled", action="store_true",
+                   help="create the account blocked, e.g. ahead of a start date")
+    s.add_argument("--generate", action="store_true",
+                   help="generate the first password and print it on stdout")
+    s.add_argument("--length", type=int, default=20, metavar="N",
+                   help="length of the generated password, default 20")
+    s.add_argument("--no-force-change", dest="force_change", action="store_false",
+                   help="let the first password stand; default is that it must be "
+                        "changed at first sign-in")
+    s.add_argument("--host", metavar="DC",
+                   help="domain controller to create on, default WSG_AD_HOST or the "
+                        "configured one")
+    s.add_argument("--ad-user", dest="ad_user", metavar="USER",
+                   help="AD account that signs in to the DC; default WSG_AD_USER or the "
+                        "configured one")
+    s.add_argument("--sync", action="store_true",
+                   help="start a delta sync cycle afterwards instead of waiting for the "
+                        "scheduled one")
+    s.add_argument("--wait", type=int, default=None, metavar="SEC",
+                   help="wait this long for the account to appear in Entra; default 300 "
+                        "with --sync and 0 without")
+    s.add_argument("--dry-run", action="store_true",
+                   help="check the name, the OU and the template, then stop")
+    s.add_argument("--adopt", action="store_true",
+                   help="when AD already has this account - offboarded out of the sync "
+                        "scope, say - put that object back into service instead of "
+                        "creating a second one; it keeps its SID and its old group "
+                        "memberships")
+    s.add_argument("--force", action="store_true",
+                   help="create it even with a UPN suffix the tenant has not verified")
+    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_user_create)
+
+    s = sub.add_parser("onprem-find", help="who in the AD forest already answers to this "
+                                          "name, deleted objects included")
+    s.add_argument("query", help="a UPN, a samAccountName, or part of a name")
+    s.add_argument("--host", metavar="DC", help="default WSG_AD_HOST or the configured one")
+    s.add_argument("--ad-user", dest="ad_user", metavar="USER",
+                   help="AD account that signs in to the DC; default WSG_AD_USER or the "
+                        "configured one")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_user_onprem_find)
 
     s = sub.add_parser("onprem-check", help="can we reach the domain controller, and does "
                                             "Entra Connect run there")

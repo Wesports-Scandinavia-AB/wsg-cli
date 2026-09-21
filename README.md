@@ -51,11 +51,13 @@ wsg arena reopen X   undo a resolve
 wsg arena logout     deletes the Arena session
 
 wsg user find X        search the directory by name, UPN or mail
+wsg user create UPN    create the account in on-prem AD, where it has to start
 wsg user show X        account state, licences, sign-in history, last changes
 wsg user audit X       who changed the account, when, and what
 wsg user signins X     sign-in log, interactive and token refreshes
 wsg user groups X      group and directory role memberships
 wsg user password X    set a new password — in AD if the account is synced
+wsg user onprem-find X who in the AD forest holds this name, deleted ones too
 wsg user onprem-check  can we reach the DC, and does Entra Connect run there
 
 wsg device find X      search by serial, device name or user
@@ -703,6 +705,86 @@ Four things the raw Graph output gets wrong if you read it too quickly:
   `typ` says `synkat från lokalt AD`, the Entra audit record names AD Connect,
   and the person who made the change is only in the on-prem AD security log.
 
+### Creating an account
+
+```
+wsg user create person@example.com --generate --like bo.exempel --dry-run
+wsg user create person@example.com --generate --like bo.exempel --sync
+wsg user create person@example.com --generate --ou "OU=Konsulter,OU=Vartex,DC=ad,DC=vartex,DC=se" --disabled
+```
+
+**The account is born in AD, not in Entra.** In a hybrid tenant that is not a
+preference: a cloud account cannot be adopted by AD afterwards without a hard
+match on `onPremisesImmutableId`, so an account created in the wrong half has
+to be deleted and made again. The command opens a WinRM session to a domain
+controller, runs `New-ADUser` there, adds the groups, and optionally starts a
+delta sync and waits for the account to turn up in Entra.
+
+Only the UPN is required. `person@example.com` gives the display name
+`Ada Exempel`, the samAccountName `ada.exempel` and the same address in
+the `mail` attribute, and every part of that can be overridden - `--given-name`,
+`--surname`, `--display-name`, `--cn`, `--sam`, `--mail`, plus `--title`,
+`--department`, `--company`, `--office`, `--mobile`, `--employee-id`,
+`--manager` and `--description`. Deriving a name from an address is guesswork,
+so the plan prints every field it worked out before anything is written, and
+`--dry-run` stops there.
+
+**`--like` copies the OU and the groups from a colleague**, which is how a new
+person in an existing role should be set up: `--ou` overrides the OU it found,
+`--group` adds more groups, and `--no-copy-groups` takes the OU alone.
+
+Four things are checked before the DC is asked to write anything, because each
+one is silent afterwards:
+
+- **The UPN is not already in Entra.** A cloud account with the same name does
+  not merge with a new AD object; the sync collides with it, and someone has to
+  clean up two accounts by hand.
+- **The OU exists, and there is one at all.** `New-ADUser` without `-Path` drops
+  the account in the domain default container, which the OU filter in Entra
+  Connect usually does not include - the account then exists in AD and nowhere
+  else, and nothing reports an error. There is no sane default, so the command
+  refuses rather than guess: `--ou`, `"ou"` in `onprem.json`, `WSG_AD_OU`, or
+  `--like`.
+- **The samAccountName and the UPN are free in the whole forest**, and the
+  samAccountName fits in AD's 20 characters. Forest-wide is the point: AD
+  enforces UPN uniqueness across every domain, and counts objects a plain
+  `Get-ADUser` never returns - other domains, and deleted ones the Recycle Bin
+  still holds. Missing those is how a create passes every check and then dies
+  inside `New-ADUser` with *not unique forest-wide*, an error that names neither
+  the object nor where it is. `wsg user onprem-find X` asks the same question on
+  its own and prints what it found. (A long firstname.lastname is the other
+  half: it quietly becomes an invalid samAccountName, and AD's answer does not
+  mention the length.)
+- **The UPN suffix is a verified domain in the tenant.** AD writes any suffix it
+  is given; Entra Connect then replaces an unverified one with
+  `...@<tenant>.onmicrosoft.com`. The account syncs, so it looks right, and the
+  address handed to the new person does not work. `--force` creates it anyway.
+
+**When AD already has the account, `--adopt` puts that object back into service**
+instead of adding a second one. An offboarded account here is moved to
+`OU=!Disabled Users` rather than deleted, which puts it outside Entra Connect's
+OU filter: Entra cannot see it, so `wsg user show` says the name is free, while
+AD goes on guarding its UPN forest-wide. The same person coming back should get
+the same object - the SID goes with it, and with the SID every on-prem
+permission ever granted to them. `--adopt` moves it into the target OU, writes
+the attributes, resets the password, enables it and adds the groups it does not
+already have. The ones it does have are left alone and printed, because old
+access follows the object and is worth a look. What it cannot bring back is the
+cloud side: the Entra object was deleted when the account fell out of scope, so
+the licence gives a new and empty mailbox.
+
+The first password takes the same route as every other secret here: `--generate`
+prints it on stdout and the report on stderr, or it is read from stdin. The
+account must change it at first sign-in unless `--no-force-change` says
+otherwise, and `--disabled` creates it blocked, for a start date that has not
+arrived yet.
+
+**What is left afterwards is in the cloud**: the licence - and with it the
+mailbox in Exchange Online - Entra groups, and MFA registration. None of that
+can happen before the account has synced, which is what `--sync` and the wait
+are for. Where Exchange is still on-prem, the mailbox is created there with
+`Enable-RemoteMailbox`, not from here.
+
 ### Resetting a password
 
 ```
@@ -762,8 +844,8 @@ password date. The account is addressed by the `onPremisesDistinguishedName`
 Entra already holds, so the DC writes exactly the object the report was about
 rather than matching a name. A locked-out account is unlocked at the same time
 (`--no-unlock` leaves it), and the password takes the same route as everywhere
-else here: generator or stdin, into powershell.exe through an environment
-variable, to the DC inside the encrypted WinRM channel. Never argv.
+else here: generator or stdin, into powershell.exe over its stdin, to the DC
+inside the encrypted WinRM channel. Never argv, and never the environment.
 
 **A delta sync does not carry the password.** `--sync` starts
 `Start-ADSyncSyncCycle -PolicyType Delta`, which moves directory attributes;
@@ -784,8 +866,10 @@ DPAPI-encrypted file, and its existence switches the prompt off.
 Setup, once per machine:
 
 ```
-# the DC and the account that signs in to it, in %LOCALAPPDATA%\wsg\onprem.json
-{"host": "192.0.2.4", "user": "you@ad.example.com"}
+# the DC, the account that signs in to it, and where new accounts go,
+# in %LOCALAPPDATA%\wsg\onprem.json
+{"host": "192.0.2.4", "user": "you@ad.example.com",
+ "ou": "OU=Personal,OU=Vartex,DC=ad,DC=vartex,DC=se"}
 
 # only on a machine outside the domain: WinRM will not NTLM to an unknown host
 # without this. Elevated shell, and scoped to the one address.
