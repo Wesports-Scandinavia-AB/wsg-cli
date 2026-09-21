@@ -58,6 +58,13 @@ wsg user groups X      group and directory role memberships
 wsg user password X    set a new password — in AD if the account is synced
 wsg user onprem-check  can we reach the DC, and does Entra Connect run there
 
+wsg device find X      search by serial, device name or user
+wsg device show X      who has it, last check-in, Autopilot record, sign-in log
+wsg device user X      hand it over: primary user in Intune and in Autopilot
+wsg device reset X     Autopilot reset — wipe the profiles, keep the enrolment
+wsg device retire X    remove company data, leave the rest
+wsg device sync X      ask this device to check in now
+
 wsg intune apps        managed apps with their assignments
 wsg intune app-status  per-user install status for one app
 wsg intune intent      what the service intends for a user on a device
@@ -373,6 +380,67 @@ domain has exactly one incident in the relevant state. `ack` only needs
 
 Send a real `User-Agent`: the zone's bot rules answer 403 to `Python-urllib`.
 Override the app with `WSG_ARENA_URL`, the binary with `WSG_CLOUDFLARED`.
+
+## Devices
+
+`wsg device` answers the two questions a laptop on a desk actually raises: who
+has it, and can somebody else take it over.
+
+```
+wsg device find PF464                  partial serial, name or user
+wsg device show PF46487Q               the whole picture
+wsg device user PF46487Q --set person@example.com
+wsg device reset PF46487Q              Autopilot reset, then hand it over
+```
+
+One laptop is three objects with three keys, and none of them links to the
+others by name. The **Autopilot identity** is the hardware hash, keyed by serial
+number; it survives every wipe and carries the group tag and the assigned user.
+The **managed device** is the Intune enrolment, with its own GUID, a primary
+user and the check-in times. The **Entra device** is what Conditional Access
+evaluates, keyed by a third id. `show` fetches all three and prints them as one
+machine.
+
+`show` leads with the check-in date and the sign-in log because that is what
+says whether the machine is free. `usersLoggedOn` is the last logon the client
+reported *at its last check-in*, so a laptop that has been in a drawer since May
+still names whoever used it in May. The sign-in log is the second opinion: it
+names everyone, not just the last one, and it is where a machine that quietly
+changed hands shows up. It keeps 30 days, so an empty log means "nothing in the
+window", never "nobody used it".
+
+A partial serial is the one search that needs care. On `managedDevices`,
+`$filter=contains(serialNumber,'PF46487Q')` returns the device but
+`contains(serialNumber,'PF464')` returns an empty list rather than an error —
+the serial is indexed for equality only. `find` therefore falls back to a
+client-side sweep when the server side comes back empty, so a half-typed serial
+still finds the machine instead of silently looking like no such machine exists.
+
+Handing a machine over is two writes, and `wsg device user` does both: the
+primary user in Intune, which decides who it is listed under and which
+user-targeted assignments it gets, and the assigned user on the Autopilot
+record, which is the name at the sign-in screen after a reset. Where a profile
+is assigned to a specific user, leaving the old name there means the new person
+cannot complete the setup.
+
+Then the reset, and the three are not interchangeable:
+
+| | enrolment | Entra join | user profiles | personal data |
+|---|---|---|---|---|
+| `reset` | kept | kept | gone | gone |
+| `reset --factory` | gone | gone | gone | gone |
+| `retire` | gone | gone | kept | kept |
+
+`reset` is the handover: the machine comes back at the Autopilot sign-in screen,
+still ours, ready for the next person. `--factory` also drops the Intune and
+Entra objects; the Autopilot registration survives either way because it lives
+on the hardware hash. `retire` is for a machine somebody keeps.
+
+All three need `DeviceManagementManagedDevices.PrivilegedOperations.All`, all
+three take effect at the device's next check-in, and none of them can be called
+back after that. They ask for the serial number typed back rather than a y/n,
+and `--yes` is the only way past the prompt — a piped stdin is refused, so a
+script cannot wipe a laptop by accident.
 
 ## Intune
 

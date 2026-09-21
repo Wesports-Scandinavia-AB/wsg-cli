@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import arena, auth, garp, garpdb, intune, mscal, ongoing, onprem, planner, users
+from . import arena, auth, devices, garp, garpdb, intune, mscal, ongoing, onprem, planner, users
 from .scopes import DEFAULT_SCOPES
 
 
@@ -698,6 +698,295 @@ def _add_intune_commands(sub):
     s = sub.add_parser("sync", help="ask a device to check in now")
     s.add_argument("device", help="Intune managed device id")
     s.set_defaults(fn=cmd_intune_sync)
+
+
+def _gb(n):
+    return f"{n / 1e9:.0f} GB" if n else None
+
+
+def _who_logged_on(dev):
+    """usersLoggedOn as names, newest first.
+
+    The list holds object ids, not names, and the primary user is usually the
+    only entry - but "usually" is exactly what this command exists to check, so
+    any other id is looked up rather than glossed over.
+    """
+    out = []
+    for e in sorted(dev.get("usersLoggedOn") or [],
+                    key=lambda x: x.get("lastLogOnDateTime") or "", reverse=True):
+        uid = e.get("userId")
+        if uid and uid == dev.get("userId"):
+            name = f"{dev.get('userDisplayName')} <{dev.get('userPrincipalName')}>"
+        else:
+            try:
+                u = users.resolve(uid)
+                name = f"{u.get('displayName')} <{u.get('userPrincipalName')}>"
+            except (users.UserError, TypeError):
+                name = uid or "?"
+        out.append((e.get("lastLogOnDateTime"), name))
+    return out
+
+
+def cmd_device_find(a):
+    try:
+        rows = devices.find(a.query, limit=a.top)
+    except devices.DeviceError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("Ingen enhet matchade.")
+        return 0
+    w = max(len(r.get("serialNumber") or "") for r in rows) + 2
+    for d in sorted(rows, key=lambda x: x.get("lastSyncDateTime") or "", reverse=True):
+        print(f"{(d.get('serialNumber') or '-'):<{w}}{(d.get('deviceName') or '-'):<20}"
+              f"{(d.get('userPrincipalName') or '-'):<32}"
+              f"senast incheckad {_ts(d.get('lastSyncDateTime'))}{_age(d.get('lastSyncDateTime'))}")
+    print(f"\n{len(rows)} enhet(er). Hela bilden: wsg device show <serienummer>")
+    return 0
+
+
+def cmd_device_show(a):
+    """Everything about one machine, and whether it is free to hand over.
+
+    The question behind this command is almost always "can somebody else take
+    it?", so the check-in date and the sign-in log come before the hardware.
+    """
+    try:
+        r = devices.report(a.device, days=a.days)
+    except devices.DeviceError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return 0
+
+    d, ap, ent = r["device"], r.get("autopilot"), r.get("entra")
+    logons = _who_logged_on(d)
+    rows = [
+        ("primär användare", f"{d.get('userDisplayName')} <{d.get('userPrincipalName')}>"
+                             if d.get("userPrincipalName") else "ingen"),
+        ("senast inloggad", f"{_ts(logons[0][0])}{_age(logons[0][0])}  {logons[0][1]}"
+                            if logons else "-"),
+        ("senast incheckad", _ts(d.get("lastSyncDateTime")) + _age(d.get("lastSyncDateTime"))),
+        ("enrollerad", _ts(d.get("enrolledDateTime")) + _age(d.get("enrolledDateTime"))),
+        ("efterlevnad", d.get("complianceState")),
+        ("hantering", f"{d.get('managementState')}, {d.get('managedDeviceOwnerType')}, "
+                      f"{d.get('joinType')}"),
+        ("profil", d.get("enrollmentProfileName")),
+        ("os", f"{d.get('operatingSystem')} {d.get('osVersion')} {d.get('skuFamily') or ''}".strip()),
+        ("kryptering", "bitlocker på" if d.get("isEncrypted") else "OKRYPTERAD"),
+        ("modell", " ".join(x for x in (d.get("manufacturer"), d.get("model")) if x)),
+        ("lagring", f"{_gb(d.get('freeStorageSpaceInBytes'))} ledigt av "
+                    f"{_gb(d.get('totalStorageSpaceInBytes'))}"
+                    if d.get("totalStorageSpaceInBytes") else None),
+        ("anteckning", d.get("notes")),
+        ("intune-id", d.get("id")),
+        ("entra-enhets-id", d.get("azureADDeviceId")),
+    ]
+    if a.verbose:
+        rows += [("wifi-mac", d.get("wiFiMacAddress")),
+                 ("ethernet-mac", d.get("ethernetMacAddress")),
+                 ("intune-namn", d.get("managedDeviceName"))]
+    if ent:
+        rows.append(("entra-objekt", f"{'aktiverat' if ent.get('accountEnabled') else 'SPÄRRAT'}, "
+                                     f"{ent.get('trustType')}, senast sedd "
+                                     f"{_ts(ent.get('approximateLastSignInDateTime'))}"))
+    if ap:
+        rows += [
+            ("autopilot", f"{ap.get('enrollmentState')}, grupptagg "
+                          f"{ap.get('groupTag') or '-'}"),
+            ("autopilot-användare", ap.get("userPrincipalName") or "ingen tilldelad"),
+            ("autopilot-kontakt", _ts(ap.get("lastContactedDateTime"))),
+            ("autopilot-id", ap.get("id")),
+        ]
+
+    rows = [(k, v) for k, v in rows if v not in (None, "", "-")]
+    w = max(len(k) for k, _ in rows) + 2
+    print(f"{d.get('deviceName')}   {d.get('serialNumber')}")
+    for label, value in rows:
+        print(f"  {label:<{w}}{value}")
+
+    if not ap:
+        print("\nIngen Autopilot-post för serienumret. En återställning ger då en vanlig\n"
+              "OOBE, inte vår - enheten måste registreras innan den lämnas vidare.")
+    if r.get("signin_error"):
+        print(f"\nInloggningsloggen kunde inte läsas: {r['signin_error'].splitlines()[0]}")
+    elif r["signins"]:
+        print(f"\nInloggningar senaste {a.days} dygnen:")
+        for e in r["signins"]:
+            print(f"  {_ts(e['last']):<18}{e['count']:>4} st   "
+                  f"{e['name'] or ''} <{e['upn']}>")
+    else:
+        print(f"\nInga inloggningar loggade senaste {a.days} dygnen. Loggen sparas i 30 dagar,\n"
+              "så det betyder 'inget i fönstret', inte 'ingen har använt den'.")
+
+    # The whole point of the lookup is usually whether the machine is free.
+    fresh = _age(d.get("lastSyncDateTime"))
+    if fresh in (" (idag)", " (1 dagar sedan)"):
+        print(f"\nEnheten checkade in {fresh.strip(' ()')} - den är i bruk. Prata med\n"
+              f"{d.get('userDisplayName') or 'användaren'} innan du återställer den.")
+    print(f"\nLämna vidare:  wsg device user {d.get('serialNumber')} --set <person@example.com>\n"
+          f"               wsg device reset {d.get('serialNumber')}")
+    return 0
+
+
+def _confirm_device(a, d, what):
+    """A wipe needs the serial typed back, not a y/n.
+
+    `_confirm` says yes when stdin is not a terminal, which is right for a
+    password read from a pipe and wrong for this: a script that pipes something
+    in would wipe a laptop without asking. Here the only ways through are the
+    serial typed at a prompt or an explicit --yes.
+    """
+    print(f"{what}:\n  {d.get('deviceName')}  {d.get('serialNumber')}  "
+          f"{d.get('userPrincipalName') or 'ingen användare'}\n"
+          f"  senast incheckad {_ts(d.get('lastSyncDateTime'))}{_age(d.get('lastSyncDateTime'))}")
+    if a.yes:
+        return True
+    # isatty is not to be trusted here: under Git Bash on Windows it answers
+    # true for a redirected stdin, so the prompt is reached anyway and the read
+    # ends in EOFError. Both roads lead to the same answer - no.
+    try:
+        if not sys.stdin.isatty():
+            raise EOFError
+        got = input(f"Skriv serienumret ({d.get('serialNumber')}) för att bekräfta: ").strip()
+    except EOFError:
+        print("\nAvbrutet: ingen bekräftelse gick att läsa. Kör om med --yes om du menar allvar.",
+              file=sys.stderr)
+        return False
+    if got.casefold() != (d.get("serialNumber") or "").casefold():
+        print("Avbrutet.", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_device_reset(a):
+    try:
+        d = devices.resolve(a.device)
+    except devices.DeviceError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    keep = not a.factory
+    what = ("Autopilot-återställning (behåller enrollering och Entra-join)" if keep
+            else "FABRIKSÅTERSTÄLLNING (tar bort enrollering, Entra-objekt och Intune-objekt)")
+    if not _confirm_device(a, d, what):
+        return 1
+    try:
+        devices.reset(d["id"], keep_enrollment=keep)
+    except devices.DeviceError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print("Kommandot är skickat. Enheten utför det vid nästa incheckning och kan inte\n"
+          "ångras efter det. Är den påslagen går det fortare med: "
+          f"wsg device sync {d.get('serialNumber')}")
+    return 0
+
+
+def cmd_device_retire(a):
+    try:
+        d = devices.resolve(a.device)
+    except devices.DeviceError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if not _confirm_device(a, d, "Avregistrering (tar bort företagsdata, behåller övrigt)"):
+        return 1
+    try:
+        devices.retire(d["id"])
+    except devices.DeviceError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print("Avregistrering begärd. Enheten tappar företagsdata vid nästa incheckning.")
+    return 0
+
+
+def cmd_device_user(a):
+    """Move the machine to another person, in both places it is written down."""
+    try:
+        d = devices.resolve(a.device)
+        ap = devices.autopilot(managed_device=d)
+    except devices.DeviceError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    try:
+        if a.clear:
+            devices.clear_primary_user(d["id"])
+            print("Primär användare i Intune borttagen.")
+            if ap and not a.intune_only:
+                devices.unassign_autopilot_user(ap["id"])
+                print("Autopilot-tilldelning borttagen.")
+        else:
+            u = users.resolve(a.set)
+            devices.set_primary_user(d["id"], u["id"])
+            print(f"Primär användare i Intune: {u.get('displayName')} "
+                  f"<{u.get('userPrincipalName')}>")
+            if ap and not a.intune_only:
+                devices.assign_autopilot_user(ap["id"], u["userPrincipalName"],
+                                              u.get("displayName"))
+                print("Autopilot-posten pekar nu på samma person.")
+    except (devices.DeviceError, users.UserError) as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if not ap and not a.intune_only:
+        print("Ingen Autopilot-post för serienumret, så bara Intune ändrades.")
+    return 0
+
+
+def cmd_device_sync(a):
+    try:
+        d = devices.resolve(a.device)
+        devices.sync(d["id"])
+    except devices.DeviceError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(f"Synk begärd för {d.get('deviceName')} ({d.get('serialNumber')}). "
+          f"Enheten hämtar väntande kommandon när den är påslagen och online.")
+    return 0
+
+
+def _add_device_commands(sub):
+    s = sub.add_parser("find", help="search by serial, device name or user")
+    s.add_argument("query")
+    s.add_argument("--top", type=int, default=50, metavar="N")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_device_find)
+
+    s = sub.add_parser("show", help="one machine: who has it, when it last checked in, "
+                                    "Autopilot record and sign-in log")
+    s.add_argument("device", help="serial number, device name, user, or Intune device id")
+    s.add_argument("--days", type=int, default=30, metavar="N",
+                   help="sign-in window (default 30, which is all the log keeps)")
+    s.add_argument("-v", "--verbose", action="store_true", help="also MAC addresses")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_device_show)
+
+    s = sub.add_parser("reset", help="Autopilot reset: wipe the profiles, keep the enrolment")
+    s.add_argument("device", help="serial number, device name, or Intune device id")
+    s.add_argument("--factory", action="store_true",
+                   help="full wipe: also drop the enrolment and the Entra object")
+    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_device_reset)
+
+    s = sub.add_parser("retire", help="remove company data and management, keep the rest")
+    s.add_argument("device", help="serial number, device name, or Intune device id")
+    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_device_retire)
+
+    s = sub.add_parser("user", help="hand the machine to someone else: primary user in "
+                                    "Intune and assigned user in Autopilot")
+    s.add_argument("device", help="serial number, device name, or Intune device id")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--set", metavar="USER", help="UPN, object id or name fragment")
+    g.add_argument("--clear", action="store_true", help="leave the machine unassigned")
+    s.add_argument("--intune-only", action="store_true",
+                   help="leave the Autopilot record alone")
+    s.set_defaults(fn=cmd_device_user)
+
+    s = sub.add_parser("sync", help="ask the device to check in now")
+    s.add_argument("device", help="serial number, device name, or Intune device id")
+    s.set_defaults(fn=cmd_device_sync)
 
 
 def _ts(s, with_time=True):
@@ -2303,13 +2592,17 @@ def main(argv=None):
     )
     # metavar hides the compatibility aliases from the usage line.
     sub = p.add_subparsers(dest="cmd", required=True,
-                           metavar="{graph,user,arena,intune,ongoing,garp,garpdb,calendar,planner}")
+                           metavar="{graph,user,device,arena,intune,ongoing,garp,garpdb,calendar,planner}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
 
     us = sub.add_parser("user", help="M365/Entra accounts: state, licences, sign-ins, audit trail")
     _add_user_commands(us.add_subparsers(dest="user_cmd", required=True))
+
+    dv = sub.add_parser("device", help="Windows clients: who has one, and handing it to "
+                                       "someone else")
+    _add_device_commands(dv.add_subparsers(dest="device_cmd", required=True))
 
     ar = sub.add_parser("arena", help="WeSports Arena via Cloudflare Access (needs cloudflared)")
     _add_arena_commands(ar.add_subparsers(dest="arena_cmd", required=True))
