@@ -51,6 +51,7 @@ wsg arena reopen X   undo a resolve
 wsg arena logout     deletes the Arena session
 
 wsg user find X        search the directory by name, UPN or mail
+wsg user stale         tenant-wide: accounts nobody uses, and what they cost
 wsg user create UPN    create the account in on-prem AD, where it has to start
 wsg user show X        account state, licences, sign-in history, last changes
 wsg user audit X       who changed the account, when, and what
@@ -704,6 +705,52 @@ Four things the raw Graph output gets wrong if you read it too quickly:
 - **A synced account was probably changed in AD, not in Entra.** When
   `typ` says `synkat från lokalt AD`, the Entra audit record names AD Connect,
   and the person who made the change is only in the on-prem AD security log.
+
+### Accounts nobody is using
+
+```
+wsg user stale                       # the whole tenant, silent 90+ days
+wsg user stale --days 180 --limit 40
+wsg user stale --sku SPB             # who is holding the licence you need
+wsg user stale --domain cykloteket.se
+wsg user stale --domain vartex.se --domain wesports.se --days 365
+wsg user stale --json
+```
+
+`--domain` matches any address the account answers to, not just the UPN: the
+primary address and every `smtp:` alias in `proxyAddresses` count, so a mailbox
+whose UPN is `hej@wesports.se` turns up under `--domain cykloteket.se` when it
+carries that alias. A B2B guest is matched on their own address too - the UPN
+of a guest is the invited address with the `@` rewritten to an underscore, so
+matching the UPN alone would never find them by their own domain.
+
+One sweep, two different questions. **A licensed account nobody uses is money**:
+the report puts each SKU next to how many of its licences sit on dormant
+accounts, and marks the ones that are fully consumed, because that is where the
+next hire gets stuck. **An unlicensed account that is still enabled is reach**:
+it appears in no licence review precisely because it is free, and a synced one
+goes on authenticating on-prem long after the cloud has forgotten it.
+
+Three things the raw numbers get wrong on their own:
+
+- **`lastSignInDateTime` counts failed attempts, and interactive only.** A
+  mailbox a client keeps polling has an old interactive timestamp and a fresh
+  non-interactive one, so reading either alone calls a working account dead.
+  Dormancy here is the most recent of `lastSuccessfulSignInDateTime` and
+  `lastNonInteractiveSignInDateTime`.
+- **"Never used" also describes a shared mailbox.** Nobody signs in as one, so
+  it looks identical to an abandoned account - and the answer for it is to
+  convert it to a shared mailbox, which needs no licence at all, rather than to
+  close it. The report prints how old a never-used account is for the same
+  reason: a new hire who has not started yet reads exactly like a five-year-old
+  ghost without it.
+- **An account in an OU that is not synced is not in this report at all.** It
+  has no Entra object to be dormant, while AD keeps it enabled and keeps
+  guarding its UPN. `wsg user onprem-find` is the one that sees those.
+
+`signInActivity` needs AuditLog.Read.All and Entra ID P1; without the licence
+the property is simply absent, which from here is indistinguishable from an
+account that has never been used.
 
 ### Creating an account
 

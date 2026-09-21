@@ -1462,6 +1462,162 @@ def _revoke(a, u):
     return 0
 
 
+def _sku_names(skus):
+    return {s["skuId"]: s.get("skuPartNumber") or s["skuId"][:8] for s in skus}
+
+
+def _stale_row(u, names, days):
+    lic = ",".join(names.get(l["skuId"], "?") for l in u.get("assignedLicenses") or [])
+    kind = ("gäst" if (u.get("userType") or "") == "Guest"
+            else "synkad" if u.get("onPremisesSyncEnabled") else "moln")
+    if days is not None:
+        when = f"tyst {days}d"
+    else:
+        # Never used and created last week is a new hire who has not started;
+        # never used and five years old is something else entirely. Without the
+        # age the two rows read the same.
+        age = _age_days(u.get("createdDateTime"))
+        when = "aldrig använt" + (f", skapat {age}d sedan" if age is not None else "")
+    return f"   {(u.get('userPrincipalName') or '')[:46]:<48}{lic[:20]:<22}{kind:<8}{when}"
+
+
+def _age_days(s):
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - d).days
+
+
+def cmd_user_stale(a):
+    """Accounts nobody is using: what they cost, and what they still reach.
+
+    Two different questions share one sweep. A licensed account that is never
+    used is money; an unlicensed one that is still enabled is reach, because a
+    synced account keeps authenticating on-prem long after the cloud has
+    forgotten it, and it shows up in no licence review precisely because it is
+    free.
+    """
+    try:
+        users_ = users.everyone()
+        skus = users.subscribed_skus()
+    except users.UserError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    names = _sku_names(skus)
+
+    if a.domain:
+        users_ = [u for u in users_ if users.in_domains(u, a.domain)]
+        if not users_:
+            print(f"Inget konto har en adress i {', '.join(a.domain)}.", file=sys.stderr)
+            return 1
+
+    want = None
+    if a.sku:
+        want = {i for i, n in names.items() if n.casefold() == a.sku.casefold()}
+        if not want:
+            print(f"Ingen licens heter {a.sku!r}. Finns: "
+                  + ", ".join(sorted(set(names.values()))), file=sys.stderr)
+            return 2
+        users_ = [u for u in users_
+                  if any(l["skuId"] in want for l in u.get("assignedLicenses") or [])]
+
+    aged = [(u, users.last_used(u)) for u in users_]
+    enabled = [(u, d) for u, d in aged if u.get("accountEnabled")]
+    members = [(u, d) for u, d in enabled if (u.get("userType") or "") != "Guest"]
+    licensed = [(u, d) for u, d in members if u.get("assignedLicenses")]
+    free = [(u, d) for u, d in members if not u.get("assignedLicenses")]
+    guests = [(u, d) for u, d in enabled if (u.get("userType") or "") == "Guest"]
+
+    def idle(rows, limit=None):
+        out = [(u, d) for u, d in rows if d is None or d >= a.days]
+        # Longest silence first, and never-used before everything else.
+        out.sort(key=lambda r: -(r[1] if r[1] is not None else 10 ** 6))
+        return out[:limit] if limit else out
+
+    if a.json:
+        print(json.dumps({
+            "days": a.days,
+            "domains": a.domain or [],
+            "licensed": [{"upn": u.get("userPrincipalName"), "idleDays": d,
+                          "mail": u.get("mail"),
+                          "skus": [names.get(l["skuId"]) for l in u["assignedLicenses"]],
+                          "synced": bool(u.get("onPremisesSyncEnabled"))}
+                         for u, d in idle(licensed)],
+            "unlicensed": [{"upn": u.get("userPrincipalName"), "idleDays": d,
+                            "synced": bool(u.get("onPremisesSyncEnabled")),
+                            "dn": u.get("onPremisesDistinguishedName")}
+                           for u, d in idle(free)],
+            "guests": [{"upn": u.get("userPrincipalName"), "idleDays": d}
+                       for u, d in idle(guests)],
+        }, indent=2, ensure_ascii=False))
+        return 0
+
+    scope = ""
+    if a.domain:
+        scope = f"  (bara adresser i {', '.join(a.domain)})"
+    print(f"Katalogen: {len(users_)} konton, {len(enabled)} aktiva, "
+          f"{len(licensed)} aktiva med licens, {len(guests)} aktiva gäster.{scope}")
+
+    # With a filter on, the consumed column is still tenant-wide while the
+    # dormant count is not: saying so beats two numbers that look comparable.
+    print(f"\nLicenser, och hur många av dem som ligger på konton som varit tysta "
+          f"{a.days}+ dagar"
+          + (" inom filtret" if (a.domain or a.sku) else ""))
+    holders = {}
+    for u, d in licensed:
+        for l in u.get("assignedLicenses") or []:
+            holders.setdefault(l["skuId"], []).append(d)
+    for sku in sorted(skus, key=lambda x: -x.get("consumedUnits", 0)):
+        if not sku.get("consumedUnits"):
+            continue
+        if want and sku["skuId"] not in want:
+            continue
+        got = holders.get(sku["skuId"], [])
+        dead = sum(1 for d in got if d is None or d >= a.days)
+        total = (sku.get("prepaidUnits") or {}).get("enabled", 0)
+        # A SKU with nothing left is where the next hire gets stuck, so it is
+        # worth seeing next to the count of licences nobody is using.
+        pressure = "  SLUT" if total and sku["consumedUnits"] >= total else ""
+        print(f"   {sku.get('skuPartNumber', '?'):<34}{sku['consumedUnits']:>4} av "
+              f"{total:<8}{dead:>3} oanvända{pressure}")
+
+    rows = idle(licensed)
+    print(f"\nAktiva konton MED licens som inte används  ({len(rows)})")
+    for u, d in rows[:a.limit]:
+        print(_stale_row(u, names, d))
+    if len(rows) > a.limit:
+        print(f"   ... {len(rows) - a.limit} till, --limit visar fler")
+
+    rows = idle(free)
+    synced = sum(1 for u, _ in rows if u.get("onPremisesSyncEnabled"))
+    print(f"\nAktiva konton UTAN licens som inte används  ({len(rows)}, "
+          f"varav {synced} synkade från AD)")
+    print("   Kostar inget och syns därför i ingen licensgenomgång, men ett synkat "
+          "konto\n   autentiserar fortfarande mot allt on-prem.")
+    for u, d in rows[:a.limit]:
+        print(_stale_row(u, names, d))
+    if len(rows) > a.limit:
+        print(f"   ... {len(rows) - a.limit} till, --limit visar fler")
+
+    rows = idle(guests)
+    never = sum(1 for _, d in rows if d is None)
+    print(f"\nAktiva gäster som inte används  ({len(rows)}, varav {never} aldrig "
+          f"loggat in)")
+    for u, d in rows[:a.limit]:
+        print(_stale_row(u, names, d))
+    if len(rows) > a.limit:
+        print(f"   ... {len(rows) - a.limit} till, --limit visar fler")
+
+    print("\n\"aldrig använt\" betyder att ingen loggat in SOM kontot. En delad "
+          "brevlåda som\nfem personer läser varje dag ser likadan ut — den ska "
+          "konverteras, inte stängas.\nEtt konto i en OU som inte synkas syns inte "
+          "här alls: wsg user onprem-find hittar dem.")
+    return 0
+
+
 # ── creating an account ───────────────────────────────────────────────────────
 
 # AD's own rule, and the one that is easy to trip over: 20 characters, and none
@@ -1971,6 +2127,22 @@ def _add_user_commands(sub):
     s.add_argument("--top", type=int, default=25)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_user_find)
+
+    s = sub.add_parser("stale", help="tenant-wide: accounts nobody is using, what they "
+                                     "cost and what they still reach")
+    s.add_argument("--days", type=int, default=90, metavar="N",
+                   help="how long an account has to have been silent to count, "
+                        "default 90")
+    s.add_argument("--sku", metavar="NAME",
+                   help="only accounts holding this licence, e.g. SPB")
+    s.add_argument("--domain", action="append", metavar="DOMAIN",
+                   help="only accounts with an address in this domain - the UPN, the "
+                        "primary address or any alias; repeatable. A guest is matched "
+                        "on their own address, not on the rewritten #EXT# one")
+    s.add_argument("--limit", type=int, default=20, metavar="N",
+                   help="rows shown per section, default 20")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_user_stale)
 
     s = sub.add_parser("show", help="account state: enabled, licences, last sign-in, "
                                     "password age, and the latest changes")
