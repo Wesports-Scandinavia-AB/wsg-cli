@@ -1462,6 +1462,147 @@ def _revoke(a, u):
     return 0
 
 
+def cmd_user_alias(a):
+    """Give a synced account one more address to receive mail on, or take it away.
+
+    For a synced account the addresses belong to AD like the password does:
+    Exchange Online refuses to edit them ("the object is being synchronized from
+    your on-premises organization") and Graph has no write for proxyAddresses at
+    all. So the alias goes into AD over WinRM and rides the next sync to Entra.
+    """
+    address = a.address.strip().casefold()
+    if address.count("@") != 1 or ":" in address:
+        print(f"{a.address!r} är ingen mailadress. Ange den utan smtp:.", file=sys.stderr)
+        return 2
+    try:
+        u = users.resolve(a.user)
+    except users.UserError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    print(f"Konto:   {u.get('displayName')} <{u.get('userPrincipalName')}>", file=sys.stderr)
+    current = users.addresses(u)
+    print(f"Adresser: {', '.join(u.get('proxyAddresses') or []) or 'inga'}", file=sys.stderr)
+    if not u.get("onPremisesSyncEnabled"):
+        print("         Molnkonto: adresserna ägs av Exchange Online, inte AD. Lägg aliaset "
+              "där (Set-Mailbox -EmailAddresses @{Add=...}).", file=sys.stderr)
+        return 2
+    if a.remove and address not in current:
+        print(f"         {address} finns inte på kontot, inget att ta bort.", file=sys.stderr)
+        return 0
+    if not a.remove:
+        if address in current:
+            print(f"         {address} finns redan på kontot.", file=sys.stderr)
+            return 0
+        domain = address.split("@", 1)[1]
+        verified = users.verified_domains()
+        if verified is not None and domain not in {d.casefold() for d in verified}:
+            # Exchange drops an address in a domain the tenant does not own, and the
+            # sync reports success anyway.
+            print(f"         {domain} är inte verifierad i tenanten, så Exchange tar inte "
+                  f"emot adressen.", file=sys.stderr)
+            return 2
+        try:
+            holders = [h for h in users.address_holders(address) if h["id"] != u["id"]]
+        except users.UserError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        if holders:
+            for h in holders:
+                print(f"         Upptagen i Entra: {h['kind']} {h.get('displayName')} "
+                      f"<{h.get('userPrincipalName') or h.get('mail')}>", file=sys.stderr)
+            return 2
+
+    identity = u.get("onPremisesDistinguishedName") or u.get("onPremisesSamAccountName")
+    if not identity:
+        print("         Kontot är märkt som synkat men saknar både DN och samAccountName "
+              "i Entra, så det går inte att peka ut i AD.", file=sys.stderr)
+        return 2
+    try:
+        dc = onprem.host(a.host)
+        cred = onprem.credential(a.ad_user)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    verb = "Ta bort" if a.remove else "Lägg till"
+    print(f"Skriver: {dc} (AD), {identity}", file=sys.stderr)
+    print(f"Ändring: {verb.lower()} smtp:{address}"
+          + (", delta-sync startas" if a.sync else "") + ".", file=sys.stderr)
+
+    write = not a.dry_run and _confirm(a, f"{verb} aliaset i AD på {dc}? [j/N] ")
+    if not a.dry_run and not write:
+        print("Avbryter.", file=sys.stderr)
+        return 1
+    # What Entra shows as primary today, so that an empty list in AD gets it back
+    # in the same write instead of losing it (see onprem.set_alias).
+    primary = next((p.split(":", 1)[1] for p in u.get("proxyAddresses") or []
+                    if p.startswith("SMTP:")), None) or u.get("mail")
+    try:
+        r = onprem.set_alias(dc, cred, identity, address, remove=a.remove, write=write,
+                             primary=primary)
+    except onprem.OnPremError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    if r.get("heldBy"):
+        print(f"Upptagen i AD, utanför det Entra ser: {', '.join(r['heldBy'])}. "
+              f"Inget ändrat.", file=sys.stderr)
+        return 2
+    if r.get("needsPrimary"):
+        if not primary:
+            print("proxyAddresses är tomt i AD och Entra visar ingen primäradress att "
+                  "behålla. Ett ensamt smtp:-alias skulle lämna kontot utan SMTP:, så "
+                  "inget skrivs.", file=sys.stderr)
+            return 2
+        print(f"         proxyAddresses är tomt i AD - Entra härleder {primary} ur mail. "
+              f"Första värdet gör AD:s lista gällande, så SMTP:{primary} skrivs med.",
+              file=sys.stderr)
+    if a.dry_run:
+        print(f"[torrkörning] AD svarar: {r.get('samAccountName')}, adresser "
+              f"{', '.join(r.get('before') or []) or 'inga'}.", file=sys.stderr)
+        if not a.remove:
+            print(f"[torrkörning] Skulle lägga till: {', '.join(r.get('adds') or [])}. "
+                  f"Inget skrivet.", file=sys.stderr)
+        return 0
+    if not r.get("changed"):
+        print(f"Ingen ändring behövdes i AD: {', '.join(r.get('after') or [])}", file=sys.stderr)
+        return 0
+    print(f"Klart i AD: {', '.join(r.get('after') or [])}", file=sys.stderr)
+
+    if a.sync:
+        try:
+            sync = onprem.delta_sync(dc, cred)
+        except onprem.OnPremError as e:
+            sync = {"ran": False, "reason": str(e)}
+        print(f"  Delta-sync startad: {sync.get('result')}." if sync.get("ran")
+              else f"  Ingen delta-sync: {sync.get('reason')}", file=sys.stderr)
+    return _wait_for_alias(u, address, not a.remove, a.wait)
+
+
+def _wait_for_alias(u, address, present, seconds):
+    """Poll Entra until the alias has arrived, or gone. Late is not failure."""
+    if not seconds:
+        return 0
+    print(f"Väntar på synken till Entra (upp till {seconds}s)", end="", file=sys.stderr,
+          flush=True)
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(15)
+        print(".", end="", file=sys.stderr, flush=True)
+        try:
+            now = users.addresses(users.resolve(u["id"]))
+        except users.UserError:
+            continue
+        if (address in now) == present:
+            print(f"\nEntra har {'fått' if present else 'tappat'} {address}.", file=sys.stderr)
+            return 0
+    print(f"\nInte i Entra än. Ändringen i AD är gjord och kommer med nästa synk "
+          f"(var 30:e minut); kolla med: wsg user show {u.get('userPrincipalName')} -v",
+          file=sys.stderr)
+    return 0
+
+
 def _sku_names(skus):
     return {s["skuId"]: s.get("skuPartNumber") or s["skuId"][:8] for s in skus}
 
@@ -2223,6 +2364,25 @@ def _add_user_commands(sub):
                         "writeback off, or a guest")
     s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
     s.set_defaults(fn=cmd_user_password)
+
+    s = sub.add_parser("alias", help="add or remove a mail alias on a synced account, "
+                                     "in AD where its addresses live")
+    user_arg(s)
+    s.add_argument("address", help="the address, e.g. person@example.com")
+    s.add_argument("--remove", action="store_true", help="take the alias away instead")
+    s.add_argument("--host", metavar="DC",
+                   help="domain controller, default WSG_AD_HOST or the configured one")
+    s.add_argument("--ad-user", dest="ad_user", metavar="USER",
+                   help="AD account that signs in to the DC; default WSG_AD_USER or the "
+                        "configured one")
+    s.add_argument("--sync", action="store_true", help="also start a delta sync cycle")
+    s.add_argument("--wait", type=int, default=300, metavar="SEC",
+                   help="wait this long for Entra to show the change; 0 skips the check "
+                        "(default 300)")
+    s.add_argument("--dry-run", action="store_true",
+                   help="check the address in Entra and AD and stop")
+    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_user_alias)
 
     s = sub.add_parser("create", help="create an account in on-prem AD, where a synced "
                                       "account has to start; the password is read from "

@@ -58,6 +58,7 @@ wsg user audit X       who changed the account, when, and what
 wsg user signins X     sign-in log, interactive and token refreshes
 wsg user groups X      group and directory role memberships
 wsg user password X    set a new password — in AD if the account is synced
+wsg user alias X ADDR  add (or --remove) a mail alias, in AD for a synced account
 wsg user onprem-find X who in the AD forest holds this name, deleted ones too
 wsg user onprem-check  can we reach the DC, and does Entra Connect run there
 
@@ -875,6 +876,36 @@ Three things worth knowing before the reset:
   reset keep working, which for a compromised account means the attacker stays
   in. `--revoke-sessions` invalidates them; clients are out within the hour, and
   access tokens already issued live until they expire.
+
+### Mail aliases on a synced account
+
+```
+wsg user alias person@example.com person@example.com --dry-run
+wsg user alias person@example.com person@example.com --sync
+wsg user alias person@example.com person@example.com --remove
+```
+
+A synced account's addresses belong to AD the same way its password does:
+Exchange Online refuses to edit them and Graph cannot write `proxyAddresses` at
+all. The alias is added in AD as one `smtp:` value - `-Add`, never `-Replace`,
+which would drop the primary with it - and then waits for Entra to show it.
+
+Before anything is written the address is checked three ways: its domain must
+be verified in the tenant (Exchange silently drops one that is not), no user or
+group in Entra may hold it, and no object in AD may hold it either - an account
+outside the sync scope can, where Entra never sees it. `--dry-run` runs all
+three and stops. A cloud account is refused with a pointer to Exchange, where
+its addresses live.
+
+**An empty list in AD is normal and invisible from Entra.** Many accounts
+have no `proxyAddresses` on-prem at all; Entra then shows a primary derived from
+`mail`, and Exchange adds the `onmicrosoft.com` routing address itself. The first
+value written makes AD's list the one that counts, so a lone `smtp:` alias would
+leave the account without an `SMTP:` primary. In that case the command writes the
+primary Entra shows today in the same change, and `--dry-run` says so.
+
+An alias only receives mail. It is not a sign-in name: that is the UPN, and it
+is also what a SAML app gets as NameID unless the claim says otherwise.
 
 ### Synced accounts: resetting in AD
 
