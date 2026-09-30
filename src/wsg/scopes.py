@@ -34,6 +34,11 @@ DEFAULT_SCOPES = [
     # namnen på tilldelade och på ägargruppen kommer från User.Read.All och
     # Group.Read.All ovan, inte härifrån.
     "Tasks.Read",
+    # Teams-chatt: skriva till en kollega i 1:1. Chat.Create hittar eller skapar
+    # chatten (POST /chats returnerar den befintliga), ChatMessage.Send postar i den.
+    # Inget av dem läser chattar.
+    "Chat.Create",
+    "ChatMessage.Send",
     # Intune
     "DeviceManagementManagedDevices.Read.All",
     "DeviceManagementManagedDevices.ReadWrite.All",
@@ -42,14 +47,6 @@ DEFAULT_SCOPES = [
     "DeviceManagementServiceConfig.Read.All",
     "DeviceManagementServiceConfig.ReadWrite.All",
     "DeviceManagementScripts.ReadWrite.All",
-    # SharePoint-sidor: uppdatera och publicera intranätsartiklar via
-    # /sites/{id}/pages. Behörigheten på siten avgör fortfarande.
-    "Sites.ReadWrite.All",
-    # Teams-chatt: skriva till en kollega i 1:1. Chat.Create hittar eller skapar
-    # chatten (POST /chats returnerar den befintliga), ChatMessage.Send postar i den.
-    # Inget av dem läser chattar.
-    "Chat.Create",
-    "ChatMessage.Send",
     "DeviceManagementApps.ReadWrite.All",
     # LAPS-lösenord för enskild enhet
     "DeviceLocalCredential.Read.All",
