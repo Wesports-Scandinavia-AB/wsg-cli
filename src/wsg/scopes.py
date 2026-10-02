@@ -14,6 +14,10 @@ DEFAULT_SCOPES = [
     "Mail.Send",
     # Mail.ReadWrite behövs för createReply/drafts, dvs. svara i tråd
     "Mail.ReadWrite",
+    # Läsa delade brevlådor jag har FullAccess till (person@example.com, person@example.com,
+    # person@example.com) - mail-triage tittar i dem varje varv. Scopet ger
+    # ingen åtkomst i sig; Exchange-behörigheten på brevlådan avgör fortfarande.
+    "Mail.Read.Shared",
     "MailboxSettings.Read",
     # Directory
     "User.Read.All",
