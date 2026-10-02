@@ -31,6 +31,10 @@ DEFAULT_SCOPES = [
     # Läser om password writeback är på, dvs. om ett synkat konto alls kan
     # lösenordsbytas i Entra. Utan scopet hoppar wsg user password över kollen.
     "OnPremDirectorySynchronization.Read.All",
+    # Claims på en enterprise-apps SAML-token (servicePrincipals/{id}/claimsPolicy),
+    # t.ex. vad AARO SAML får som NameID. Skriver bara appkonfiguration, men kräver
+    # också en roll som Cloud Application Administrator för att gå igenom.
+    "Policy.ReadWrite.ApplicationConfiguration",
     "Device.Read.All",
     "AuditLog.Read.All",
     "ServiceHealth.Read.All",
