@@ -5,7 +5,7 @@ no secrets: you sign in as yourself and the scripts get what you are allowed to
 do. Two services today:
 
 - `wsg graph` — Microsoft Graph, signed in with your Entra account
-- `wsg arena` — WeSports Arena, signed in through Cloudflare Access
+- `wsg arena` — WeSports Arena, signed in with Arena's own OAuth (no Cloudflare Access since 2026-09-20)
 
 ## Install
 
@@ -32,9 +32,9 @@ wsg graph whoami     calls Graph /me
 wsg graph sendmail   send mail as yourself, body from stdin, --dry-run first
 wsg graph logout     deletes the cache
 
-wsg arena login      sign in to WeSports Arena through Cloudflare Access
-wsg arena status     who is signed in to Arena, session expiry
-wsg arena token      prints the Access JWT for Arena
+wsg arena login      sign in to WeSports Arena (prints the URL, loopback redirect)
+wsg arena status     the Arena session on this machine, token expiry
+wsg arena token      prints a live Arena access token
 wsg arena whoami     calls Arena /api/me
 wsg arena get PATH   GET any Arena API path, prints JSON
 wsg arena companies      the registry: id, legal name, org no
@@ -154,23 +154,38 @@ override with `WSG_TENANT`.
 
 ## Arena
 
-Arena (`https://arena.wesports.io`) sits behind Cloudflare Access, which
-federates to Entra. The app only trusts the JWT Access issues, so the Graph
-token from `wsg login` does not work there. `wsg arena` drives `cloudflared`
-for the browser login and the token cache in `~/.cloudflared`:
+Arena (`https://arena.wesports.io`) has its own sign-in (Tribune) since
+Cloudflare Access came off it on 2026-09-20, and a terminal cannot carry the
+browser's session cookie. `wsg arena login` therefore uses Arena's OAuth server:
+authorization code + PKCE with a loopback redirect, the page that asks being
+Arena's own. It prints the URL and never opens a browser.
+
+It needs a client registered in Arena with audience `api` — one per person,
+whose tokens open `/api` with that person's rights and never `/mcp`:
 
 ```
-winget install Cloudflare.cloudflared      once
-wsg arena login                            cloudflared prints a URL and opens the default browser
+node scripts/mcp-client.mjs create --name "wsg — Tommy" --api   in wesports-arena, then apply the SQL
+```
+
+Put the id and secret it prints in `%LOCALAPPDATA%\wsg\arena.json`
+(`~/.config/wsg/arena.json` elsewhere), or in `WSG_ARENA_CLIENT_ID` /
+`WSG_ARENA_CLIENT_SECRET`:
+
+```json
+{"client_id": "cl_...", "client_secret": "amcs_..."}
+```
+
+```
+wsg arena login                            prints a URL; sign in and allow
 wsg arena get /api/me
 ```
 
-The session lasts as long as the Access app allows (hours, not 90 days), so
-scripts should treat exit code 2 as "run `wsg arena login`". The `get` command
-sends the token as `cf-access-token`; do the same from your own code:
+The access token lives an hour and renews itself with the refresh token, which
+lasts 30 days and rotates on every use. Scripts should treat exit code 2 as
+"run `wsg arena login`". The token is a normal bearer token:
 
 ```powershell
-$H = @{ "cf-access-token" = (wsg arena token); "User-Agent" = "my-script" }
+$H = @{ Authorization = "Bearer " + (wsg arena token); "User-Agent" = "my-script" }
 Invoke-RestMethod -Headers $H -Uri https://arena.wesports.io/api/me
 ```
 
@@ -383,7 +398,7 @@ domain has exactly one incident in the relevant state. `ack` only needs
 --learning "..."` writes the after-the-fact note in the same go.
 
 Send a real `User-Agent`: the zone's bot rules answer 403 to `Python-urllib`.
-Override the app with `WSG_ARENA_URL`, the binary with `WSG_CLOUDFLARED`.
+Override the app with `WSG_ARENA_URL`, the token cache with `WSG_ARENA_TOKEN_CACHE`.
 
 ## Devices
 

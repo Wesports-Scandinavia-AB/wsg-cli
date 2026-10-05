@@ -1,28 +1,40 @@
 """
-WeSports Arena: sign in through Cloudflare Access and call the Arena API.
+WeSports Arena: sign in with Arena's own OAuth server and call the Arena API.
 
-Arena trusts Cloudflare Access, not Entra directly. The browser login goes
-through Access (which federates to Entra), and Access hands back a JWT scoped
-to the app. That JWT is what the API accepts, sent as the `cf-access-token`
-header. The Access CLI flow (NaCl box against login.cloudflareaccess.org) is
-not worth reimplementing without dependencies, so this module drives the
-`cloudflared` binary, which also owns the token cache in ~/.cloudflared.
+Cloudflare Access came off arena.wesports.io on 2026-09-20, and with it the JWT
+this module used to fetch through `cloudflared`. A command-line tool cannot carry
+the browser's __Host- session cookie, so it signs in the way the Claude connector
+does: authorization code + PKCE against /oauth/authorize, with a loopback
+redirect to a port on this machine. The page that asks is Arena's own, behind
+the normal Arena sign-in (Tribune), so you prove yourself exactly as in the
+browser and the token carries the assurance of that sign-in.
 
-Session length is set by the Access app (hours, not the 90 days of the Graph
-refresh token), so expect to run `wsg arena login` more often than `wsg graph login`.
+The client is registered in Arena with audience 'api' (Arena:
+scripts/mcp-client.mjs create --api). Its tokens open /api as you, with your
+rights and no more, and never /mcp. Its id and secret live in
+%LOCALAPPDATA%\\wsg\\arena.json (or ~/.config/wsg/arena.json), or in
+WSG_ARENA_CLIENT_ID / WSG_ARENA_CLIENT_SECRET.
+
+An access token lives an hour and is renewed with the refresh token, which lives
+30 days and rotates on every use, so `wsg arena login` is needed about monthly.
 """
 
+import base64
+import hashlib
+import http.server
 import json
 import os
-import shutil
-import subprocess
+import secrets
+import socket
 import sys
+import threading
+import time
 from pathlib import Path
 from urllib import parse, request
 from urllib.error import HTTPError
 
 from . import __version__
-from .auth import AuthError, decode_jwt
+from .auth import AuthError
 
 DEFAULT_URL = "https://arena.wesports.io"
 # Cloudflare's bot rules on the zone answer 403 (error 1010, browser_signature_banned)
@@ -34,98 +46,206 @@ def app_url():
     return os.environ.get("WSG_ARENA_URL", DEFAULT_URL).rstrip("/")
 
 
-def _host():
-    return parse.urlsplit(app_url()).netloc
+def _config_dir():
+    base = os.environ.get("LOCALAPPDATA")
+    return Path(base) / "wsg" if base else Path.home() / ".config" / "wsg"
 
 
-def cloudflared():
-    exe = os.environ.get("WSG_CLOUDFLARED") or shutil.which("cloudflared")
-    if not exe and sys.platform == "win32":
-        for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
-            if base and (Path(base) / "cloudflared" / "cloudflared.exe").exists():
-                exe = str(Path(base) / "cloudflared" / "cloudflared.exe")
-                break
-    if not exe:
-        raise AuthError("cloudflared hittades inte. Installera: winget install Cloudflare.cloudflared "
-                        "(eller sätt WSG_CLOUDFLARED till sökvägen)")
-    return exe
+def client_path():
+    return Path(os.environ.get("WSG_ARENA_CLIENT") or _config_dir() / "arena.json")
 
 
-def cache_dir():
-    return Path(os.environ.get("TUNNEL_ORIGIN_CERT_DIR") or Path.home() / ".cloudflared")
+def cache_path():
+    return Path(os.environ.get("WSG_ARENA_TOKEN_CACHE") or _config_dir() / "arena-token.json")
 
 
-def _cached_files(token=None):
-    """Token files for this app: <host>-<aud>-token plus .url and .lock sidecars.
-
-    The host in the file name is whatever URL was used at login (a pages.dev alias
-    counts), so match on the AUD from the token when we have one.
-    """
-    if token is None:
+def client():
+    """(client_id, client_secret) for the registered 'api' client."""
+    cid, secret = os.environ.get("WSG_ARENA_CLIENT_ID"), os.environ.get("WSG_ARENA_CLIENT_SECRET")
+    if not (cid and secret):
         try:
-            token = get_token()
-        except AuthError:
-            return sorted(cache_dir().glob(f"{_host()}-*-token*"))
-    auds = decode_jwt(token).get("aud") or []
-    auds = [auds] if isinstance(auds, str) else auds
-    files = set()
-    for aud in auds:
-        files.update(cache_dir().glob(f"*-{aud}-token*"))
-    return sorted(files)
+            c = json.loads(client_path().read_text(encoding="utf-8"))
+            cid, secret = c.get("client_id"), c.get("client_secret")
+        except (OSError, ValueError):
+            pass
+    if not (cid and secret):
+        raise AuthError(
+            f"Ingen Arena-klient. Lägg client_id och client_secret i {client_path()} "
+            "(registreras i Arena med: node scripts/mcp-client.mjs create --name \"wsg — <namn>\" --api)")
+    return cid, secret
 
 
-def login(timeout=600):
-    """Run `cloudflared access login`. cloudflared prints the URL on stderr; the JWT is never printed.
+# ── token cache ───────────────────────────────────────────────────────────────
 
-    cloudflared always tries to open the default browser itself; there is no flag
-    to stop it. The URL is printed as well so a headless box or a second browser
-    works too. Returns the JWT.
-    """
-    cmd = [cloudflared(), "access", "login", "--no-verbose", app_url()]
+def _read_cache():
     try:
-        # stderr carries the URL and progress, so stream it straight through.
-        # stdout carries only the token because of --no-verbose.
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, timeout=timeout, text=True)
-    except subprocess.TimeoutExpired:
-        raise AuthError(f"Ingen inloggning inom {timeout} s")
-    if r.returncode != 0:
-        raise AuthError(f"cloudflared avslutades med kod {r.returncode}")
-    tok = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
-    if tok.count(".") != 2:
-        raise AuthError("cloudflared gav ingen token")
-    return tok
+        return json.loads(cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_cache(tok):
+    p = cache_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "url": app_url(),
+        "access_token": tok["access_token"],
+        "refresh_token": tok.get("refresh_token"),
+        "expires_at": int(time.time()) + int(tok.get("expires_in", 3600)) - 60,
+        "signed_in_at": int(time.time()),
+    }
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(p)
+    return data
+
+
+def _token_endpoint(body):
+    """POST /oauth/token with the client's credentials. Returns (json, error_json)."""
+    cid, secret = client()
+    data = parse.urlencode({**body, "client_id": cid, "client_secret": secret}).encode()
+    req = request.Request(f"{app_url()}/oauth/token", data=data, method="POST", headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    })
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read()), None
+    except HTTPError as e:
+        try:
+            return None, json.loads(e.read())
+        except ValueError:
+            return None, {"error": f"HTTP {e.code}"}
+
+
+# ── sign-in ───────────────────────────────────────────────────────────────────
+
+_DONE_HTML = (
+    "<!doctype html><meta charset='utf-8'><title>wsg</title>"
+    "<body style='font-family:system-ui;padding:3em'>"
+    "<h2>Inloggad i Arena.</h2><p>Du kan stänga den här fliken.</p>"
+)
+
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def login(timeout=600, out=sys.stderr):
+    """Authorization code + PKCE over a loopback redirect. Prints the URL, never opens a browser."""
+    cid, _ = client()
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    port = _free_port()
+    # Arena matches a loopback redirect on host and path, any port (RFC 8252).
+    redirect = f"http://127.0.0.1:{port}/callback"
+    url = f"{app_url()}/oauth/authorize?" + parse.urlencode({
+        "client_id": cid,
+        "response_type": "code",
+        "redirect_uri": redirect,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    })
+
+    result = {}
+    got = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = parse.urlsplit(self.path)
+            q = dict(parse.parse_qsl(u.query))
+            if u.path != "/callback" or ("code" not in q and "error" not in q):
+                self.send_response(404)
+                self.end_headers()
+                return
+            result.update(q)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(_DONE_HTML.encode("utf-8"))
+            got.set()
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    server.timeout = 1
+
+    def serve():
+        while not got.is_set():
+            server.handle_request()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+
+    print("Öppna den här adressen i webbläsaren och logga in:", file=out, flush=True)
+    print(url, file=out, flush=True)
+
+    ok = got.wait(timeout)
+    got.set()            # stop the serve loop before closing the socket
+    thread.join(3)
+    server.server_close()
+    if not ok:
+        raise AuthError(f"Ingen inloggning inom {timeout} sekunder.")
+    if result.get("error"):
+        raise AuthError(f"{result['error']}: {result.get('error_description', '')}")
+    if result.get("state") != state:
+        raise AuthError("state mismatch, avbryter.")
+
+    tok, err = _token_endpoint({
+        "grant_type": "authorization_code",
+        "code": result["code"],
+        "redirect_uri": redirect,
+        "code_verifier": verifier,
+    })
+    if not tok:
+        err = err or {}
+        raise AuthError(err.get("error_description") or err.get("error") or "tokenutbytet misslyckades")
+    return _write_cache(tok)
 
 
 def get_token():
-    """Return the cached Access JWT, or raise AuthError if login is needed."""
-    r = subprocess.run([cloudflared(), "access", "token", "-app", app_url()],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    tok = r.stdout.strip()
-    if r.returncode != 0 or tok.count(".") != 2:
+    """A live access token, refreshed when it has run out. Raises AuthError when login is needed."""
+    c = _read_cache()
+    if not c or c.get("url") != app_url():
         raise AuthError(f"Inte inloggad mot {app_url()}. Kör: wsg arena login")
-    return tok
+    if c.get("expires_at", 0) > time.time():
+        return c["access_token"]
+    if not c.get("refresh_token"):
+        raise AuthError("Arena-sessionen har gått ut. Kör: wsg arena login")
+    tok, err = _token_endpoint({"grant_type": "refresh_token", "refresh_token": c["refresh_token"]})
+    if not tok:
+        # A rotated-away or revoked refresh token cannot be retried: it is spent.
+        raise AuthError(f"Arena-sessionen kunde inte förnyas ({(err or {}).get('error', '?')}). Kör: wsg arena login")
+    return _write_cache(tok)["access_token"]
 
 
 def logout():
-    files = _cached_files()
-    files = [f for f in files if not f.name.endswith(".lock")] + [f for f in files if f.name.endswith(".lock")]
-    for f in files:
-        try:
-            f.unlink()
-        except OSError:
-            pass
-    return bool(files)
+    """Forget the tokens on this machine. Arena revokes them on offboarding, and they lapse after 30 days."""
+    p = cache_path()
+    if p.exists():
+        p.unlink()
+        return True
+    return False
 
 
 def status():
-    """Claims of the cached token, or None. Does not call the network."""
-    try:
-        tok = get_token()
-    except AuthError:
+    """What the cache holds, or None. Does not call the network."""
+    c = _read_cache()
+    if not c or c.get("url") != app_url():
         return None
-    c = decode_jwt(tok)
-    c["_files"] = [str(f) for f in _cached_files(tok)]
-    return c
+    return {
+        "url": c["url"],
+        "access_expires_at": c.get("expires_at", 0),
+        "signed_in_at": c.get("signed_in_at"),
+        "renewable": bool(c.get("refresh_token")),
+        "cache": str(cache_path()),
+    }
 
 
 def api(method, path, body=None, token=None, timeout=60):
@@ -134,7 +254,7 @@ def api(method, path, body=None, token=None, timeout=60):
     url = app_url() + (path if path.startswith("/") else "/" + path)
     data = json.dumps(body).encode() if body is not None else None
     req = request.Request(url, method=method, data=data, headers={
-        "cf-access-token": tok,
+        "Authorization": f"Bearer {tok}",
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
         **({"Content-Type": "application/json"} if data else {}),
@@ -145,8 +265,8 @@ def api(method, path, body=None, token=None, timeout=60):
             ctype = resp.headers.get("Content-Type", "")
     except HTTPError as e:
         raw = e.read()
-        if e.code in (401, 403) and b"cloudflareaccess" in raw.lower():
-            raise AuthError(f"Access släppte inte igenom ({e.code}). Kör: wsg arena login")
+        if e.code == 401:
+            raise AuthError(f"Arena tog inte emot inloggningen ({method} {path}: 401). Kör: wsg arena login")
         try:
             detail = json.loads(raw).get("error") or raw.decode(errors="replace")
         except (ValueError, AttributeError):
@@ -156,9 +276,6 @@ def api(method, path, body=None, token=None, timeout=60):
         return json.loads(raw) if raw else None
     head = raw.lstrip()[:200].lower()
     if head.startswith(b"<!doctype") or head.startswith(b"<html"):
-        if b"cloudflareaccess" in raw.lower():
-            # Access redirected to its login page instead of letting us through.
-            raise AuthError("Fick Access inloggningssida istället för JSON. Kör: wsg arena login")
         # Pages serves the SPA shell for any unknown path, so a typo lands here.
         raise AuthError(f"{method} {path}: ingen API-route, fick appens HTML")
     return raw.decode(errors="replace")

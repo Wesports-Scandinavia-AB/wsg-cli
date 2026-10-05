@@ -204,12 +204,13 @@ def cmd_graph_sendmail(a):
 
 def cmd_arena_login(a):
     try:
-        tok = arena.login(timeout=a.timeout)
+        arena.login(timeout=a.timeout)
+        me = arena.get("/api/me")
     except auth.AuthError as e:
         print(f"Inloggningen misslyckades: {e}", file=sys.stderr)
         return 1
-    c = auth.decode_jwt(tok)
-    print(f"Inloggad mot {arena.app_url()} som {c.get('email', '?')}", file=sys.stderr)
+    m = (me or {}).get("member") or {}
+    print(f"Inloggad mot {arena.app_url()} som {m.get('email', '?')}", file=sys.stderr)
     return 0
 
 
@@ -219,7 +220,7 @@ def cmd_arena_token(a):
     except auth.AuthError as e:
         print(str(e), file=sys.stderr)
         return 2
-    print(f"cf-access-token: {tok}" if a.header else tok)
+    print(f"Authorization: Bearer {tok}" if a.header else tok)
     return 0
 
 
@@ -228,26 +229,25 @@ def cmd_arena_status(a):
     if not c:
         print(f"Inte inloggad mot {arena.app_url()}. Kör: wsg arena login")
         return 2
-    exp = datetime.fromtimestamp(c.get("exp", 0))
-    idp = c.get("idp")
-    idp = idp.get("type") if isinstance(idp, dict) else idp
+    exp = datetime.fromtimestamp(c["access_expires_at"])
+    since = datetime.fromtimestamp(c["signed_in_at"]) if c.get("signed_in_at") else None
+    live = c["access_expires_at"] > time.time()
     if a.json:
         print(json.dumps({
-            "url": arena.app_url(),
-            "email": c.get("email"),
-            "idp": idp,
-            "amr": c.get("amr"),
-            "expires_at": exp.isoformat(timespec="seconds"),
-            "valid": c.get("exp", 0) > time.time(),
-            "cache": c.get("_files"),
+            "url": c["url"],
+            "access_expires_at": exp.isoformat(timespec="seconds"),
+            "access_valid": live,
+            "renewable": c["renewable"],
+            "token_issued_at": since.isoformat(timespec="seconds") if since else None,
+            "cache": c["cache"],
         }, indent=2, ensure_ascii=False))
         return 0
-    print(f"App:      {arena.app_url()}")
-    print(f"E-post:   {c.get('email', '?')}")
-    print(f"IdP:      {idp or '?'}  amr={','.join(c.get('amr') or []) or '-'}")
-    print(f"Session:  {'giltig till ' + exp.strftime('%Y-%m-%d %H:%M') if c.get('exp', 0) > time.time() else 'utgången, kör: wsg arena login'}")
-    for f in c.get("_files") or []:
-        print(f"Cache:    {f}")
+    print(f"App:      {c['url']}")
+    print(f"Token:    {'giltig till ' + exp.strftime('%Y-%m-%d %H:%M') if live else 'utgången'}"
+          f"{', förnyas av sig själv' if c['renewable'] else ', kör: wsg arena login'}")
+    if since:
+        print(f"Utfärdad: {since.strftime('%Y-%m-%d %H:%M')} (förnyelsen gäller 30 dagar från senaste användning)")
+    print(f"Cache:    {c['cache']}")
     return 0
 
 
@@ -2521,15 +2521,15 @@ def _add_graph_commands(sub, visible=True):
 
 
 def _add_arena_commands(sub):
-    s = sub.add_parser("login", help="sign in to Arena through Cloudflare Access (Entra + MFA)")
+    s = sub.add_parser("login", help="sign in to Arena (OAuth in the browser, prints the URL)")
     s.add_argument("--timeout", type=int, default=600, help="seconds to wait for the browser, default 600")
     s.set_defaults(fn=cmd_arena_login)
 
-    s = sub.add_parser("token", help="print the cached Access JWT")
-    s.add_argument("--header", action="store_true", help="print as 'cf-access-token: <jwt>'")
+    s = sub.add_parser("token", help="print a live Arena access token (renews it when needed)")
+    s.add_argument("--header", action="store_true", help="print as 'Authorization: Bearer <token>'")
     s.set_defaults(fn=cmd_arena_token)
 
-    s = sub.add_parser("status", help="who is signed in to Arena and until when")
+    s = sub.add_parser("status", help="the Arena session on this machine and until when")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_arena_status)
 
@@ -3490,7 +3490,7 @@ def main(argv=None):
                                        "someone else")
     _add_device_commands(dv.add_subparsers(dest="device_cmd", required=True))
 
-    ar = sub.add_parser("arena", help="WeSports Arena via Cloudflare Access (needs cloudflared)")
+    ar = sub.add_parser("arena", help="WeSports Arena, signed in with Arena's own OAuth")
     _add_arena_commands(ar.add_subparsers(dest="arena_cmd", required=True))
 
     it = sub.add_parser("intune", help="Intune app management: list, status, publish Store and Win32 apps")
