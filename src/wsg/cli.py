@@ -246,7 +246,8 @@ def cmd_arena_status(a):
     print(f"Token:    {'giltig till ' + exp.strftime('%Y-%m-%d %H:%M') if live else 'utgången'}"
           f"{', förnyas av sig själv' if c['renewable'] else ', kör: wsg arena login'}")
     if since:
-        print(f"Utfärdad: {since.strftime('%Y-%m-%d %H:%M')} (förnyelsen gäller 30 dagar från senaste användning)")
+        until = datetime.fromtimestamp(c["signed_in_at"] + arena.SIGN_IN_TTL_SECONDS)
+        print(f"Inloggad: {since.strftime('%Y-%m-%d %H:%M')} (gäller till {until.strftime('%Y-%m-%d %H:%M')}, sedan loggar wsg in igen)")
     print(f"Cache:    {c['cache']}")
     return 0
 

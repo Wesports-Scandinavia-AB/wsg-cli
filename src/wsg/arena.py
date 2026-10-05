@@ -15,8 +15,13 @@ rights and no more, and never /mcp. Its id and secret live in
 %LOCALAPPDATA%\\wsg\\arena.json (or ~/.config/wsg/arena.json), or in
 WSG_ARENA_CLIENT_ID / WSG_ARENA_CLIENT_SECRET.
 
-An access token lives an hour and is renewed with the refresh token, which lives
-30 days and rotates on every use, so `wsg arena login` is needed about monthly.
+An access token lives an hour and is renewed with the refresh token, which
+rotates on every use. The sign-in as a whole ends twelve hours after it began,
+the same as a browser session (Arena, API_FAMILY_TTL_SECONDS): the token carries
+that sign-in's assurance, tier 3 included, and a month of it on disk was too
+much. When it ends, an interactive run signs in again by itself (prints the URL
+and waits); a script without a terminal gets an AuthError instead, or always
+with WSG_ARENA_NO_RELOGIN=1.
 """
 
 import base64
@@ -75,6 +80,10 @@ def client():
     return cid, secret
 
 
+# How long Arena keeps a sign-in alive, refreshes included. Arena decides; this is
+# only for `wsg arena status` to say when the next sign-in is due.
+SIGN_IN_TTL_SECONDS = 12 * 60 * 60
+
 # ── token cache ───────────────────────────────────────────────────────────────
 
 def _read_cache():
@@ -84,7 +93,7 @@ def _read_cache():
         return None
 
 
-def _write_cache(tok):
+def _write_cache(tok, signed_in_at=None):
     p = cache_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     data = {
@@ -92,7 +101,8 @@ def _write_cache(tok):
         "access_token": tok["access_token"],
         "refresh_token": tok.get("refresh_token"),
         "expires_at": int(time.time()) + int(tok.get("expires_in", 3600)) - 60,
-        "signed_in_at": int(time.time()),
+        # When the SIGN-IN happened, kept across refreshes: Arena counts its twelve hours from it.
+        "signed_in_at": int(signed_in_at or time.time()),
     }
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -209,24 +219,38 @@ def login(timeout=600, out=sys.stderr):
     return _write_cache(tok)
 
 
+def _interactive():
+    """Someone is at a terminal to follow a sign-in URL. stderr, not stdin: `secret set`
+    reads the value from a pipe, and the URL is printed to stderr anyway."""
+    return sys.stderr.isatty() and not os.environ.get("WSG_ARENA_NO_RELOGIN")
+
+
+def _relogin(reason):
+    """Sign in again when someone can, else say how. Returns a fresh access token."""
+    if not _interactive():
+        raise AuthError(f"{reason}. Kör: wsg arena login")
+    print(f"{reason}, loggar in igen.", file=sys.stderr, flush=True)
+    return login()["access_token"]
+
+
 def get_token():
-    """A live access token, refreshed when it has run out. Raises AuthError when login is needed."""
+    """A live access token: cached, refreshed, or (at a terminal) signed in again."""
     c = _read_cache()
     if not c or c.get("url") != app_url():
-        raise AuthError(f"Inte inloggad mot {app_url()}. Kör: wsg arena login")
+        return _relogin(f"Inte inloggad mot {app_url()}")
     if c.get("expires_at", 0) > time.time():
         return c["access_token"]
     if not c.get("refresh_token"):
-        raise AuthError("Arena-sessionen har gått ut. Kör: wsg arena login")
+        return _relogin("Arena-inloggningen har gått ut")
     tok, err = _token_endpoint({"grant_type": "refresh_token", "refresh_token": c["refresh_token"]})
     if not tok:
-        # A rotated-away or revoked refresh token cannot be retried: it is spent.
-        raise AuthError(f"Arena-sessionen kunde inte förnyas ({(err or {}).get('error', '?')}). Kör: wsg arena login")
-    return _write_cache(tok)["access_token"]
+        # Spent, revoked, or past the sign-in's twelve hours: none of these can be retried.
+        return _relogin(f"Arena-inloggningen kunde inte förnyas ({(err or {}).get('error_description') or (err or {}).get('error', '?')})")
+    return _write_cache(tok, c.get("signed_in_at"))["access_token"]
 
 
 def logout():
-    """Forget the tokens on this machine. Arena revokes them on offboarding, and they lapse after 30 days."""
+    """Forget the tokens on this machine. Arena revokes them on offboarding, and they lapse twelve hours after sign-in."""
     p = cache_path()
     if p.exists():
         p.unlink()
@@ -249,20 +273,32 @@ def status():
 
 
 def api(method, path, body=None, token=None, timeout=60):
-    """Call the Arena API. `path` is like '/api/me'. Returns parsed JSON (or text)."""
+    """Call the Arena API. `path` is like '/api/me'. Returns parsed JSON (or text).
+
+    A 401 on our own cached token (revoked, or the sign-in ran out between the
+    expiry check and the call) signs in again once at a terminal and retries. A
+    401 is refused before the handler runs, so the retry cannot do a write twice."""
     tok = token or get_token()
     url = app_url() + (path if path.startswith("/") else "/" + path)
     data = json.dumps(body).encode() if body is not None else None
-    req = request.Request(url, method=method, data=data, headers={
-        "Authorization": f"Bearer {tok}",
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-        **({"Content-Type": "application/json"} if data else {}),
-    })
-    try:
+
+    def call(t):
+        req = request.Request(url, method=method, data=data, headers={
+            "Authorization": f"Bearer {t}",
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            **({"Content-Type": "application/json"} if data else {}),
+        })
         with request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            ctype = resp.headers.get("Content-Type", "")
+            return resp.read(), resp.headers.get("Content-Type", "")
+
+    try:
+        try:
+            raw, ctype = call(tok)
+        except HTTPError as e:
+            if e.code != 401 or token or not _interactive():
+                raise
+            raw, ctype = call(_relogin(f"Arena tog inte emot inloggningen ({method} {path}: 401)"))
     except HTTPError as e:
         raw = e.read()
         if e.code == 401:
