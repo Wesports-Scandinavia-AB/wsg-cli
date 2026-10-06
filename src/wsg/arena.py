@@ -29,7 +29,7 @@ import hashlib
 import http.server
 import json
 import os
-import secrets
+from secrets import token_urlsafe
 import socket
 import sys
 import threading
@@ -147,9 +147,9 @@ def _free_port():
 def login(timeout=600, out=sys.stderr):
     """Authorization code + PKCE over a loopback redirect. Prints the URL, never opens a browser."""
     cid, _ = client()
-    verifier = secrets.token_urlsafe(64)
+    verifier = token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    state = secrets.token_urlsafe(16)
+    state = token_urlsafe(16)
     port = _free_port()
     # Arena matches a loopback redirect on host and path, any port (RFC 8252).
     redirect = f"http://127.0.0.1:{port}/callback"
