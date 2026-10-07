@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import arena, auth, devices, garp, garpdb, intune, mscal, ongoing, onprem, planner, users
+from . import arena, auth, devices, garp, garpdb, intune, mscal, ongoing, onetime, onprem, planner, users
 from .scopes import DEFAULT_SCOPES
 
 
@@ -3085,6 +3085,91 @@ def _add_planner_commands(sub):
     s.set_defaults(fn=cmd_planner_task)
 
 
+# ── One-time links (secrets.wesports.io) ──────────────────────────────────────
+# How a credential leaves this machine for someone else: as a link that burns on
+# first read, never as text in a mail or a Teams thread, which are archived,
+# forwarded and indexed. Encryption happens here; see onetime.py.
+
+
+def cmd_secret_create(a):
+    import getpass
+    if a.file:
+        # A file goes as it is, trailing newline and all: a JSON key file or a PEM
+        # is compared byte for byte by whatever reads it at the other end.
+        try:
+            with open(a.file, encoding="utf-8") as f:
+                value = f.read()
+        except OSError as e:
+            print(f"Kan inte läsa {a.file}: {e.strerror}", file=sys.stderr)
+            return 2
+    elif sys.stdin.isatty():
+        value = getpass.getpass("Hemlighet (visas inte): ")
+    else:
+        value = _stdin_text()
+        # The pipe's line ending, not the secret's — same rule as arena secret-set.
+        for eol in (chr(13) + chr(10), chr(10), chr(13)):
+            if value.endswith(eol):
+                value = value[: -len(eol)]
+                break
+    if not value:
+        print("Tomt värde, avbryter.", file=sys.stderr)
+        return 2
+    passphrase = None
+    if a.passphrase:
+        passphrase = getpass.getpass("Lösenfras (skickas separat till mottagaren): ")
+        if passphrase != getpass.getpass("Igen: "):
+            print("Lösenfraserna skiljer sig, avbryter.", file=sys.stderr)
+            return 2
+    try:
+        r = onetime.create(value, ttl=a.ttl, views=a.views, title=a.title, passphrase=passphrase)
+    except onetime.OnetimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return 0
+    # The link alone on stdout so it pipes; the rest is for the person at the prompt.
+    print(r["link"])
+    plural = "visning" if r["views"] == 1 else "visningar"
+    print(f"Går ut {r['expiresAt']}, {r['views']} {plural}"
+          f"{', kräver lösenfras' if passphrase else ''}.", file=sys.stderr)
+    print(f"Ångra innan den öppnats: wsg secret delete {r['id']} {r['burnToken']}", file=sys.stderr)
+    return 0
+
+
+def cmd_secret_delete(a):
+    try:
+        onetime.delete(a.id, a.burn_token)
+    except onetime.OnetimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print("Borttagen. Länken fungerar inte längre.")
+    return 0
+
+
+def _add_secret_commands(sub):
+    s = sub.add_parser("create", help="encrypt a value here and print a one-time link; the "
+                                      "value comes from stdin or --file, never an argument")
+    s.add_argument("--file", metavar="PATH", help="send this file's contents, unchanged")
+    s.add_argument("--ttl", choices=onetime.TTLS, default="1d",
+                   help="how long the link lives if nobody opens it (default 1d)")
+    s.add_argument("--views", type=int, default=1, metavar="N",
+                   help=f"how many times it can be opened, 1-{onetime.MAX_VIEWS} (default 1)")
+    s.add_argument("--title", help="shown before opening, readable by anyone with the link "
+                                   "— never the secret itself")
+    s.add_argument("--passphrase", action="store_true",
+                   help="prompt for a passphrase the recipient must also type; send it "
+                        "another way than the link")
+    s.add_argument("--json", action="store_true",
+                   help="print link, id, burn token and expiry as JSON")
+    s.set_defaults(fn=cmd_secret_create)
+
+    s = sub.add_parser("delete", help="destroy a link before it is opened, with its burn token")
+    s.add_argument("id", metavar="ID")
+    s.add_argument("burn_token", metavar="BURN-TOKEN")
+    s.set_defaults(fn=cmd_secret_delete)
+
+
 # ── Garp ERP ──────────────────────────────────────────────────────────────────
 # The ERP half of the same question. `wsg ongoing last` says whether the warehouse
 # got the order; this says whether Garp ever sent it. Read together they locate the
@@ -3479,7 +3564,7 @@ def main(argv=None):
     )
     # metavar hides the compatibility aliases from the usage line.
     sub = p.add_subparsers(dest="cmd", required=True,
-                           metavar="{graph,user,device,arena,intune,ongoing,garp,garpdb,calendar,planner}")
+                           metavar="{graph,user,device,arena,intune,ongoing,garp,garpdb,calendar,planner,secret}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
@@ -3512,6 +3597,9 @@ def main(argv=None):
 
     pl = sub.add_parser("planner", help="Planner boards, read-only: what is on them and what is mine")
     _add_planner_commands(pl.add_subparsers(dest="planner_cmd", required=True))
+
+    se = sub.add_parser("secret", help="one-time links on secrets.wesports.io, encrypted before they leave")
+    _add_secret_commands(se.add_subparsers(dest="secret_cmd", required=True))
 
     _add_graph_commands(sub, visible=False)   # wsg login / token / status / whoami / logout
 

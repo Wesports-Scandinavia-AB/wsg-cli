@@ -2,10 +2,11 @@
 
 Sign in once per service, reuse the token from any script. No app registration,
 no secrets: you sign in as yourself and the scripts get what you are allowed to
-do. Two services today:
+do. Three services today:
 
 - `wsg graph` — Microsoft Graph, signed in with your Entra account
 - `wsg arena` — WeSports Arena, signed in with Arena's own OAuth (no Cloudflare Access since 2026-09-20)
+- `wsg secret` — one-time links on secrets.wesports.io, no sign-in
 
 ## Install
 
@@ -91,6 +92,9 @@ wsg planner tasks X    one board, in board order, by bucket — --all for comple
 wsg planner mine       tasks assigned to you, nearest due first
 wsg planner task ID    one task with its description and checklist
 wsg planner link X     the address of one board, --bare for the URL alone
+
+wsg secret create      encrypt a value or --file here, print a one-time link
+wsg secret delete      destroy a link before it is opened
 
 ```
 
@@ -218,6 +222,41 @@ attachment. Above that ceiling the file needs `createUploadSession` against a dr
 or OneDrive and a link; this command refuses up front rather than failing halfway.
 
 Needs `Mail.Send`, which is in the default scope set.
+
+## One-time secret links
+
+A password, an API key or a credentials file goes to someone else as a link on
+[secrets.wesports.io](https://secrets.wesports.io) that burns on first read — never
+as text in a mail or a Teams thread, which are archived, forwarded and indexed. Put
+the link in the mail instead.
+
+```
+wsg secret create --file client_secret.json --ttl 7d --title "GA4 OAuth client"
+printf '%s' "$API_KEY" | wsg secret create
+wsg secret create --passphrase          # prompts for the value, then a passphrase
+wsg secret delete <id> <burn-token>     # before it is opened
+```
+
+No sign-in: the service is public. The value is encrypted here, with the same
+envelope the service's own create page builds, and the key exists only in the
+link's `#fragment`, which never reaches the server. So the link alone is the
+secret — whoever holds it can open it, once.
+
+- **The value comes from stdin or `--file`, never an argument**, for the same reason
+  as `secret-set`. A file is sent byte for byte; from a pipe, one trailing line
+  ending is dropped.
+- **stdout is the link alone**, so it pipes into a mail. Expiry and the delete
+  command go to stderr. `--json` gives link, id, burn token and expiry together.
+- `--ttl` is `1h`, `1d` (default) or `7d`; `--views` 1–10, default 1.
+- **`--title` is readable by anyone with the link** before it is opened. Say what
+  it is, never what it says.
+- `--passphrase` weaves a passphrase into the key: the link alone then opens
+  nothing. Send it another way. A wrong passphrase still burns the secret — the
+  server cannot tell it from a right one.
+
+AES-GCM is implemented in plain Python in `onetime.py`, since the package has no
+dependencies and the standard library has no AES. It was checked against the
+`cryptography` package and against the service's reveal endpoint.
 
 ## The work calendar
 
