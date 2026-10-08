@@ -3,10 +3,11 @@ import json
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import arena, auth, devices, garp, garpdb, intune, mscal, ongoing, onetime, onprem, planner, users
+from . import arena, auth, devices, garp, garpdb, grit, intune, mscal, ongoing, onetime, onprem, planner, users
 from .scopes import DEFAULT_SCOPES
 
 
@@ -2134,6 +2135,223 @@ def _adopt(a, spec, found, password, dc, cred, pre):
     return rc
 
 
+def _ascii_name(s):
+    """"Jönsson" -> "jonsson": the tenant's UPNs drop the accent (Göransson is goransson,
+    Jürs is jurs), they do not spell it out the German way."""
+    plain = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9.-]", "", plain.lower().replace(" ", "."))
+
+
+_NO_ALIAS = {"inget", "ingen", "nej", "-", "no", "none"}
+
+
+def cmd_user_onboard(a):
+    """Onboard the person on a Grit item: AD account, licence, groups, ticked off.
+
+    The answers come from the item's notes, where the Onboarding flow filed
+    them; the template account (the flow's "Samma rättigheter som") supplies
+    the OU, the licences and the groups that a person with the same job has.
+    Anything the item does not say is a flag here, never a guess.
+
+    It runs in two halves because the sync sits between them. The AD half is
+    `wsg user create`, unchanged. The cloud half needs the account in Entra,
+    so when the sync has not carried it across yet, running the same command
+    again later picks up there: an account that already exists, synced, is
+    not created twice.
+    """
+    try:
+        main_item, subs = grit.item(a.ref)
+    except grit.GritError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    ans = grit.answers(main_item.get("body"))
+    name = a.display_name or grit.subject(main_item.get("title"))
+    if not name or " " not in name:
+        print(f"Kan inte läsa ett för- och efternamn ur {main_item.get('title')!r}. "
+              f"Ange --display-name.", file=sys.stderr)
+        return 2
+    given, _, surname = name.partition(" ")
+
+    domain = (a.domain or ans.get("domain") or "").lstrip("@").strip().lower()
+    if a.upn:
+        upn = a.upn
+    elif domain:
+        upn = f"{_ascii_name(given)}.{_ascii_name(surname)}@{domain}"
+    else:
+        print("Posten säger ingen e-postdomän. Ange --domain eller --upn.", file=sys.stderr)
+        return 2
+
+    # The template is a person in Entra, not in AD: every group a Vartex
+    # account has is a cloud group (checked 2026-10-08), so copying AD
+    # memberships would copy nothing that matters.
+    like_who = a.like or ans.get("like")
+    template = None
+    if like_who:
+        try:
+            template = users.resolve(like_who)
+        except users.UserError as e:
+            print(f"Mallen {like_who!r}: {e}", file=sys.stderr)
+            return 2
+
+    manager_upn = None
+    if a.manager or ans.get("manager"):
+        try:
+            manager_upn = users.resolve(a.manager or ans["manager"]).get("userPrincipalName")
+        except users.UserError as e:
+            print(f"Chefen: {e}", file=sys.stderr)
+            return 2
+
+    ou = a.ou
+    if not ou and template and template.get("onPremisesDistinguishedName"):
+        ou = template["onPremisesDistinguishedName"].split(",", 1)[1]
+
+    try:
+        if a.license:
+            skus = [users.sku(x) for x in a.license]
+        else:
+            by_id = {s["skuId"]: s for s in users.subscribed_skus()}
+            skus = [by_id[x["skuId"]] for x in (template or {}).get("assignedLicenses") or []
+                    if x["skuId"] in by_id]
+        wanted = []
+        if template and not a.no_template_groups:
+            wanted += [g for g in users.member_groups(template["id"])
+                       if users.group_door(g) in ("graph", "exchange")]
+        wanted += [users.group(x) for x in a.group or []]
+    except users.UserError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    seen, groups = set(), []
+    for g in wanted:
+        if g["id"] not in seen:
+            seen.add(g["id"])
+            groups.append(g)
+    usage = a.usage_location or (template or {}).get("usageLocation") or "SE"
+    department = a.department or (template or {}).get("department")
+
+    print(f"Grit {a.ref}: {main_item.get('title')}", file=sys.stderr)
+    if template:
+        print(f"  mall        {template.get('displayName')} <{template.get('userPrincipalName')}>",
+              file=sys.stderr)
+    print(f"  licens      {', '.join(s['skuPartNumber'] for s in skus) or 'INGEN'}"
+          f"  (usageLocation {usage})", file=sys.stderr)
+    for g in groups:
+        door = users.group_door(g)
+        print(f"  grupp       {g['displayName']}"
+              + ("  (distributionslista: Exchange, inte härifrån)" if door == "exchange" else ""),
+              file=sys.stderr)
+    if not skus:
+        print("Ingen licens att ge: ange --license, eller en mall som har en.", file=sys.stderr)
+        return 2
+
+    existing = [u for u in users.find(upn, limit=5)
+                if (u.get("userPrincipalName") or "").casefold() == upn.casefold()]
+    if existing and not existing[0].get("onPremisesSyncEnabled"):
+        print(f"{upn} finns redan i Entra som molnkonto. Det går inte att ta över från AD; "
+              f"reda ut det för hand.", file=sys.stderr)
+        return 2
+
+    if existing:
+        print(f"{upn} finns redan i Entra, synkat från AD. Hoppar över att skapa och gör "
+              f"molndelen.", file=sys.stderr)
+    else:
+        if not ou:
+            print("Ingen OU: ange --ou, eller en mall vars konto ligger i rätt OU.",
+                  file=sys.stderr)
+            return 2
+        argv = ["user", "create", upn, "--given-name", given, "--surname", surname,
+                "--display-name", name, "--ou", ou, "--generate", "--sync"]
+        for flag, value in (("--title", ans.get("title")), ("--company", ans.get("company")),
+                            ("--office", ans.get("office")), ("--department", department),
+                            ("--manager", manager_upn), ("--host", a.host),
+                            ("--ad-user", a.ad_user)):
+            if value:
+                argv += [flag, value]
+        if a.dry_run:
+            argv.append("--dry-run")
+        if a.yes:
+            argv.append("--yes")
+        rc = main(argv)
+        if rc:
+            return rc
+
+    if a.dry_run:
+        _onboard_grit_plan(ans, subs)
+        print("[torrkörning] Ingen licens, inga grupper, inget i Grit.", file=sys.stderr)
+        return 0
+
+    try:
+        u = users.resolve(upn)
+    except users.UserError:
+        print(f"{upn} syns inte i Entra än. Kör samma kommando igen när synken har gått, "
+              f"så görs licens, grupper och Grit då.", file=sys.stderr)
+        return 0
+
+    problems, left_for_exchange = [], []
+    if u.get("usageLocation") != usage:
+        users.set_usage_location(u["id"], usage)
+    have = {x["skuId"] for x in u.get("assignedLicenses") or []}
+    for s in skus:
+        if s["skuId"] in have:
+            continue
+        try:
+            users.assign_license(u["id"], s["skuId"])
+            print(f"  licens {s['skuPartNumber']} tilldelad", file=sys.stderr)
+        except users.UserError as e:
+            problems.append(f"licens {s['skuPartNumber']}: {e}")
+    for g in groups:
+        if users.group_door(g) == "exchange":
+            left_for_exchange.append(g)
+            continue
+        try:
+            added = users.add_member(g["id"], u["id"])
+            print(f"  {'+' if added else '='} {g['displayName']}", file=sys.stderr)
+        except users.UserError as e:
+            problems.append(f"{g['displayName']}: {e}")
+
+    for p in problems:
+        print(f"MISSLYCKADES: {p}", file=sys.stderr)
+    if left_for_exchange:
+        print("Distributionslistor tar inte medlemmar via Graph. I Exchange Online:",
+              file=sys.stderr)
+        for g in left_for_exchange:
+            print(f"  Add-DistributionGroupMember -Identity '{g.get('mail') or g['displayName']}' "
+                  f"-Member '{upn}'", file=sys.stderr)
+
+    if a.no_grit:
+        return 1 if problems else 0
+    licensed = not any(p.startswith("licens") for p in problems)
+    done = []
+    try:
+        for title, ok in ((grit.STEP_ACCOUNT, licensed),
+                          (grit.STEP_ALIAS, (ans.get("alias") or "").lower() in _NO_ALIAS),
+                          (grit.STEP_RIGHTS, not problems and not left_for_exchange)):
+            s = grit.step(subs, title)
+            if ok and s and s.get("status") != "done":
+                grit.set_status(s["id"], "done")
+                done.append(title)
+        rest = [g["displayName"] for g in left_for_exchange]
+        grit.set_line(main_item["id"], f"Konto {upn} skapat {datetime.now():%Y-%m-%d}"
+                      + (f"; kvar i Exchange: {', '.join(rest)}" if rest else ""))
+    except grit.GritError as e:
+        print(f"Grit: {e}", file=sys.stderr)
+        return 1
+    for t in done:
+        print(f"  Grit: bockat av \"{t}\"", file=sys.stderr)
+    return 1 if problems else 0
+
+
+def _onboard_grit_plan(ans, subs):
+    print("Grit efteråt:", file=sys.stderr)
+    print(f"  \"{grit.STEP_ACCOUNT}\" bockas av när licensen sitter", file=sys.stderr)
+    if (ans.get("alias") or "").lower() in _NO_ALIAS:
+        print(f"  \"{grit.STEP_ALIAS}\" bockas av: inget alias", file=sys.stderr)
+    print(f"  \"{grit.STEP_RIGHTS}\" bockas av om alla grupper gick in via Graph",
+          file=sys.stderr)
+    for t in (grit.STEP_ACCOUNT, grit.STEP_ALIAS, grit.STEP_RIGHTS):
+        if not grit.step(subs, t):
+            print(f"  (posten har inget steg som heter \"{t}\")", file=sys.stderr)
+
+
 def _wait_for_user(upn, seconds):
     """Poll Entra until the sync has carried the new account across.
 
@@ -2457,6 +2675,37 @@ def _add_user_commands(sub):
                    help="create it even with a UPN suffix the tenant has not verified")
     s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
     s.set_defaults(fn=cmd_user_create)
+
+    s = sub.add_parser("onboard", help="onboard the person on a Grit Onboarding item: the AD "
+                                       "account, then licence and groups in Entra, then the "
+                                       "steps ticked off in Grit")
+    s.add_argument("ref", help="the Grit item's number, e.g. 20261007-13")
+    s.add_argument("--like", metavar="USER",
+                   help="template account for OU, licences and groups; default is the item's "
+                        "\"Samma rättigheter som\"")
+    s.add_argument("--no-template-groups", dest="no_template_groups", action="store_true",
+                   help="take the OU and licences from the template, not its groups")
+    s.add_argument("--group", action="append", metavar="GROUP",
+                   help="an Entra group to add, by name, mail or id; repeatable")
+    s.add_argument("--license", action="append", metavar="SKU",
+                   help="licence by part number (SPB) or skuId; replaces the template's")
+    s.add_argument("--ou", metavar="DN", help="AD OU; default is the template's")
+    s.add_argument("--upn", help="default is firstname.lastname@ the item's domain")
+    s.add_argument("--domain", help="default is the item's \"Primär e-postdomän\"")
+    s.add_argument("--display-name", dest="display_name", metavar="NAME",
+                   help="default is the name in the item's title")
+    s.add_argument("--department", metavar="NAME", help="default is the template's")
+    s.add_argument("--manager", metavar="USER", help="default is the item's \"Chef\"")
+    s.add_argument("--usage-location", dest="usage_location", metavar="CC",
+                   help="licensing country; default the template's, else SE")
+    s.add_argument("--host", metavar="DC", help="as for user create")
+    s.add_argument("--ad-user", dest="ad_user", metavar="USER", help="as for user create")
+    s.add_argument("--no-grit", dest="no_grit", action="store_true",
+                   help="do not tick anything off in Grit")
+    s.add_argument("--dry-run", action="store_true",
+                   help="print the plan, check the name and the OU, write nothing")
+    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    s.set_defaults(fn=cmd_user_onboard)
 
     s = sub.add_parser("onprem-find", help="who in the AD forest already answers to this "
                                           "name, deleted objects included")
