@@ -2137,9 +2137,11 @@ def _adopt(a, spec, found, password, dc, cred, pre):
 
 def _ascii_name(s):
     """"Jönsson" -> "jonsson": the tenant's UPNs drop the accent (Göransson is goransson,
-    Jürs is jurs), they do not spell it out the German way."""
+    Jürs is jurs), they do not spell it out the German way. A surname in two
+    words is run together (Jouni von Wendt is jouni.vonwendt), so "Anderberg
+    Alm" is anderbergalm, not anderberg.alm."""
     plain = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    return re.sub(r"[^a-z0-9.-]", "", plain.lower().replace(" ", "."))
+    return re.sub(r"[^a-z0-9.-]", "", plain.lower().replace(" ", ""))
 
 
 _NO_ALIAS = {"inget", "ingen", "nej", "-", "no", "none"}
@@ -2188,9 +2190,10 @@ def cmd_user_onboard(a):
         print("Posten säger ingen e-postdomän. Ange --domain eller --upn.", file=sys.stderr)
         return 2
 
-    # The template is a person in Entra, not in AD: every group a Vartex
-    # account has is a cloud group (checked 2026-10-08), so copying AD
-    # memberships would copy nothing that matters.
+    # The template is a person in Entra, read once for both kinds of group: most
+    # are cloud groups, written below through Graph, but the Role-*-WVD groups
+    # that open Garp and WSS are synced from AD and have to be written there, so
+    # they go to `user create` as --group (checked 2026-10-08 on Anna-Zarha).
     like_who = a.like or ans.get("like")
     template = None
     if like_who:
@@ -2229,19 +2232,26 @@ def cmd_user_onboard(a):
                     if x["skuId"] in by_id]
         wanted = []
         if template and not a.no_template_groups:
-            wanted += [g for g in users.member_groups(template["id"])
-                       if users.group_door(g) in ("graph", "exchange")]
+            wanted += users.member_groups(template["id"])
         wanted += [users.group(x) for x in a.group or []]
     except users.UserError as e:
         print(str(e), file=sys.stderr)
         return 2
-    seen, groups = set(), []
+    seen, groups, ad_groups = set(), [], []
     for g in wanted:
-        if g["id"] not in seen:
-            seen.add(g["id"])
+        if g["id"] in seen:
+            continue
+        seen.add(g["id"])
+        door = users.group_door(g)
+        if door == "ad":
+            ad_groups.append(g.get("onPremisesSamAccountName") or g["displayName"])
+        elif door in ("graph", "exchange"):
             groups.append(g)
-    usage = a.usage_location or (template or {}).get("usageLocation") or "SE"
-    department = a.department or (template or {}).get("department")
+    tpl = template or {}
+    usage = a.usage_location or tpl.get("usageLocation") or "SE"
+    department = a.department or tpl.get("department")
+    company = ans.get("company") or tpl.get("companyName")
+    office = ans.get("office") or tpl.get("officeLocation")
 
     print(f"Grit {a.ref}: {main_item.get('title')}", file=sys.stderr)
     if template:
@@ -2261,6 +2271,8 @@ def cmd_user_onboard(a):
         print(f"  grupp       {g['displayName']}"
               + ("  (distributionslista: Exchange, inte härifrån)" if door == "exchange" else ""),
               file=sys.stderr)
+    for g in ad_groups:
+        print(f"  AD-grupp    {g}  (sätts i AD när kontot skapas)", file=sys.stderr)
 
     existing = [u for u in users.find(upn, limit=5)
                 if (u.get("userPrincipalName") or "").casefold() == upn.casefold()]
@@ -2279,8 +2291,10 @@ def cmd_user_onboard(a):
             return 2
         argv = ["user", "create", upn, "--given-name", given, "--surname", surname,
                 "--display-name", name, "--ou", ou, "--generate", "--sync"]
-        for flag, value in (("--title", ans.get("title")), ("--company", ans.get("company")),
-                            ("--office", ans.get("office")), ("--department", department),
+        for g in ad_groups:
+            argv += ["--group", g]
+        for flag, value in (("--title", ans.get("title")), ("--company", company),
+                            ("--office", office), ("--department", department),
                             ("--manager", manager_dn), ("--host", a.host),
                             ("--ad-user", a.ad_user), ("--via", a.via)):
             if value:
@@ -2351,8 +2365,17 @@ def cmd_user_onboard(a):
                 grit.set_status(s["id"], "done")
                 done.append(title)
         rest = [g["displayName"] for g in left_for_exchange]
-        grit.set_line(main_item["id"], f"Konto {upn} skapat {datetime.now():%Y-%m-%d}"
-                      + (f"; kvar i Exchange: {', '.join(rest)}" if rest else ""))
+        line = (f"Konto {upn} skapat {datetime.now():%Y-%m-%d}"
+                + (f"; kvar i Exchange: {', '.join(rest)}" if rest else ""))
+        # A line someone else wrote ("Dator på Davildas plats") is kept after
+        # ours; only a line this command wrote itself is replaced.
+        # Grit caps a status line at 140 characters, so the old line only comes
+        # along when both fit.
+        before = main_item.get("statusLine") or ""
+        if before and not before.startswith("Konto ") and len(line) + 3 + len(before) <= 140:
+            line = f"{line} — {before}"
+        line = line[:140]
+        grit.set_line(main_item["id"], line)
     except grit.GritError as e:
         print(f"Grit: {e}", file=sys.stderr)
         return 1
