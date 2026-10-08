@@ -2200,13 +2200,21 @@ def cmd_user_onboard(a):
             print(f"Mallen {like_who!r}: {e}", file=sys.stderr)
             return 2
 
-    manager_upn = None
+    # The manager goes to AD by DN, the one identity AD cannot misread. The Entra
+    # UPN is not it: AD looks the UPN up *in AD*, where a synced account can
+    # carry another suffix (person@example.com is not found there), and
+    # New-ADUser then refuses the whole account over one attribute.
+    manager_dn = None
     if a.manager or ans.get("manager"):
         try:
-            manager_upn = users.resolve(a.manager or ans["manager"]).get("userPrincipalName")
+            boss = users.resolve(a.manager or ans["manager"])
         except users.UserError as e:
             print(f"Chefen: {e}", file=sys.stderr)
             return 2
+        manager_dn = boss.get("onPremisesDistinguishedName")
+        if not manager_dn:
+            print(f"Chefen {boss.get('displayName')} är ett molnkonto utan AD-objekt och kan "
+                  f"inte bli chef i AD. Sätt chefen i Entra efteråt.", file=sys.stderr)
 
     ou = a.ou
     if not ou and template and template.get("onPremisesDistinguishedName"):
@@ -2273,7 +2281,7 @@ def cmd_user_onboard(a):
                 "--display-name", name, "--ou", ou, "--generate", "--sync"]
         for flag, value in (("--title", ans.get("title")), ("--company", ans.get("company")),
                             ("--office", ans.get("office")), ("--department", department),
-                            ("--manager", manager_upn), ("--host", a.host),
+                            ("--manager", manager_dn), ("--host", a.host),
                             ("--ad-user", a.ad_user), ("--via", a.via)):
             if value:
                 argv += [flag, value]
