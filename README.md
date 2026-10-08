@@ -54,7 +54,7 @@ wsg arena logout     deletes the Arena session
 wsg user find X        search the directory by name, UPN or mail
 wsg user stale         tenant-wide: accounts nobody uses, and what they cost
 wsg user create UPN    create the account in on-prem AD, where it has to start
-wsg user onboard REF   a Grit Onboarding item end to end: AD, licence, groups, ticked off
+wsg user onboard REF   a Grit Onboarding item end to end: AD, groups, licence ordered from the reseller
 wsg user show X        account state, licences, sign-in history, last changes
 wsg user audit X       who changed the account, when, and what
 wsg user signins X     sign-in log, interactive and token refreshes

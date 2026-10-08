@@ -2144,6 +2144,13 @@ def _ascii_name(s):
 
 _NO_ALIAS = {"inget", "ingen", "nej", "-", "no", "none"}
 
+# Licences are always ordered from the CSP partner, never assigned from here
+# (decision 2026-10-08): the reseller buys and assigns them, and the tenant runs at
+# zero free seats anyway. Onboarding names the licence, marks the Grit item as
+# waiting on the reseller, and leaves "Skapa kontot och tilldela licens" open until
+# the licence is on the account - a rerun then ticks it off.
+_LICENSE_FROM = "the licence reseller"
+
 
 def cmd_user_onboard(a):
     """Onboard the person on a Grit item: AD account, licence, groups, ticked off.
@@ -2232,16 +2239,20 @@ def cmd_user_onboard(a):
     if template:
         print(f"  mall        {template.get('displayName')} <{template.get('userPrincipalName')}>",
               file=sys.stderr)
-    print(f"  licens      {', '.join(s['skuPartNumber'] for s in skus) or 'INGEN'}"
-          f"  (usageLocation {usage})", file=sys.stderr)
+    if not skus:
+        print("Ingen licens angiven: ange --license, eller en mall som har en.", file=sys.stderr)
+        return 2
+    sku_names = ", ".join(s["skuPartNumber"] for s in skus)
+    free = {s["skuPartNumber"]: s["prepaidUnits"]["enabled"] - s["consumedUnits"] for s in skus}
+    print(f"  licens      {sku_names}  (usageLocation {usage}; lediga: "
+          + ", ".join(f"{k} {v}" for k, v in free.items()) + ")", file=sys.stderr)
+    print(f"              beställs hos {_LICENSE_FROM}, tilldelas aldrig härifrån",
+          file=sys.stderr)
     for g in groups:
         door = users.group_door(g)
         print(f"  grupp       {g['displayName']}"
               + ("  (distributionslista: Exchange, inte härifrån)" if door == "exchange" else ""),
               file=sys.stderr)
-    if not skus:
-        print("Ingen licens att ge: ange --license, eller en mall som har en.", file=sys.stderr)
-        return 2
 
     existing = [u for u in users.find(upn, limit=5)
                 if (u.get("userPrincipalName") or "").casefold() == upn.casefold()]
@@ -2290,14 +2301,7 @@ def cmd_user_onboard(a):
     if u.get("usageLocation") != usage:
         users.set_usage_location(u["id"], usage)
     have = {x["skuId"] for x in u.get("assignedLicenses") or []}
-    for s in skus:
-        if s["skuId"] in have:
-            continue
-        try:
-            users.assign_license(u["id"], s["skuId"])
-            print(f"  licens {s['skuPartNumber']} tilldelad", file=sys.stderr)
-        except users.UserError as e:
-            problems.append(f"licens {s['skuPartNumber']}: {e}")
+    to_order = [s["skuPartNumber"] for s in skus if s["skuId"] not in have]
     for g in groups:
         if users.group_door(g) == "exchange":
             left_for_exchange.append(g)
@@ -2317,11 +2321,20 @@ def cmd_user_onboard(a):
             print(f"  Add-DistributionGroupMember -Identity '{g.get('mail') or g['displayName']}' "
                   f"-Member '{upn}'", file=sys.stderr)
 
+    if to_order:
+        print(f"Licens att beställa hos {_LICENSE_FROM}: {', '.join(to_order)} till {upn}.",
+              file=sys.stderr)
+
     if a.no_grit:
         return 1 if problems else 0
-    licensed = not any(p.startswith("licens") for p in problems)
+    licensed = not to_order
     done = []
     try:
+        if to_order:
+            grit.set_waiting(main_item["id"],
+                             f"{_LICENSE_FROM}: licens {', '.join(to_order)} till {upn}")
+        elif (main_item.get("waitingFor") or "").startswith(_LICENSE_FROM):
+            grit.set_waiting(main_item["id"], None)
         for title, ok in ((grit.STEP_ACCOUNT, licensed),
                           (grit.STEP_ALIAS, (ans.get("alias") or "").lower() in _NO_ALIAS),
                           (grit.STEP_RIGHTS, not problems and not left_for_exchange)):
@@ -2342,7 +2355,8 @@ def cmd_user_onboard(a):
 
 def _onboard_grit_plan(ans, subs):
     print("Grit efteråt:", file=sys.stderr)
-    print(f"  \"{grit.STEP_ACCOUNT}\" bockas av när licensen sitter", file=sys.stderr)
+    print(f"  väntar på {_LICENSE_FROM} tills licensen sitter; \"{grit.STEP_ACCOUNT}\" "
+          f"bockas av vid en omkörning efter det", file=sys.stderr)
     if (ans.get("alias") or "").lower() in _NO_ALIAS:
         print(f"  \"{grit.STEP_ALIAS}\" bockas av: inget alias", file=sys.stderr)
     print(f"  \"{grit.STEP_RIGHTS}\" bockas av om alla grupper gick in via Graph",
@@ -2681,7 +2695,7 @@ def _add_user_commands(sub):
     s.set_defaults(fn=cmd_user_create)
 
     s = sub.add_parser("onboard", help="onboard the person on a Grit Onboarding item: the AD "
-                                       "account, then licence and groups in Entra, then the "
+                                       "account, then groups in Entra (the licence is ordered from the reseller), then the "
                                        "steps ticked off in Grit")
     s.add_argument("ref", help="the Grit item's number, e.g. 20261007-13")
     s.add_argument("--like", metavar="USER",
