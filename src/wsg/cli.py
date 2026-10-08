@@ -1894,7 +1894,7 @@ def cmd_user_create(a):
         return 2
 
     try:
-        cred = onprem.credential(a.ad_user)
+        cred = onprem.credential(a.ad_user, a.via)
         pre = onprem.precheck(dc, cred, spec["SamAccountName"], upn, spec["ou"], a.like)
     except onprem.OnPremError as e:
         print(str(e), file=sys.stderr)
@@ -2263,7 +2263,7 @@ def cmd_user_onboard(a):
         for flag, value in (("--title", ans.get("title")), ("--company", ans.get("company")),
                             ("--office", ans.get("office")), ("--department", department),
                             ("--manager", manager_upn), ("--host", a.host),
-                            ("--ad-user", a.ad_user)):
+                            ("--ad-user", a.ad_user), ("--via", a.via)):
             if value:
                 argv += [flag, value]
         if a.dry_run:
@@ -2673,6 +2673,10 @@ def _add_user_commands(sub):
                         "memberships")
     s.add_argument("--force", action="store_true",
                    help="create it even with a UPN suffix the tenant has not verified")
+    s.add_argument("--via", choices=("winrm", "azure"),
+                   help="how to reach the DC: winrm with your AD password (default), or "
+                        "azure, Run Command on the DC with your az login; default "
+                        "WSG_AD_VIA or the configured one")
     s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
     s.set_defaults(fn=cmd_user_create)
 
@@ -2700,6 +2704,7 @@ def _add_user_commands(sub):
                    help="licensing country; default the template's, else SE")
     s.add_argument("--host", metavar="DC", help="as for user create")
     s.add_argument("--ad-user", dest="ad_user", metavar="USER", help="as for user create")
+    s.add_argument("--via", choices=("winrm", "azure"), help="as for user create")
     s.add_argument("--no-grit", dest="no_grit", action="store_true",
                    help="do not tick anything off in Grit")
     s.add_argument("--dry-run", action="store_true",
