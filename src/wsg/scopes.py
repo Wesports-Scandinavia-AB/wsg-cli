@@ -1,10 +1,16 @@
 """
-Default delegated Graph scopes requested at login.
+Delegated Graph scopes requested by `wsg graph login`.
 
-One login should cover every script we run, so this is the union of what they
-need. Add a scope here when a script starts needing it, then run `wsg graph login`
-again. Users without the matching admin role can still sign in with a narrower
-set: `wsg graph login --scopes User.Read,Files.ReadWrite,Mail.Send`.
+This is the base set: what anyone in the group can use on their own account, plus
+read access to the directory for names. It is also exactly what the "WeSports CLI"
+app is consented for, org-wide, so a scope added here does nothing until the app's
+API permissions and its admin consent are widened to match; until then the login
+names it under "Ej beviljade scopes".
+
+Directory, device and policy scopes live with the admin commands in wsg-admin-cli,
+which sign in through their own app. Before 2026-10-09 this list held both, and
+the client was Microsoft's Graph CLI app, whose tokens carried every scope ever
+consented for it regardless of this list.
 """
 
 DEFAULT_SCOPES = [
@@ -14,55 +20,24 @@ DEFAULT_SCOPES = [
     "Mail.Send",
     # Mail.ReadWrite behövs för createReply/drafts, dvs. svara i tråd
     "Mail.ReadWrite",
-    # Läsa delade brevlådor jag har FullAccess till (person@example.com, person@example.com,
-    # person@example.com) - mail-triage tittar i dem varje varv. Scopet ger
-    # ingen åtkomst i sig; Exchange-behörigheten på brevlådan avgör fortfarande.
+    # Delade brevlådor man har FullAccess till. Scopet ger ingen åtkomst i sig;
+    # Exchange-behörigheten på brevlådan avgör fortfarande.
     "Mail.Read.Shared",
-    "MailboxSettings.Read",
-    # Directory
+    # ReadWrite för inkorgsregler (messageRules), inte bara tidszonen
+    "MailboxSettings.ReadWrite",
+    # wsg calendar: speglade bokningar som upptagen-tid i den egna kalendern
+    "Calendars.ReadWrite",
+    # Namn på personer och grupper, t.ex. vilka som är tilldelade i Planner
+    # (directoryObjects/getByIds). Bara läsning, samma katalog som Outlook visar.
     "User.Read.All",
-    # User.ReadWrite.All krävs för lösenordsreset (wsg user password) och för
-    # revokeSignInSessions. Scopet räcker inte i sig: kontot måste dessutom ha
-    # en roll som får återställa lösenord, t.ex. Helpdesk-administratör.
-    "User.ReadWrite.All",
     "Group.Read.All",
-    "GroupMember.ReadWrite.All",
-    "Directory.Read.All",
-    # Läser om password writeback är på, dvs. om ett synkat konto alls kan
-    # lösenordsbytas i Entra. Utan scopet hoppar wsg user password över kollen.
-    "OnPremDirectorySynchronization.Read.All",
-    # Claims på en enterprise-apps SAML-token (servicePrincipals/{id}/claimsPolicy),
-    # t.ex. vad AARO SAML får som NameID. Skriver bara appkonfiguration, men kräver
-    # också en roll som Cloud Application Administrator för att gå igenom.
-    "Policy.ReadWrite.ApplicationConfiguration",
-    "Device.Read.All",
-    "AuditLog.Read.All",
-    "ServiceHealth.Read.All",
-    # Planner. Tasks.Read täcker både /me/planner/plans och en enskild board;
-    # namnen på tilldelade och på ägargruppen kommer från User.Read.All och
-    # Group.Read.All ovan, inte härifrån.
+    # Planner. Tasks.Read täcker både /me/planner/plans och en enskild board.
     "Tasks.Read",
-    # SharePoint-sidor: uppdatera och publicera intranätsartiklar via
-    # /sites/{id}/pages. Behörigheten på siten avgör fortfarande.
-    "Sites.ReadWrite.All",
     # Teams-chatt: skriva till en kollega i 1:1. Chat.Create hittar eller skapar
     # chatten (POST /chats returnerar den befintliga), ChatMessage.Send postar i den.
     # Chat.Read läser chattar, inklusive inklistrade bilder (hostedContents) som
-    # M365-connectorn inte visar. ChatMember.ReadWrite lägger till och tar bort
-    # medlemmar, till exempel för att lämna en gruppchatt.
+    # M365-connectorn inte visar.
     "Chat.Create",
     "ChatMessage.Send",
     "Chat.Read",
-    "ChatMember.ReadWrite",
-    # Intune
-    "DeviceManagementManagedDevices.Read.All",
-    "DeviceManagementManagedDevices.ReadWrite.All",
-    "DeviceManagementManagedDevices.PrivilegedOperations.All",
-    "DeviceManagementConfiguration.Read.All",
-    "DeviceManagementServiceConfig.Read.All",
-    "DeviceManagementServiceConfig.ReadWrite.All",
-    "DeviceManagementScripts.ReadWrite.All",
-    "DeviceManagementApps.ReadWrite.All",
-    # LAPS-lösenord för enskild enhet
-    "DeviceLocalCredential.Read.All",
 ]

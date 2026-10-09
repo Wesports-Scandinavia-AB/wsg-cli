@@ -1,11 +1,20 @@
 """
 Token handling: cache, refresh, and the two interactive flows.
 
-Client: Microsoft Graph Command Line Tools (first-party public client, no secret,
-loopback redirect allowed). Same client Connect-MgGraph uses.
+Client: "WeSports CLI", our own app registration in the Vartex tenant (public
+client, no secret, loopback and device code). Until 2026-10-09 this was Microsoft
+Graph Command Line Tools, the client Connect-MgGraph uses. It was replaced because
+Entra puts every scope consented for a client into its tokens, whatever the login
+asks for, and a shared first-party client collects consents from every tool that
+uses it. Our own client is consented for the base set in scopes.py and nothing
+more, so a token holds what that list says.
+
+The admin commands (wsg-admin-cli) sign in through a second app, "WeSports Admin
+CLI", which only assigned people may use. Each client is a Client object with its
+own token cache, and every function here takes `client=` for it.
 
 Cache: %LOCALAPPDATA%\\wsg\\token.json on Windows, ~/.config/wsg/token.json
-elsewhere. Holds access token, refresh token, expiry and granted scopes. The
+elsewhere; the admin client caches beside it under its own name. Holds access token, refresh token, expiry and granted scopes. The
 refresh token lives 90 days and is extended every time it is used, so after one
 login the scripts stay quiet until a password change or 90 idle days.
 """
@@ -25,8 +34,23 @@ from pathlib import Path
 from urllib import parse, request
 from urllib.error import HTTPError
 
-CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
 GRAPH = "https://graph.microsoft.com"
+# Vartex. Our apps are single-tenant, and a single-tenant app cannot sign in
+# through /organizations, so the tenant is named rather than discovered.
+TENANT_ID = "8a11617d-a9b4-42ec-985c-0fb8488747c4"
+
+
+class Client:
+    """One app registration: its id, the file its token is cached in, and the
+    command that signs in to it (named in errors, so the fix is in the message)."""
+
+    def __init__(self, client_id, cache_name, login_command):
+        self.id = client_id
+        self.cache_name = cache_name
+        self.login_command = login_command
+
+
+CORE = Client(os.environ.get("WSG_CLIENT_ID", "6a691e2e-9293-4c35-afda-f235e7d58408"), "token.json", "wsg graph login")
 
 
 class AuthError(Exception):
@@ -34,34 +58,41 @@ class AuthError(Exception):
 
 
 def _tenant():
-    return os.environ.get("WSG_TENANT", "organizations")
+    return os.environ.get("WSG_TENANT", TENANT_ID)
 
 
 def _authority():
     return f"https://login.microsoftonline.com/{_tenant()}/oauth2/v2.0"
 
 
-def cache_path():
-    if os.environ.get("WSG_TOKEN_CACHE"):
+def cache_path(client=None):
+    client = client or CORE
+    if client is CORE and os.environ.get("WSG_TOKEN_CACHE"):
         return Path(os.environ["WSG_TOKEN_CACHE"])
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "wsg" / "token.json"
+    return base / "wsg" / client.cache_name
 
 
 # ── cache ─────────────────────────────────────────────────────────────────────
 
-def read_cache():
+def read_cache(client=None):
     try:
-        return json.loads(cache_path().read_text(encoding="utf-8"))
+        cached = json.loads(cache_path(client).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    # A refresh token is bound to the client that got it; another client cannot use
+    # it. Caches written before 2026-10-09 carry no client id and come from the Graph
+    # CLI client, so they read as signed out and the error names the login to run.
+    if cached.get("client_id") != (client or CORE).id:
+        return None
+    return cached
 
 
-def _write_cache(tok):
-    p = cache_path()
+def _write_cache(tok, client=None):
+    p = cache_path(client)
     p.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "access_token": tok["access_token"],
@@ -69,6 +100,7 @@ def _write_cache(tok):
         "expires_at": int(time.time()) + int(tok.get("expires_in", 3600)) - 60,
         "scope": tok.get("scope", ""),
         "tenant": _tenant(),
+        "client_id": (client or CORE).id,
     }
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -76,8 +108,8 @@ def _write_cache(tok):
     return data
 
 
-def logout():
-    p = cache_path()
+def logout(client=None):
+    p = cache_path(client)
     existed = p.exists()
     if existed:
         p.unlink()
@@ -115,34 +147,35 @@ def _scope_string(scopes):
     return " ".join(f"{GRAPH}/{s}" for s in scopes) + " offline_access openid profile"
 
 
-def _refresh(refresh_token, scopes):
+def _refresh(refresh_token, scopes, client=None):
     tok, err = _post(f"{_authority()}/token", {
         "grant_type": "refresh_token",
-        "client_id": CLIENT_ID,
+        "client_id": (client or CORE).id,
         "refresh_token": refresh_token,
         "scope": _scope_string(scopes),
     })
     if tok:
-        return _write_cache(tok)
+        return _write_cache(tok, client)
     raise AuthError((err or {}).get("error_description") or (err or {}).get("error") or "refresh failed")
 
 
-def get_token(scopes=None):
+def get_token(scopes=None, client=None):
     """Return a valid access token from the cache, refreshing if needed.
 
     Never prompts. Raises AuthError when a login is required.
     """
-    cached = read_cache()
+    client = client or CORE
+    cached = read_cache(client)
     if not cached:
-        raise AuthError("Not signed in. Run: wsg graph login")
+        raise AuthError(f"Not signed in. Run: {client.login_command}")
     have = granted_scopes(cached)
     want = set(scopes or [])
     if cached.get("expires_at", 0) > time.time() and want <= have:
         return cached["access_token"]
     if not cached.get("refresh_token"):
-        raise AuthError("Cached token expired and no refresh token. Run: wsg graph login")
+        raise AuthError(f"Cached token expired and no refresh token. Run: {client.login_command}")
     # Refresh for the union, so the cache keeps covering everything granted so far.
-    return _refresh(cached["refresh_token"], sorted(have | want))["access_token"]
+    return _refresh(cached["refresh_token"], sorted(have | want), client)["access_token"]
 
 
 # ── interactive: auth code + PKCE on loopback ─────────────────────────────────
@@ -192,7 +225,8 @@ def _win_app_path(exe):
     return None
 
 
-def login(scopes, open_browser=False, timeout=600, out=sys.stderr, login_hint=None, browser=None):
+def login(scopes, open_browser=False, timeout=600, out=sys.stderr, login_hint=None, browser=None,
+          client=None):
     """Authorization code flow with PKCE. Prints the URL, waits for the redirect."""
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
@@ -200,8 +234,9 @@ def login(scopes, open_browser=False, timeout=600, out=sys.stderr, login_hint=No
     port = _free_port()
     redirect = f"http://localhost:{port}"
 
+    client = client or CORE
     params = {
-        "client_id": CLIENT_ID,
+        "client_id": client.id,
         "response_type": "code",
         "redirect_uri": redirect,
         "response_mode": "query",
@@ -263,20 +298,21 @@ def login(scopes, open_browser=False, timeout=600, out=sys.stderr, login_hint=No
 
     tok, err = _post(f"{_authority()}/token", {
         "grant_type": "authorization_code",
-        "client_id": CLIENT_ID,
+        "client_id": client.id,
         "code": result["code"],
         "redirect_uri": redirect,
         "code_verifier": verifier,
     })
     if not tok:
         raise AuthError((err or {}).get("error_description") or str(err))
-    return _write_cache(tok)
+    return _write_cache(tok, client)
 
 
 # ── interactive: device code (for boxes without a browser) ────────────────────
 
-def login_device(scopes, out=sys.stderr):
-    dc, err = _post(f"{_authority()}/devicecode", {"client_id": CLIENT_ID, "scope": _scope_string(scopes)})
+def login_device(scopes, out=sys.stderr, client=None):
+    client = client or CORE
+    dc, err = _post(f"{_authority()}/devicecode", {"client_id": client.id, "scope": _scope_string(scopes)})
     if not dc:
         raise AuthError(str(err))
     print(dc["message"], file=out, flush=True)
@@ -286,11 +322,11 @@ def login_device(scopes, out=sys.stderr):
         time.sleep(interval)
         tok, err = _post(f"{_authority()}/token", {
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            "client_id": CLIENT_ID,
+            "client_id": client.id,
             "device_code": dc["device_code"],
         })
         if tok:
-            return _write_cache(tok)
+            return _write_cache(tok, client)
         code = (err or {}).get("error")
         if code == "slow_down":
             interval += 5
@@ -301,9 +337,9 @@ def login_device(scopes, out=sys.stderr):
 
 # ── convenience ───────────────────────────────────────────────────────────────
 
-def graph(method, path, token=None, body=None, scopes=None):
+def graph(method, path, token=None, body=None, scopes=None, client=None):
     """Small Graph helper for scripts: graph('GET', '/me')."""
-    token = token or get_token(scopes)
+    token = token or get_token(scopes, client)
     url = path if path.startswith("http") else f"{GRAPH}/v1.0{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Authorization": f"Bearer {token}"}
