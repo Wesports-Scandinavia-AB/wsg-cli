@@ -149,14 +149,14 @@ browser's session cookie. `wsg arena login` therefore uses Arena's OAuth server:
 authorization code + PKCE with a loopback redirect, the page that asks being
 Arena's own. It prints the URL and never opens a browser.
 
-It needs a client registered in Arena with audience `api` — one per person,
-whose tokens open `/api` with that person's rights and never `/mcp`:
+Nothing to set up first. wsg signs in as `cl_wsg_cli`, a public client
+registered in Arena with audience `api` (since 2026-10-09): no secret, since a
+secret on your own disk protects nothing, while PKCE and the loopback redirect
+protect the flow. Its tokens open `/api` with your rights and never `/mcp`.
 
-```
-node scripts/mcp-client.mjs create --name "wsg — Tommy" --api   in wesports-arena, then apply the SQL
-```
-
-Put the id and secret it prints in `%LOCALAPPDATA%\wsg\arena.json`
+A client of your own still works and wins when configured — register it in
+wesports-arena with `node scripts/mcp-client.mjs create --name "wsg — <name>" --api`,
+and put the id and secret in `%LOCALAPPDATA%\wsg\arena.json`
 (`~/.config/wsg/arena.json` elsewhere), or in `WSG_ARENA_CLIENT_ID` /
 `WSG_ARENA_CLIENT_SECRET`:
 

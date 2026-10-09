@@ -9,11 +9,16 @@ redirect to a port on this machine. The page that asks is Arena's own, behind
 the normal Arena sign-in (Tribune), so you prove yourself exactly as in the
 browser and the token carries the assurance of that sign-in.
 
-The client is registered in Arena with audience 'api' (Arena:
-scripts/mcp-client.mjs create --api). Its tokens open /api as you, with your
-rights and no more, and never /mcp. Its id and secret live in
-%LOCALAPPDATA%\\wsg\\arena.json (or ~/.config/wsg/arena.json), or in
-WSG_ARENA_CLIENT_ID / WSG_ARENA_CLIENT_SECRET.
+The client is `cl_wsg_cli`, registered in Arena as a public client with audience
+'api' (Arena migration 20261009163326): no secret, so anyone can sign in without
+IT setting anything up first. A secret here would have been a file on your own
+disk, which protects nothing; PKCE and the loopback redirect protect the flow.
+Its tokens open /api as you, with your rights and no more, and never /mcp.
+
+A client of your own (Arena: scripts/mcp-client.mjs create --api) still works
+and wins when it is configured: id and secret in %LOCALAPPDATA%\\wsg\\arena.json
+(or ~/.config/wsg/arena.json), or in WSG_ARENA_CLIENT_ID / WSG_ARENA_CLIENT_SECRET.
+Before 2026-10-09 that was the only way.
 
 An access token lives an hour and is renewed with the refresh token, which
 rotates on every use. The sign-in as a whole ends twelve hours after it began,
@@ -64,8 +69,13 @@ def cache_path():
     return Path(os.environ.get("WSG_ARENA_TOKEN_CACHE") or _config_dir() / "arena-token.json")
 
 
+# Arena's shared public client for wsg. Not a secret: it is in this public repo on purpose.
+PUBLIC_CLIENT_ID = "cl_wsg_cli"
+
+
 def client():
-    """(client_id, client_secret) for the registered 'api' client."""
+    """(client_id, client_secret) for the 'api' client: a configured one of your own,
+    else the public one, with secret None."""
     cid, secret = os.environ.get("WSG_ARENA_CLIENT_ID"), os.environ.get("WSG_ARENA_CLIENT_SECRET")
     if not (cid and secret):
         try:
@@ -74,9 +84,7 @@ def client():
         except (OSError, ValueError):
             pass
     if not (cid and secret):
-        raise AuthError(
-            f"Ingen Arena-klient. Lägg client_id och client_secret i {client_path()} "
-            "(registreras i Arena med: node scripts/mcp-client.mjs create --name \"wsg — <namn>\" --api)")
+        return PUBLIC_CLIENT_ID, None
     return cid, secret
 
 
@@ -88,9 +96,16 @@ SIGN_IN_TTL_SECONDS = 12 * 60 * 60
 
 def _read_cache():
     try:
-        return json.loads(cache_path().read_text(encoding="utf-8"))
+        cached = json.loads(cache_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    # A refresh token only works for the client that got it. A cache from another
+    # client (arena.json added or removed since) reads as signed out, so the next
+    # call signs in again instead of failing on a refresh Arena must refuse.
+    # Caches from before 2026-10-09 carry no client id and are kept as they are.
+    if cached.get("client_id", client()[0]) != client()[0]:
+        return None
+    return cached
 
 
 def _write_cache(tok, signed_in_at=None):
@@ -98,6 +113,7 @@ def _write_cache(tok, signed_in_at=None):
     p.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "url": app_url(),
+        "client_id": client()[0],
         "access_token": tok["access_token"],
         "refresh_token": tok.get("refresh_token"),
         "expires_at": int(time.time()) + int(tok.get("expires_in", 3600)) - 60,
@@ -113,7 +129,9 @@ def _write_cache(tok, signed_in_at=None):
 def _token_endpoint(body):
     """POST /oauth/token with the client's credentials. Returns (json, error_json)."""
     cid, secret = client()
-    data = parse.urlencode({**body, "client_id": cid, "client_secret": secret}).encode()
+    # The public client sends its id alone (token_endpoint_auth_method "none").
+    creds = {"client_id": cid, **({"client_secret": secret} if secret else {})}
+    data = parse.urlencode({**body, **creds}).encode()
     req = request.Request(f"{app_url()}/oauth/token", data=data, method="POST", headers={
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",

@@ -81,9 +81,18 @@ python -m wsg secret create --file nyckel.json --title "API-nyckel" --ttl 7d
 
 ## Arena
 
-`python -m wsg arena login` fungerar bara om IT har lagt in en Arena-klient åt
-personen (`arena.json`). Saknas den säger kommandot det. Hänvisa då till IT och
-försök inte skapa någon själv.
+```
+python -m wsg arena login      skriver ut en adress; personen loggar in i Arena och godkänner
+python -m wsg arena whoami     vem som är inloggad
+```
+
+Samma regler som för Microsoft-inloggningen: kör `login` i bakgrunden, ge personen
+adressen som text, öppna inte webbläsaren själv. Personen loggar in som vanligt i
+Arena och trycker **Allow** på sidan som säger att ett kommandoradsverktyg vill
+agera som hen. Inloggningen gäller tolv timmar, sedan frågar den igen.
+
+Verktyget får göra exakt det personen får göra i Arena-appen, inget mer. Ett 403
+betyder att personen saknar rätten i Arena, inte att något är fel i wsg.
 
 ## Token till ett eget script
 
