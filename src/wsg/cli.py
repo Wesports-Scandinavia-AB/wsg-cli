@@ -3,16 +3,27 @@ import json
 import re
 import sys
 import time
-import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import arena, auth, devices, garp, garpdb, grit, intune, mscal, ongoing, onetime, onprem, planner, users
+from . import arena, auth, mscal, onetime, planner
 from .scopes import DEFAULT_SCOPES
 
 
-def _scopes_arg(s):
-    return [x.strip() for x in s.split(",") if x.strip()] if s else list(DEFAULT_SCOPES)
+def _scopes_arg(s, default=DEFAULT_SCOPES):
+    return [x.strip() for x in s.split(",") if x.strip()] if s else list(default)
+
+
+def _plugins(group):
+    """Entry points in `group`, from packages installed next to this one.
+
+    wsg-admin-cli registers its commands (`wsg.commands`) this way, so they keep
+    their names without wsg-cli knowing they exist. entry_points() grew its
+    `group=` keyword in 3.10; 3.9 returns a dict instead.
+    """
+    from importlib.metadata import entry_points
+    eps = entry_points()
+    return list(eps.select(group=group) if hasattr(eps, "select") else eps.get(group, []))
 
 
 def _stdin_text():
@@ -32,12 +43,13 @@ def _stdin_text():
 
 
 def cmd_graph_login(a):
-    scopes = _scopes_arg(a.scopes)
+    scopes = _scopes_arg(a.scopes, a.default_scopes)
     try:
         if a.device:
-            data = auth.login_device(scopes)
+            data = auth.login_device(scopes, client=a.client)
         else:
-            data = auth.login(scopes, open_browser=a.open, timeout=a.timeout, login_hint=a.user, browser=a.browser)
+            data = auth.login(scopes, open_browser=a.open, timeout=a.timeout, login_hint=a.user, browser=a.browser,
+                              client=a.client)
     except auth.AuthError as e:
         print(f"Inloggningen misslyckades: {e}", file=sys.stderr)
         return 1
@@ -46,13 +58,13 @@ def cmd_graph_login(a):
     missing = set(scopes) - auth.granted_scopes(data)
     if missing:
         print("Ej beviljade scopes: " + ", ".join(sorted(missing)), file=sys.stderr)
-    print(f"Token sparad i {auth.cache_path()}", file=sys.stderr)
+    print(f"Token sparad i {auth.cache_path(a.client)}", file=sys.stderr)
     return 0
 
 
 def cmd_graph_token(a):
     try:
-        tok = auth.get_token(_scopes_arg(a.scopes) if a.scopes else None)
+        tok = auth.get_token(_scopes_arg(a.scopes) if a.scopes else None, a.client)
     except auth.AuthError as e:
         print(str(e), file=sys.stderr)
         return 2
@@ -61,9 +73,9 @@ def cmd_graph_token(a):
 
 
 def cmd_graph_status(a):
-    c = auth.read_cache()
+    c = auth.read_cache(a.client)
     if not c:
-        print("Inte inloggad. Kör: wsg graph login")
+        print(f"Inte inloggad. Kör: {a.client.login_command}")
         return 2
     claims = auth.decode_jwt(c["access_token"])
     exp = datetime.fromtimestamp(c.get("expires_at", 0))
@@ -78,14 +90,14 @@ def cmd_graph_status(a):
             "access_token_valid": fresh,
             "has_refresh_token": bool(c.get("refresh_token")),
             "scopes": sorted(auth.granted_scopes(c)),
-            "cache": str(auth.cache_path()),
+            "cache": str(auth.cache_path(a.client)),
         }, indent=2, ensure_ascii=False))
         return 0
     print(f"Användare:     {user} ({claims.get('name', '')})")
     print(f"Tenant:        {claims.get('tid', '?')}")
     print(f"Access token:  {'giltig till ' + exp.strftime('%Y-%m-%d %H:%M') if fresh else 'utgången, förnyas vid nästa anrop'}")
     print(f"Refresh token: {'ja' if c.get('refresh_token') else 'nej'}")
-    print(f"Cache:         {auth.cache_path()}")
+    print(f"Cache:         {auth.cache_path(a.client)}")
     print("Scopes:")
     for s in sorted(auth.granted_scopes(c)):
         print(f"  {s}")
@@ -94,7 +106,7 @@ def cmd_graph_status(a):
 
 def cmd_graph_whoami(a):
     try:
-        me = auth.graph("GET", "/me")
+        me = auth.graph("GET", "/me", client=a.client)
     except auth.AuthError as e:
         print(str(e), file=sys.stderr)
         return 2
@@ -103,7 +115,7 @@ def cmd_graph_whoami(a):
 
 
 def cmd_graph_logout(a):
-    print("Cache borttagen." if auth.logout() else "Ingen cache fanns.")
+    print("Cache borttagen." if auth.logout(a.client) else "Ingen cache fanns.")
     return 0
 
 
@@ -548,449 +560,6 @@ def cmd_arena_logout(a):
     return 0
 
 
-def cmd_intune_apps(a):
-    try:
-        rows = intune.apps(a.name)
-    except intune.IntuneError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    if not rows:
-        print("Inga appar matchade.")
-        return 0
-    for app in sorted(rows, key=lambda x: (x.get("displayName") or "").casefold()):
-        kind = (app.get("@odata.type") or "").split(".")[-1]
-        print(f"{app['id']}  {app.get('displayName')}  [{kind}]  {app.get('publishingState')}")
-        for asg in app.get("assignments", []):
-            t = asg.get("target") or {}
-            who = t.get("groupId") or (t.get("@odata.type") or "").split(".")[-1]
-            print(f"    {asg.get('intent')} -> {who}")
-    return 0
-
-
-def cmd_intune_app_status(a):
-    try:
-        rows = intune.app_status(a.app_id)
-    except intune.IntuneError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    if not rows:
-        print("Ingen klient har rapporterat än. Det betyder inte att tilldelningen saknas -\n"
-              "kör 'wsg intune intent' för att se vad tjänsten avser för en användare.")
-        return 0
-    for r in rows:
-        print(" | ".join(f"{k}={v}" for k, v in r.items() if v not in (None, "")))
-    return 0
-
-
-def cmd_intune_intent(a):
-    try:
-        rows = intune.intent(a.user, a.device)
-    except intune.IntuneError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    for x in rows:
-        print(f"{x.get('displayName')}  |  {x.get('mobileAppIntent')}  |  {x.get('installState')}")
-    return 0
-
-
-def cmd_intune_store_app(a):
-    try:
-        app_id = intune.add_store_app(a.package_id, a.name, a.publisher,
-                                      description=a.description, run_as=a.run_as)
-        print(f"Appen skapad: {app_id}")
-        if a.assign:
-            intune.assign(app_id, a.assign, a.intent,
-                          "#microsoft.graph.winGetAppAssignmentSettings")
-            print(f"Tilldelad {a.assign} som {a.intent}")
-    except intune.IntuneError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    return 0
-
-
-def cmd_intune_win32(a):
-    def progress(done, total):
-        print(f"\r  laddar upp {done / 1e6:.0f}/{total / 1e6:.0f} MB", end="", file=sys.stderr, flush=True)
-
-    try:
-        app_id = intune.publish_win32(
-            a.package, a.name, a.publisher, a.install, a.uninstall,
-            a.detect_path, a.detect_file, description=a.description,
-            run_as=a.run_as, arch=a.arch, min_os=a.min_os, setup_file=a.setup_file,
-            on_progress=None if a.quiet else progress,
-        )
-        if not a.quiet:
-            print(file=sys.stderr)
-        print(f"Appen publicerad: {app_id}")
-        if a.assign:
-            intune.assign(app_id, a.assign, a.intent,
-                          "#microsoft.graph.win32LobAppAssignmentSettings")
-            print(f"Tilldelad {a.assign} som {a.intent}")
-    except intune.IntuneError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    return 0
-
-
-def cmd_intune_sync(a):
-    try:
-        intune.sync_device(a.device)
-    except intune.IntuneError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    print("Synk begärd. Enheten hämtar tilldelningar vid nästa incheckning.")
-    return 0
-
-
-def _add_intune_commands(sub):
-    s = sub.add_parser("apps", help="list managed apps with their assignments")
-    s.add_argument("name", nargs="?", help="only apps whose display name contains this")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_intune_apps)
-
-    s = sub.add_parser("app-status", help="per-user install status for one app")
-    s.add_argument("app_id")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_intune_app_status)
-
-    s = sub.add_parser("intent", help="what the service intends for a user on a device")
-    s.add_argument("user", help="user object id or UPN")
-    s.add_argument("device", help="Intune managed device id")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_intune_intent)
-
-    s = sub.add_parser("store-app", help="add a Microsoft Store app (new) by Store id")
-    s.add_argument("package_id", help="Store id, e.g. 9PLM9XGG6VKS")
-    s.add_argument("--name", required=True)
-    s.add_argument("--publisher", required=True)
-    s.add_argument("--description")
-    s.add_argument("--run-as", choices=("user", "system"), default="user")
-    s.add_argument("--assign", metavar="GROUP", help="group id, or 'all' for all licensed users")
-    s.add_argument("--intent", choices=("available", "required"), default="available")
-    s.set_defaults(fn=cmd_intune_store_app)
-
-    s = sub.add_parser("win32", help="publish an .intunewin package")
-    s.add_argument("package", help="path to the .intunewin file")
-    s.add_argument("--name", required=True)
-    s.add_argument("--publisher", required=True)
-    s.add_argument("--install", required=True, metavar="CMD", help="install command line")
-    s.add_argument("--uninstall", required=True, metavar="CMD", help="uninstall command line")
-    s.add_argument("--detect-path", required=True, help=r"e.g. %%LOCALAPPDATA%%\AnthropicClaude")
-    s.add_argument("--detect-file", required=True, help="file whose existence means installed")
-    s.add_argument("--description")
-    s.add_argument("--setup-file", help="default: the SetupFile from Detection.xml")
-    s.add_argument("--run-as", choices=("user", "system"), default="user",
-                   help="user (default) for per-user installers under %%LOCALAPPDATA%%")
-    s.add_argument("--arch", default="x64")
-    s.add_argument("--min-os", default="1809")
-    s.add_argument("--assign", metavar="GROUP", help="group id, or 'all' for all licensed users")
-    s.add_argument("--intent", choices=("available", "required"), default="required")
-    s.add_argument("-q", "--quiet", action="store_true", help="no upload progress")
-    s.set_defaults(fn=cmd_intune_win32)
-
-    s = sub.add_parser("sync", help="ask a device to check in now")
-    s.add_argument("device", help="Intune managed device id")
-    s.set_defaults(fn=cmd_intune_sync)
-
-
-def _gb(n):
-    return f"{n / 1e9:.0f} GB" if n else None
-
-
-def _who_logged_on(dev):
-    """usersLoggedOn as names, newest first.
-
-    The list holds object ids, not names, and the primary user is usually the
-    only entry - but "usually" is exactly what this command exists to check, so
-    any other id is looked up rather than glossed over.
-    """
-    out = []
-    for e in sorted(dev.get("usersLoggedOn") or [],
-                    key=lambda x: x.get("lastLogOnDateTime") or "", reverse=True):
-        uid = e.get("userId")
-        if uid and uid == dev.get("userId"):
-            name = f"{dev.get('userDisplayName')} <{dev.get('userPrincipalName')}>"
-        else:
-            try:
-                u = users.resolve(uid)
-                name = f"{u.get('displayName')} <{u.get('userPrincipalName')}>"
-            except (users.UserError, TypeError):
-                name = uid or "?"
-        out.append((e.get("lastLogOnDateTime"), name))
-    return out
-
-
-def cmd_device_find(a):
-    try:
-        rows = devices.find(a.query, limit=a.top)
-    except devices.DeviceError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    if not rows:
-        print("Ingen enhet matchade.")
-        return 0
-    w = max(len(r.get("serialNumber") or "") for r in rows) + 2
-    for d in sorted(rows, key=lambda x: x.get("lastSyncDateTime") or "", reverse=True):
-        print(f"{(d.get('serialNumber') or '-'):<{w}}{(d.get('deviceName') or '-'):<20}"
-              f"{(d.get('userPrincipalName') or '-'):<32}"
-              f"senast incheckad {_ts(d.get('lastSyncDateTime'))}{_age(d.get('lastSyncDateTime'))}")
-    print(f"\n{len(rows)} enhet(er). Hela bilden: wsg device show <serienummer>")
-    return 0
-
-
-def cmd_device_show(a):
-    """Everything about one machine, and whether it is free to hand over.
-
-    The question behind this command is almost always "can somebody else take
-    it?", so the check-in date and the sign-in log come before the hardware.
-    """
-    try:
-        r = devices.report(a.device, days=a.days)
-    except devices.DeviceError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps(r, indent=2, ensure_ascii=False))
-        return 0
-
-    d, ap, ent = r["device"], r.get("autopilot"), r.get("entra")
-    logons = _who_logged_on(d)
-    rows = [
-        ("primär användare", f"{d.get('userDisplayName')} <{d.get('userPrincipalName')}>"
-                             if d.get("userPrincipalName") else "ingen"),
-        ("senast inloggad", f"{_ts(logons[0][0])}{_age(logons[0][0])}  {logons[0][1]}"
-                            if logons else "-"),
-        ("senast incheckad", _ts(d.get("lastSyncDateTime")) + _age(d.get("lastSyncDateTime"))),
-        ("enrollerad", _ts(d.get("enrolledDateTime")) + _age(d.get("enrolledDateTime"))),
-        ("efterlevnad", d.get("complianceState")),
-        ("hantering", f"{d.get('managementState')}, {d.get('managedDeviceOwnerType')}, "
-                      f"{d.get('joinType')}"),
-        ("profil", d.get("enrollmentProfileName")),
-        ("os", f"{d.get('operatingSystem')} {d.get('osVersion')} {d.get('skuFamily') or ''}".strip()),
-        ("kryptering", "bitlocker på" if d.get("isEncrypted") else "OKRYPTERAD"),
-        ("modell", " ".join(x for x in (d.get("manufacturer"), d.get("model")) if x)),
-        ("lagring", f"{_gb(d.get('freeStorageSpaceInBytes'))} ledigt av "
-                    f"{_gb(d.get('totalStorageSpaceInBytes'))}"
-                    if d.get("totalStorageSpaceInBytes") else None),
-        ("anteckning", d.get("notes")),
-        ("intune-id", d.get("id")),
-        ("entra-enhets-id", d.get("azureADDeviceId")),
-    ]
-    if a.verbose:
-        rows += [("wifi-mac", d.get("wiFiMacAddress")),
-                 ("ethernet-mac", d.get("ethernetMacAddress")),
-                 ("intune-namn", d.get("managedDeviceName"))]
-    if ent:
-        rows.append(("entra-objekt", f"{'aktiverat' if ent.get('accountEnabled') else 'SPÄRRAT'}, "
-                                     f"{ent.get('trustType')}, senast sedd "
-                                     f"{_ts(ent.get('approximateLastSignInDateTime'))}"))
-    if ap:
-        rows += [
-            ("autopilot", f"{ap.get('enrollmentState')}, grupptagg "
-                          f"{ap.get('groupTag') or '-'}"),
-            ("autopilot-användare", ap.get("userPrincipalName") or "ingen tilldelad"),
-            ("autopilot-kontakt", _ts(ap.get("lastContactedDateTime"))),
-            ("autopilot-id", ap.get("id")),
-        ]
-
-    rows = [(k, v) for k, v in rows if v not in (None, "", "-")]
-    w = max(len(k) for k, _ in rows) + 2
-    print(f"{d.get('deviceName')}   {d.get('serialNumber')}")
-    for label, value in rows:
-        print(f"  {label:<{w}}{value}")
-
-    if not ap:
-        print("\nIngen Autopilot-post för serienumret. En återställning ger då en vanlig\n"
-              "OOBE, inte vår - enheten måste registreras innan den lämnas vidare.")
-    if r.get("signin_error"):
-        print(f"\nInloggningsloggen kunde inte läsas: {r['signin_error'].splitlines()[0]}")
-    elif r["signins"]:
-        print(f"\nInloggningar senaste {a.days} dygnen:")
-        for e in r["signins"]:
-            print(f"  {_ts(e['last']):<18}{e['count']:>4} st   "
-                  f"{e['name'] or ''} <{e['upn']}>")
-    else:
-        print(f"\nInga inloggningar loggade senaste {a.days} dygnen. Loggen sparas i 30 dagar,\n"
-              "så det betyder 'inget i fönstret', inte 'ingen har använt den'.")
-
-    # The whole point of the lookup is usually whether the machine is free.
-    fresh = _age(d.get("lastSyncDateTime"))
-    if fresh in (" (idag)", " (1 dagar sedan)"):
-        print(f"\nEnheten checkade in {fresh.strip(' ()')} - den är i bruk. Prata med\n"
-              f"{d.get('userDisplayName') or 'användaren'} innan du återställer den.")
-    print(f"\nLämna vidare:  wsg device user {d.get('serialNumber')} --set <person@example.com>\n"
-          f"               wsg device reset {d.get('serialNumber')}")
-    return 0
-
-
-def _confirm_device(a, d, what):
-    """A wipe needs the serial typed back, not a y/n.
-
-    `_confirm` says yes when stdin is not a terminal, which is right for a
-    password read from a pipe and wrong for this: a script that pipes something
-    in would wipe a laptop without asking. Here the only ways through are the
-    serial typed at a prompt or an explicit --yes.
-    """
-    print(f"{what}:\n  {d.get('deviceName')}  {d.get('serialNumber')}  "
-          f"{d.get('userPrincipalName') or 'ingen användare'}\n"
-          f"  senast incheckad {_ts(d.get('lastSyncDateTime'))}{_age(d.get('lastSyncDateTime'))}")
-    if a.yes:
-        return True
-    # isatty is not to be trusted here: under Git Bash on Windows it answers
-    # true for a redirected stdin, so the prompt is reached anyway and the read
-    # ends in EOFError. Both roads lead to the same answer - no.
-    try:
-        if not sys.stdin.isatty():
-            raise EOFError
-        got = input(f"Skriv serienumret ({d.get('serialNumber')}) för att bekräfta: ").strip()
-    except EOFError:
-        print("\nAvbrutet: ingen bekräftelse gick att läsa. Kör om med --yes om du menar allvar.",
-              file=sys.stderr)
-        return False
-    if got.casefold() != (d.get("serialNumber") or "").casefold():
-        print("Avbrutet.", file=sys.stderr)
-        return False
-    return True
-
-
-def cmd_device_reset(a):
-    try:
-        d = devices.resolve(a.device)
-    except devices.DeviceError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    keep = not a.factory
-    what = ("Autopilot-återställning (behåller enrollering och Entra-join)" if keep
-            else "FABRIKSÅTERSTÄLLNING (tar bort enrollering, Entra-objekt och Intune-objekt)")
-    if not _confirm_device(a, d, what):
-        return 1
-    try:
-        devices.reset(d["id"], keep_enrollment=keep)
-    except devices.DeviceError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    print("Kommandot är skickat. Enheten utför det vid nästa incheckning och kan inte\n"
-          "ångras efter det. Är den påslagen går det fortare med: "
-          f"wsg device sync {d.get('serialNumber')}")
-    return 0
-
-
-def cmd_device_retire(a):
-    try:
-        d = devices.resolve(a.device)
-    except devices.DeviceError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if not _confirm_device(a, d, "Avregistrering (tar bort företagsdata, behåller övrigt)"):
-        return 1
-    try:
-        devices.retire(d["id"])
-    except devices.DeviceError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    print("Avregistrering begärd. Enheten tappar företagsdata vid nästa incheckning.")
-    return 0
-
-
-def cmd_device_user(a):
-    """Move the machine to another person, in both places it is written down."""
-    try:
-        d = devices.resolve(a.device)
-        ap = devices.autopilot(managed_device=d)
-    except devices.DeviceError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    try:
-        if a.clear:
-            devices.clear_primary_user(d["id"])
-            print("Primär användare i Intune borttagen.")
-            if ap and not a.intune_only:
-                devices.unassign_autopilot_user(ap["id"])
-                print("Autopilot-tilldelning borttagen.")
-        else:
-            u = users.resolve(a.set)
-            devices.set_primary_user(d["id"], u["id"])
-            print(f"Primär användare i Intune: {u.get('displayName')} "
-                  f"<{u.get('userPrincipalName')}>")
-            if ap and not a.intune_only:
-                devices.assign_autopilot_user(ap["id"], u["userPrincipalName"],
-                                              u.get("displayName"))
-                print("Autopilot-posten pekar nu på samma person.")
-    except (devices.DeviceError, users.UserError) as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if not ap and not a.intune_only:
-        print("Ingen Autopilot-post för serienumret, så bara Intune ändrades.")
-    return 0
-
-
-def cmd_device_sync(a):
-    try:
-        d = devices.resolve(a.device)
-        devices.sync(d["id"])
-    except devices.DeviceError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    print(f"Synk begärd för {d.get('deviceName')} ({d.get('serialNumber')}). "
-          f"Enheten hämtar väntande kommandon när den är påslagen och online.")
-    return 0
-
-
-def _add_device_commands(sub):
-    s = sub.add_parser("find", help="search by serial, device name or user")
-    s.add_argument("query")
-    s.add_argument("--top", type=int, default=50, metavar="N")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_device_find)
-
-    s = sub.add_parser("show", help="one machine: who has it, when it last checked in, "
-                                    "Autopilot record and sign-in log")
-    s.add_argument("device", help="serial number, device name, user, or Intune device id")
-    s.add_argument("--days", type=int, default=30, metavar="N",
-                   help="sign-in window (default 30, which is all the log keeps)")
-    s.add_argument("-v", "--verbose", action="store_true", help="also MAC addresses")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_device_show)
-
-    s = sub.add_parser("reset", help="Autopilot reset: wipe the profiles, keep the enrolment")
-    s.add_argument("device", help="serial number, device name, or Intune device id")
-    s.add_argument("--factory", action="store_true",
-                   help="full wipe: also drop the enrolment and the Entra object")
-    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
-    s.set_defaults(fn=cmd_device_reset)
-
-    s = sub.add_parser("retire", help="remove company data and management, keep the rest")
-    s.add_argument("device", help="serial number, device name, or Intune device id")
-    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
-    s.set_defaults(fn=cmd_device_retire)
-
-    s = sub.add_parser("user", help="hand the machine to someone else: primary user in "
-                                    "Intune and assigned user in Autopilot")
-    s.add_argument("device", help="serial number, device name, or Intune device id")
-    g = s.add_mutually_exclusive_group(required=True)
-    g.add_argument("--set", metavar="USER", help="UPN, object id or name fragment")
-    g.add_argument("--clear", action="store_true", help="leave the machine unassigned")
-    s.add_argument("--intune-only", action="store_true",
-                   help="leave the Autopilot record alone")
-    s.set_defaults(fn=cmd_device_user)
-
-    s = sub.add_parser("sync", help="ask the device to check in now")
-    s.add_argument("device", help="serial number, device name, or Intune device id")
-    s.set_defaults(fn=cmd_device_sync)
-
-
 def _ts(s, with_time=True):
     """Graph timestamps are ISO 8601 in UTC; show them as local wall clock."""
     if not s:
@@ -1002,1790 +571,24 @@ def _ts(s, with_time=True):
     return d.strftime("%Y-%m-%d %H:%M" if with_time else "%Y-%m-%d")
 
 
-def _age(s):
-    if not s:
-        return ""
-    try:
-        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        return ""
-    days = (datetime.now(d.tzinfo) - d).days
-    return f" ({days} dagar sedan)" if days >= 1 else " (idag)"
-
-
-def cmd_user_find(a):
-    try:
-        rows = users.find(a.query, limit=a.top)
-    except users.UserError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    if not rows:
-        print("Ingen användare matchade.")
-        return 0
-    for u in sorted(rows, key=lambda x: (x.get("displayName") or "").casefold()):
-        state = "aktivt" if u.get("accountEnabled") else "BLOCKERAT"
-        print(f"{state:<11}{u.get('displayName')}  <{u.get('userPrincipalName')}>  {u.get('id')}")
-    return 0
-
-
-def cmd_user_show(a):
-    try:
-        u = users.resolve(a.user)
-        lic = users.licenses(u["id"])
-        mgr = users.manager(u["id"])
-        methods = users.auth_methods(u["id"]) if a.auth_methods else None
-        recent, window = ([], None) if a.no_audit else users.audits(u["id"], days=a.days, limit=5)
-    except users.UserError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps({"user": u, "licenses": lic, "manager": mgr,
-                          "authMethods": methods, "recentAudits": recent},
-                         indent=2, ensure_ascii=False))
-        return 0
-
-    sia = u.get("signInActivity") or {}
-    synced = u.get("onPremisesSyncEnabled")
-    rows = [
-        ("konto", "AKTIVERAT" if u.get("accountEnabled") else "BLOCKERAT (inloggning spärrad)"),
-        ("id", u.get("id")),
-        ("upn", u.get("userPrincipalName")),
-        ("mail", u.get("mail")),
-        ("typ", f"{u.get('userType') or '?'}, "
-                + ("synkat från lokalt AD" if synced else "molnkonto")),
-        ("titel", " / ".join(x for x in (u.get("jobTitle"), u.get("department"),
-                                         u.get("companyName")) if x)),
-        ("chef", f"{mgr.get('displayName')} <{mgr.get('userPrincipalName')}>" if mgr else "-"),
-        ("anställd", u.get("employeeId")),
-        ("slutdatum", _ts(u.get("employeeLeaveDateTime"), False)
-                      if u.get("employeeLeaveDateTime") else None),
-        ("skapat", _ts(u.get("createdDateTime"))),
-        ("lösenord ändrat", _ts(u.get("lastPasswordChangeDateTime"))
-                            + _age(u.get("lastPasswordChangeDateTime"))),
-        # lastSignIn* count attempts, failed ones included; only lastSuccessful*
-        # says the account actually let someone in.
-        ("senast lyckad inloggning", _ts(sia.get("lastSuccessfulSignInDateTime"))
-                                     + _age(sia.get("lastSuccessfulSignInDateTime"))),
-        ("senaste försök", _ts(sia.get("lastSignInDateTime"))
-                           + _age(sia.get("lastSignInDateTime"))),
-        ("  varav token/app", _ts(sia.get("lastNonInteractiveSignInDateTime"))
-                              + _age(sia.get("lastNonInteractiveSignInDateTime"))),
-        ("licenser", ", ".join(x.get("skuPartNumber") or "?" for x in lic) or "inga"),
-        ("licenser borttagna", _ts(users.offboarded(u)) + _age(users.offboarded(u))
-                               if users.offboarded(u) else None),
-        ("sessioner spärrade", _ts(u.get("signInSessionsValidFromDateTime"))
-                               + _age(u.get("signInSessionsValidFromDateTime"))),
-        ("sam-konto", u.get("onPremisesSamAccountName")),
-        ("senaste synk", _ts(u.get("onPremisesLastSyncDateTime")) if synced else None),
-        ("ou", u.get("onPremisesDistinguishedName")),
-    ]
-    if u.get("proxyAddresses") and a.verbose:
-        rows.append(("adresser", ", ".join(u["proxyAddresses"])))
-    if methods is not None:
-        kinds = sorted({(m.get("@odata.type") or "").split(".")[-1] for m in methods})
-        rows.append(("mfa-metoder", ", ".join(kinds) or "inga"))
-    elif a.auth_methods:
-        rows.append(("mfa-metoder", "kunde inte läsas - kräver scope "
-                                    "UserAuthenticationMethod.Read.All"))
-
-    rows = [(k, v) for k, v in rows if v not in (None, "", "-")]
-    w = max(len(k) for k, _ in rows) + 2
-    print(f"{u.get('displayName')}")
-    for label, value in rows:
-        print(f"  {label:<{w}}{value}")
-
-    if not u.get("accountEnabled") and synced:
-        print("\nKontot är synkat från lokalt AD. Spärren sattes då nästan säkert i AD -\n"
-              "Entra-loggen visar bara AD Connect som skrev över värdet.")
-    if recent:
-        print(f"\nSenaste ändringar (sedan {_ts(window, False)}):")
-        _print_audits(recent, verbose=False)
-        print(f"\n  Hela historiken: wsg user audit {u.get('userPrincipalName')}")
-    elif not a.no_audit:
-        print(f"\nInga katalogändringar loggade sedan {_ts(window, False)}.")
-    return 0
-
-
-def _print_audits(rows, verbose=True):
-    for r in rows:
-        head = (f"{_ts(r.get('activityDateTime'))}  {r.get('activityDisplayName')}"
-                f"  av {users.audit_initiator(r)}")
-        result = r.get("result")
-        if result and result != "success":
-            head += f"  [{result}]"
-        print(f"  {head}")
-        for target, prop, old, new in users.audit_changes(r):
-            if not verbose and prop in ("Included Updated Properties", "TargetId.UserType"):
-                continue
-            arrow = f"{old or '(tomt)'} -> {new or '(tomt)'}" if old != new else (new or "")
-            # A consent record carries every scope twice; unabridged it buries the
-            # rest of the trail.
-            if not verbose and len(arrow) > 160:
-                arrow = arrow[:160] + f"… (+{len(arrow) - 160} tecken, -v för allt)"
-            print(f"      {prop}: {arrow}")
-        if verbose and r.get("additionalDetails"):
-            extra = ", ".join(f"{d.get('key')}={d.get('value')}"
-                              for d in r["additionalDetails"] if d.get("value"))
-            if extra:
-                print(f"      ({extra})")
-
-
-def cmd_user_audit(a):
-    try:
-        u = users.resolve(a.user)
-        rows, window = users.audits(u["id"], days=a.days, limit=a.top,
-                                    as_initiator=a.by_user)
-    except users.UserError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    what = "Ändringar gjorda AV" if a.by_user else "Ändringar PÅ"
-    print(f"{what} {u.get('displayName')} <{u.get('userPrincipalName')}>, "
-          f"sedan {_ts(window, False)}: {len(rows)} poster")
-    if not rows:
-        print("Inga poster. Katalogloggen sparas 30 dagar med Entra ID P1/P2, annars 7 -\n"
-              "en äldre ändring finns inte kvar att hämta ur Entra.")
-        return 0
-    _print_audits(rows, verbose=a.verbose)
-    return 0
-
-
-def cmd_user_signins(a):
-    try:
-        u = users.resolve(a.user)
-        rows, window = users.signins(u["id"], days=a.days, limit=a.top,
-                                     failed_only=a.failed, kinds=a.kinds)
-    except users.UserError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    if not rows:
-        print(f"Inga inloggningar loggade sedan {_ts(window, False)}.")
-        return 0
-    for r in rows:
-        st = r.get("status") or {}
-        loc = r.get("location") or {}
-        where = ", ".join(x for x in (loc.get("city"), loc.get("countryOrRegion")) if x)
-        verdict = "ok" if st.get("errorCode") == 0 else f"FEL {st.get('errorCode')}"
-        kind = "interaktiv" if "interactiveUser" in (r.get("signInEventTypes") or []) else "token"
-        print(f"{_ts(r.get('createdDateTime'))}  {verdict:<9} {kind:<11}"
-              f"{r.get('appDisplayName')}  {r.get('ipAddress') or '-'}  {where or '-'}")
-        if st.get("errorCode") and (st.get("failureReason") or "").lower() != "other.":
-            print(f"      {st.get('failureReason')}")
-    return 0
-
-
-def cmd_user_groups(a):
-    try:
-        u = users.resolve(a.user)
-        rows = users.groups(u["id"])
-    except users.UserError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    for g in sorted(rows, key=lambda x: (x.get("displayName") or "").casefold()):
-        kind = (g.get("@odata.type") or "").split(".")[-1]
-        tag = "roll" if kind == "directoryRole" else (
-            "M365" if "Unified" in (g.get("groupTypes") or []) else
-            "distribution" if g.get("mailEnabled") and not g.get("securityEnabled") else
-            "säkerhet")
-        src = " (AD)" if g.get("onPremisesSyncEnabled") else ""
-        print(f"{tag:<13}{g.get('displayName')}{src}  {g.get('id')}")
-    return 0
-
-
-def _read_password(a, upn):
-    """The new password, from the generator, a terminal, or stdin - never argv.
-
-    An argument lands in the shell history and in the process list of every other
-    user on the machine, and this is a credential. Same reasoning as
-    `wsg arena secret-set`, which is why there is no --value here either.
-    """
-    if a.generate:
-        return users.generate_password(a.length)
-    if sys.stdin.isatty():
-        import getpass
-        pw = getpass.getpass(f"Nytt lösenord för {upn} (visas inte): ")
-        if pw and getpass.getpass("En gång till: ") != pw:
-            return None
-        return pw
-    # One trailing line ending belongs to the pipe or heredoc, not to the
-    # password. Anything beyond that is kept: a password may end in a space.
-    pw = _stdin_text()
-    for eol in ("\r\n", "\n", "\r"):
-        if pw.endswith(eol):
-            return pw[: -len(eol)]
-    return pw
-
-
-def _confirm(a, question):
-    if a.yes or not sys.stdin.isatty():
-        return True
-    return input(question).strip().lower() in ("j", "ja", "y", "yes")
-
-
-def cmd_user_password(a):
-    """Set a new password, in Entra or - for a synced account - in AD.
-
-    Which half of a hybrid tenant owns the password decides everything here, so
-    the command says which one it is talking to before it writes anything.
-    """
-    try:
-        u = users.resolve(a.user)
-    except users.UserError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-
-    password = _read_password(a, u.get("userPrincipalName"))
-    if password is None:
-        print("Lösenorden skiljer sig, avbryter.", file=sys.stderr)
-        return 2
-    if not password:
-        print("Tomt lösenord, avbryter.", file=sys.stderr)
-        return 2
-
-    synced = u.get("onPremisesSyncEnabled")
-    print(f"Konto:  {u.get('displayName')} <{u.get('userPrincipalName')}>", file=sys.stderr)
-    print(f"        {'AKTIVERAT' if u.get('accountEnabled') else 'BLOCKERAT'}, "
-          f"{'synkat från lokalt AD' if synced else 'molnkonto'}, "
-          f"lösenord ändrat {_ts(u.get('lastPasswordChangeDateTime'))}"
-          f"{_age(u.get('lastPasswordChangeDateTime'))}", file=sys.stderr)
-
-    # Where the password lives decides the route, and the account says which that
-    # is — asking the operator to know would only be asking them to get it wrong.
-    # A synced account's password belongs to AD, so that is where the write goes;
-    # --entra forces the other way for the rare case that wants it.
-    if synced and not a.entra:
-        return _password_on_prem(a, u, password)
-    if a.on_prem and not synced:
-        print("        Molnkonto: det finns inte i AD, så --on-prem har inget att skriva "
-              "till. Kör utan flaggan.", file=sys.stderr)
-        return 2
-
-    if (u.get("userType") or "").casefold() == "guest":
-        # A B2B guest has no password in this tenant at all: it authenticates in
-        # its home tenant, and the passwordProfile here is a stub Graph refuses to
-        # write. Worth catching by name, because the 403 does not explain it.
-        print("        Gästkonto: lösenordet ligger i gästens egen tenant och kan inte "
-              "sättas härifrån.", file=sys.stderr)
-        if not a.force:
-            print("Avbryter.", file=sys.stderr)
-            return 2
-
-    if synced:
-        # In a hybrid tenant this is where the command usually stops. Asking the
-        # tenant beats guessing, and beats sending a PATCH that Graph refuses with
-        # an error about "objects originated from an external service" that says
-        # nothing about writeback being the reason.
-        writeback = users.password_writeback()
-        if writeback is False:
-            print("        Synkat konto och password writeback är AVSLAGET i Entra Connect: "
-                  "lösenordet ägs av lokalt AD.\n"
-                  "        Entra tar inte emot bytet, och hash-synken skulle skriva över det "
-                  "om den gjorde det.", file=sys.stderr)
-            if not a.force:
-                print("Avbryter. Utan --entra går kommandot till AD i stället, vilket är "
-                      "det du vill (--force skickar till Entra ändå).", file=sys.stderr)
-                return 2
-        elif writeback is None:
-            print("        Synkat konto: lösenordet ägs av lokalt AD. Om password writeback "
-                  "är avslaget i Entra Connect tar Entra inte emot bytet.\n"
-                  "        (Kunde inte läsa sync-inställningarna — kräver "
-                  "OnPremDirectorySynchronization.Read.All.)", file=sys.stderr)
-        else:
-            print("        Synkat konto: lösenordet ägs av lokalt AD men writeback är på, "
-                  "så bytet skrivs tillbaka dit.", file=sys.stderr)
-
-    after = ("måste bytas vid nästa inloggning" if a.force_change else "gäller som det är")
-    print(f"Efteråt: {after}"
-          + (", med MFA innan bytet" if a.mfa else "")
-          + (", alla sessioner återkallas" if a.revoke_sessions else "")
-          + ".", file=sys.stderr)
-
-    if a.dry_run:
-        print(f"[torrkörning] {len(password)} tecken, inget skickat.", file=sys.stderr)
-        if a.generate:
-            print(password)
-        return 0
-
-    if not _confirm(a, "Sätt lösenordet i Entra? [j/N] "):
-        print("Avbryter.", file=sys.stderr)
-        return 1
-
-    try:
-        users.set_password(u["id"], password, force_change=a.force_change,
-                           force_change_with_mfa=a.mfa)
-    except users.UserError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-
-    # The password is the only thing on stdout, so `wsg user password X --generate`
-    # can be piped into a password manager without the report coming with it.
-    if a.generate:
-        print(password)
-    print(f"Lösenordet är satt på {u.get('userPrincipalName')}.", file=sys.stderr)
-    return _revoke(a, u)
-
-
-def _password_on_prem(a, u, password):
-    """Reset a synced account where its password lives: in Active Directory.
-
-    Entra keeps the account's on-prem DN, so the DC is told exactly which object
-    to write rather than being asked to match a name.
-    """
-    identity = u.get("onPremisesDistinguishedName") or u.get("onPremisesSamAccountName")
-    if not identity:
-        print("        Kontot är märkt som synkat men saknar både DN och samAccountName "
-              "i Entra, så det går inte att peka ut i AD.", file=sys.stderr)
-        return 2
-    try:
-        dc = onprem.host(a.host)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-
-    print(f"Skriver: {dc} (AD), {identity}", file=sys.stderr)
-    after = ("måste bytas vid nästa inloggning" if a.force_change else "gäller som det är")
-    print(f"Efteråt: {after}"
-          + (", kontot låses upp om det är låst" if a.unlock else "")
-          + (", delta-sync startas" if a.sync else "")
-          + (", alla sessioner återkallas i Entra" if a.revoke_sessions else "")
-          + ".", file=sys.stderr)
-    if a.mfa:
-        print("        --mfa gäller bara Entra-vägen och ignoreras här: AD har ingen "
-              "motsvarighet.", file=sys.stderr)
-
-    try:
-        cred = onprem.credential(a.ad_user)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-
-    if a.dry_run:
-        try:
-            found = onprem.find_user(dc, cred, identity)
-        except onprem.OnPremError as e:
-            print(str(e), file=sys.stderr)
-            return 2
-        print(f"[torrkörning] AD svarar: {found.get('samAccountName')}, "
-              f"{'aktivt' if found.get('enabled') else 'BLOCKERAT'}"
-              + (", LÅST" if found.get("lockedOut") else "")
-              + f", lösenord satt {found.get('pwdLastSet') or 'aldrig'}", file=sys.stderr)
-        print(f"[torrkörning] {len(password)} tecken, inget skrivet.", file=sys.stderr)
-        if a.generate:
-            print(password)
-        return 0
-
-    if not _confirm(a, f"Sätt lösenordet i AD på {dc}? [j/N] "):
-        print("Avbryter.", file=sys.stderr)
-        return 1
-
-    before = u.get("lastPasswordChangeDateTime")
-    try:
-        r = onprem.set_password(dc, cred, identity, password,
-                                force_change=a.force_change, unlock=a.unlock)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-
-    if a.generate:
-        print(password)
-    print(f"Lösenordet är satt i AD på {r.get('samAccountName') or identity}.", file=sys.stderr)
-    if isinstance(r.get("forceChange"), str):
-        print(f"  Men flaggan 'byt vid nästa inloggning' gick inte att sätta: "
-              f"{r['forceChange']}", file=sys.stderr)
-    if r.get("unlocked") is True:
-        print("  Kontot var låst och har låsts upp.", file=sys.stderr)
-    elif isinstance(r.get("unlocked"), str):
-        print(f"  Kontot är låst och gick inte att låsa upp: {r['unlocked']}", file=sys.stderr)
-
-    if a.sync:
-        try:
-            sync = onprem.delta_sync(dc, cred)
-        except onprem.OnPremError as e:
-            sync = {"ran": False, "reason": str(e)}
-        if sync.get("ran"):
-            print(f"  Delta-sync startad: {sync.get('result')}. Den flyttar attribut, "
-                  f"inte lösenordet — det rider på hash-synken.", file=sys.stderr)
-        else:
-            print(f"  Ingen delta-sync: {sync.get('reason')}", file=sys.stderr)
-
-    rc = _wait_for_sync(u, before, a.wait)
-    return _revoke(a, u) or rc
-
-
-def _wait_for_sync(u, before, seconds):
-    """Poll Entra until the account's password date moves past what it was.
-
-    This is the only honest proof that the reset reached the cloud: password hash
-    sync runs on a 2-minute cycle of its own, and nothing on the AD side knows
-    whether it has been through. Not finding it inside the window is reported as
-    "not yet", never as a failure - the reset in AD already happened.
-    """
-    if not seconds:
-        return 0
-    print(f"Väntar på hash-synken (upp till {seconds}s)", end="", file=sys.stderr, flush=True)
-    deadline = time.time() + seconds
-    while time.time() < deadline:
-        time.sleep(15)
-        print(".", end="", file=sys.stderr, flush=True)
-        try:
-            now = users.resolve(u["id"]).get("lastPasswordChangeDateTime")
-        except users.UserError:
-            continue
-        if now and now != before:
-            print(f"\nEntra har det nya lösenordet: {_ts(now)}.", file=sys.stderr)
-            return 0
-    print(f"\nEntra visar fortfarande {_ts(before)}. Bytet i AD är gjort — hash-synken "
-          f"går var annan minut, så kolla igen med: wsg user show "
-          f"{u.get('userPrincipalName')}", file=sys.stderr)
-    return 0
-
-
-def _revoke(a, u):
-    if not a.revoke_sessions:
-        return 0
-    try:
-        users.revoke_sessions(u["id"])
-    except users.UserError as e:
-        print(f"Lösenordet är bytt men sessionerna lever kvar: {e}", file=sys.stderr)
-        return 1
-    print("Sessioner återkallade: utloggad från alla klienter inom en timme "
-          "(redan utfärdade access-tokens lever tills de går ut).", file=sys.stderr)
-    return 0
-
-
-def cmd_user_alias(a):
-    """Give a synced account one more address to receive mail on, or take it away.
-
-    For a synced account the addresses belong to AD like the password does:
-    Exchange Online refuses to edit them ("the object is being synchronized from
-    your on-premises organization") and Graph has no write for proxyAddresses at
-    all. So the alias goes into AD over WinRM and rides the next sync to Entra.
-    """
-    address = a.address.strip().casefold()
-    if address.count("@") != 1 or ":" in address:
-        print(f"{a.address!r} är ingen mailadress. Ange den utan smtp:.", file=sys.stderr)
-        return 2
-    try:
-        u = users.resolve(a.user)
-    except users.UserError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-
-    print(f"Konto:   {u.get('displayName')} <{u.get('userPrincipalName')}>", file=sys.stderr)
-    current = users.addresses(u)
-    print(f"Adresser: {', '.join(u.get('proxyAddresses') or []) or 'inga'}", file=sys.stderr)
-    if not u.get("onPremisesSyncEnabled"):
-        print("         Molnkonto: adresserna ägs av Exchange Online, inte AD. Lägg aliaset "
-              "där (Set-Mailbox -EmailAddresses @{Add=...}).", file=sys.stderr)
-        return 2
-    if a.remove and address not in current:
-        print(f"         {address} finns inte på kontot, inget att ta bort.", file=sys.stderr)
-        return 0
-    if not a.remove:
-        if address in current:
-            print(f"         {address} finns redan på kontot.", file=sys.stderr)
-            return 0
-        domain = address.split("@", 1)[1]
-        verified = users.verified_domains()
-        if verified is not None and domain not in {d.casefold() for d in verified}:
-            # Exchange drops an address in a domain the tenant does not own, and the
-            # sync reports success anyway.
-            print(f"         {domain} är inte verifierad i tenanten, så Exchange tar inte "
-                  f"emot adressen.", file=sys.stderr)
-            return 2
-        try:
-            holders = [h for h in users.address_holders(address) if h["id"] != u["id"]]
-        except users.UserError as e:
-            print(str(e), file=sys.stderr)
-            return 1
-        if holders:
-            for h in holders:
-                print(f"         Upptagen i Entra: {h['kind']} {h.get('displayName')} "
-                      f"<{h.get('userPrincipalName') or h.get('mail')}>", file=sys.stderr)
-            return 2
-
-    identity = u.get("onPremisesDistinguishedName") or u.get("onPremisesSamAccountName")
-    if not identity:
-        print("         Kontot är märkt som synkat men saknar både DN och samAccountName "
-              "i Entra, så det går inte att peka ut i AD.", file=sys.stderr)
-        return 2
-    try:
-        dc = onprem.host(a.host)
-        cred = onprem.credential(a.ad_user)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-
-    verb = "Ta bort" if a.remove else "Lägg till"
-    print(f"Skriver: {dc} (AD), {identity}", file=sys.stderr)
-    print(f"Ändring: {verb.lower()} smtp:{address}"
-          + (", delta-sync startas" if a.sync else "") + ".", file=sys.stderr)
-
-    write = not a.dry_run and _confirm(a, f"{verb} aliaset i AD på {dc}? [j/N] ")
-    if not a.dry_run and not write:
-        print("Avbryter.", file=sys.stderr)
-        return 1
-    # What Entra shows as primary today, so that an empty list in AD gets it back
-    # in the same write instead of losing it (see onprem.set_alias).
-    primary = next((p.split(":", 1)[1] for p in u.get("proxyAddresses") or []
-                    if p.startswith("SMTP:")), None) or u.get("mail")
-    try:
-        r = onprem.set_alias(dc, cred, identity, address, remove=a.remove, write=write,
-                             primary=primary)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-
-    if r.get("heldBy"):
-        print(f"Upptagen i AD, utanför det Entra ser: {', '.join(r['heldBy'])}. "
-              f"Inget ändrat.", file=sys.stderr)
-        return 2
-    if r.get("needsPrimary"):
-        if not primary:
-            print("proxyAddresses är tomt i AD och Entra visar ingen primäradress att "
-                  "behålla. Ett ensamt smtp:-alias skulle lämna kontot utan SMTP:, så "
-                  "inget skrivs.", file=sys.stderr)
-            return 2
-        print(f"         proxyAddresses är tomt i AD - Entra härleder {primary} ur mail. "
-              f"Första värdet gör AD:s lista gällande, så SMTP:{primary} skrivs med.",
-              file=sys.stderr)
-    if a.dry_run:
-        print(f"[torrkörning] AD svarar: {r.get('samAccountName')}, adresser "
-              f"{', '.join(r.get('before') or []) or 'inga'}.", file=sys.stderr)
-        if not a.remove:
-            print(f"[torrkörning] Skulle lägga till: {', '.join(r.get('adds') or [])}. "
-                  f"Inget skrivet.", file=sys.stderr)
-        return 0
-    if not r.get("changed"):
-        print(f"Ingen ändring behövdes i AD: {', '.join(r.get('after') or [])}", file=sys.stderr)
-        return 0
-    print(f"Klart i AD: {', '.join(r.get('after') or [])}", file=sys.stderr)
-
-    if a.sync:
-        try:
-            sync = onprem.delta_sync(dc, cred)
-        except onprem.OnPremError as e:
-            sync = {"ran": False, "reason": str(e)}
-        print(f"  Delta-sync startad: {sync.get('result')}." if sync.get("ran")
-              else f"  Ingen delta-sync: {sync.get('reason')}", file=sys.stderr)
-    return _wait_for_alias(u, address, not a.remove, a.wait)
-
-
-def _wait_for_alias(u, address, present, seconds):
-    """Poll Entra until the alias has arrived, or gone. Late is not failure."""
-    if not seconds:
-        return 0
-    print(f"Väntar på synken till Entra (upp till {seconds}s)", end="", file=sys.stderr,
-          flush=True)
-    deadline = time.time() + seconds
-    while time.time() < deadline:
-        time.sleep(15)
-        print(".", end="", file=sys.stderr, flush=True)
-        try:
-            now = users.addresses(users.resolve(u["id"]))
-        except users.UserError:
-            continue
-        if (address in now) == present:
-            print(f"\nEntra har {'fått' if present else 'tappat'} {address}.", file=sys.stderr)
-            return 0
-    print(f"\nInte i Entra än. Ändringen i AD är gjord och kommer med nästa synk "
-          f"(var 30:e minut); kolla med: wsg user show {u.get('userPrincipalName')} -v",
-          file=sys.stderr)
-    return 0
-
-
-def _sku_names(skus):
-    return {s["skuId"]: s.get("skuPartNumber") or s["skuId"][:8] for s in skus}
-
-
-def _stale_row(u, names, days):
-    lic = ",".join(names.get(l["skuId"], "?") for l in u.get("assignedLicenses") or [])
-    kind = ("gäst" if (u.get("userType") or "") == "Guest"
-            else "synkad" if u.get("onPremisesSyncEnabled") else "moln")
-    if days is not None:
-        when = f"tyst {days}d"
-    else:
-        # Never used and created last week is a new hire who has not started;
-        # never used and five years old is something else entirely. Without the
-        # age the two rows read the same.
-        age = _age_days(u.get("createdDateTime"))
-        when = "aldrig använt" + (f", skapat {age}d sedan" if age is not None else "")
-    return f"   {(u.get('userPrincipalName') or '')[:46]:<48}{lic[:20]:<22}{kind:<8}{when}"
-
-
-def _age_days(s):
-    if not s:
-        return None
-    try:
-        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return (datetime.now(timezone.utc) - d).days
-
-
-def cmd_user_stale(a):
-    """Accounts nobody is using: what they cost, and what they still reach.
-
-    Two different questions share one sweep. A licensed account that is never
-    used is money; an unlicensed one that is still enabled is reach, because a
-    synced account keeps authenticating on-prem long after the cloud has
-    forgotten it, and it shows up in no licence review precisely because it is
-    free.
-    """
-    try:
-        users_ = users.everyone()
-        skus = users.subscribed_skus()
-    except users.UserError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    names = _sku_names(skus)
-
-    if a.domain:
-        users_ = [u for u in users_ if users.in_domains(u, a.domain)]
-        if not users_:
-            print(f"Inget konto har en adress i {', '.join(a.domain)}.", file=sys.stderr)
-            return 1
-
-    want = None
-    if a.sku:
-        want = {i for i, n in names.items() if n.casefold() == a.sku.casefold()}
-        if not want:
-            print(f"Ingen licens heter {a.sku!r}. Finns: "
-                  + ", ".join(sorted(set(names.values()))), file=sys.stderr)
-            return 2
-        users_ = [u for u in users_
-                  if any(l["skuId"] in want for l in u.get("assignedLicenses") or [])]
-
-    aged = [(u, users.last_used(u)) for u in users_]
-    enabled = [(u, d) for u, d in aged if u.get("accountEnabled")]
-    members = [(u, d) for u, d in enabled if (u.get("userType") or "") != "Guest"]
-    licensed = [(u, d) for u, d in members if u.get("assignedLicenses")]
-    free = [(u, d) for u, d in members if not u.get("assignedLicenses")]
-    guests = [(u, d) for u, d in enabled if (u.get("userType") or "") == "Guest"]
-
-    def idle(rows, limit=None):
-        out = [(u, d) for u, d in rows if d is None or d >= a.days]
-        # Longest silence first, and never-used before everything else.
-        out.sort(key=lambda r: -(r[1] if r[1] is not None else 10 ** 6))
-        return out[:limit] if limit else out
-
-    if a.json:
-        print(json.dumps({
-            "days": a.days,
-            "domains": a.domain or [],
-            "licensed": [{"upn": u.get("userPrincipalName"), "idleDays": d,
-                          "mail": u.get("mail"),
-                          "skus": [names.get(l["skuId"]) for l in u["assignedLicenses"]],
-                          "synced": bool(u.get("onPremisesSyncEnabled"))}
-                         for u, d in idle(licensed)],
-            "unlicensed": [{"upn": u.get("userPrincipalName"), "idleDays": d,
-                            "synced": bool(u.get("onPremisesSyncEnabled")),
-                            "dn": u.get("onPremisesDistinguishedName")}
-                           for u, d in idle(free)],
-            "guests": [{"upn": u.get("userPrincipalName"), "idleDays": d}
-                       for u, d in idle(guests)],
-        }, indent=2, ensure_ascii=False))
-        return 0
-
-    scope = ""
-    if a.domain:
-        scope = f"  (bara adresser i {', '.join(a.domain)})"
-    print(f"Katalogen: {len(users_)} konton, {len(enabled)} aktiva, "
-          f"{len(licensed)} aktiva med licens, {len(guests)} aktiva gäster.{scope}")
-
-    # With a filter on, the consumed column is still tenant-wide while the
-    # dormant count is not: saying so beats two numbers that look comparable.
-    print(f"\nLicenser, och hur många av dem som ligger på konton som varit tysta "
-          f"{a.days}+ dagar"
-          + (" inom filtret" if (a.domain or a.sku) else ""))
-    holders = {}
-    for u, d in licensed:
-        for l in u.get("assignedLicenses") or []:
-            holders.setdefault(l["skuId"], []).append(d)
-    for sku in sorted(skus, key=lambda x: -x.get("consumedUnits", 0)):
-        if not sku.get("consumedUnits"):
-            continue
-        if want and sku["skuId"] not in want:
-            continue
-        got = holders.get(sku["skuId"], [])
-        dead = sum(1 for d in got if d is None or d >= a.days)
-        total = (sku.get("prepaidUnits") or {}).get("enabled", 0)
-        # A SKU with nothing left is where the next hire gets stuck, so it is
-        # worth seeing next to the count of licences nobody is using.
-        pressure = "  SLUT" if total and sku["consumedUnits"] >= total else ""
-        print(f"   {sku.get('skuPartNumber', '?'):<34}{sku['consumedUnits']:>4} av "
-              f"{total:<8}{dead:>3} oanvända{pressure}")
-
-    rows = idle(licensed)
-    print(f"\nAktiva konton MED licens som inte används  ({len(rows)})")
-    for u, d in rows[:a.limit]:
-        print(_stale_row(u, names, d))
-    if len(rows) > a.limit:
-        print(f"   ... {len(rows) - a.limit} till, --limit visar fler")
-
-    rows = idle(free)
-    synced = sum(1 for u, _ in rows if u.get("onPremisesSyncEnabled"))
-    print(f"\nAktiva konton UTAN licens som inte används  ({len(rows)}, "
-          f"varav {synced} synkade från AD)")
-    print("   Kostar inget och syns därför i ingen licensgenomgång, men ett synkat "
-          "konto\n   autentiserar fortfarande mot allt on-prem.")
-    for u, d in rows[:a.limit]:
-        print(_stale_row(u, names, d))
-    if len(rows) > a.limit:
-        print(f"   ... {len(rows) - a.limit} till, --limit visar fler")
-
-    rows = idle(guests)
-    never = sum(1 for _, d in rows if d is None)
-    print(f"\nAktiva gäster som inte används  ({len(rows)}, varav {never} aldrig "
-          f"loggat in)")
-    for u, d in rows[:a.limit]:
-        print(_stale_row(u, names, d))
-    if len(rows) > a.limit:
-        print(f"   ... {len(rows) - a.limit} till, --limit visar fler")
-
-    print("\n\"aldrig använt\" betyder att ingen loggat in SOM kontot. En delad "
-          "brevlåda som\nfem personer läser varje dag ser likadan ut — den ska "
-          "konverteras, inte stängas.\nEtt konto i en OU som inte synkas syns inte "
-          "här alls: wsg user onprem-find hittar dem.")
-    return 0
-
-
-# ── creating an account ───────────────────────────────────────────────────────
-
-# AD's own rule, and the one that is easy to trip over: 20 characters, and none
-# of the punctuation it reserves. A dot is legal, which is what the convention
-# in this directory uses.
-_SAM_OK = re.compile(r"^[A-Za-z0-9._-]{1,20}$")
-
-
-class _SpecError(Exception):
-    pass
-
-
-def _derive(a):
-    """UPN, samAccountName, CN and display name from what little was given.
-
-    Only the UPN is required. The rest follows from it by the convention the
-    directory already uses - firstname.lastname - and each part can be
-    overridden on its own. Deriving a person's name from an address is
-    guesswork, so the plan prints every field before anything is written.
-    """
-    upn = (a.upn or "").strip()
-    local, _, suffix = upn.partition("@")
-    if not local or not suffix:
-        raise _SpecError(f"{upn!r} är inget UPN. Ange hela adressen, "
-                         f"t.ex. person@example.com.")
-
-    first, _, last = local.partition(".")
-    given = a.given_name or (first.title() if first else None)
-    surname = a.surname or (last.replace(".", " ").title() if last else None)
-    display = a.display_name or (" ".join(x for x in (given, surname) if x) or local)
-
-    sam = (a.sam or local).lower()
-    if not _SAM_OK.match(sam):
-        why = "är längre än 20 tecken" if len(sam) > 20 else "har tecken AD inte tar"
-        raise _SpecError(f"samAccountName {sam!r} {why}. Ange ett kortare med --sam.")
-
-    return {
-        "Name": a.cn or display,          # the CN, which must be unique in the OU
-        "SamAccountName": sam,
-        "UserPrincipalName": upn,
-        "DisplayName": display,
-        "GivenName": given,
-        "Surname": surname,
-        "EmailAddress": None if a.no_mail else (a.mail or upn),
-        "Title": a.title,
-        "Department": a.department,
-        "Company": a.company,
-        "Office": a.office,
-        "MobilePhone": a.mobile,
-        "OfficePhone": a.office_phone,
-        "EmployeeID": a.employee_id,
-        "Description": a.description,
-        "Manager": a.manager,
-        "ou": a.ou or onprem.default_ou(),
-        "like": a.like,
-        "groups": list(a.group or []),
-        "copyGroups": bool(a.like) and a.copy_groups,
-        "enabled": not a.disabled,
-        "forceChange": a.force_change,
-    }
-
-
-def _verified_suffix(upn):
-    """Whether Entra will keep this UPN or rewrite it on the way in.
-
-    (None, None) when the tenant cannot be asked. An unverified suffix is not
-    refused by AD and not refused by the sync either - Connect simply replaces
-    it - so it is worth one call while the account can still be renamed.
-    """
-    domains = users.verified_domains()
-    if domains is None:
-        return None, None
-    suffix = upn.rpartition("@")[2].casefold()
-    return any(d.casefold() == suffix for d in domains), domains
-
-
-def cmd_user_create(a):
-    """Create an account in AD, which is where a synced account has to start.
-
-    A cloud account cannot be adopted by AD afterwards without a hard match on
-    immutableId, so in a hybrid tenant this is the only sane birthplace. What
-    follows - licence, mailbox, Entra groups - waits for the sync and is not
-    this command's business.
-    """
-    try:
-        spec = _derive(a)
-    except _SpecError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    upn = spec["UserPrincipalName"]
-
-    # Entra first, and read-only. If the name is taken up there, creating it in
-    # AD makes a second object that the sync collides with rather than merges,
-    # and that mess is left behind for someone to clean up by hand.
-    try:
-        clash = [u for u in users.find(upn, limit=5)
-                 if (u.get("userPrincipalName") or "").casefold() == upn.casefold()]
-    except users.UserError as e:
-        print(f"Kunde inte fråga Entra om {upn} redan finns: {e}", file=sys.stderr)
-        return 1
-    if clash:
-        u = clash[0]
-        print(f"{upn} finns redan i Entra: {u.get('displayName')}, "
-              f"{'synkat från lokalt AD' if u.get('onPremisesSyncEnabled') else 'molnkonto'}, "
-              f"{'aktiverat' if u.get('accountEnabled') else 'BLOCKERAT'}.\n"
-              f"Kör wsg user show {upn}.", file=sys.stderr)
-        return 2
-
-    verified, domains = _verified_suffix(upn)
-    if verified is False:
-        print(f"@{upn.rpartition('@')[2]} är inte en verifierad domän i tenanten. AD tar "
-              f"emot den ändå, men Entra Connect byter då UPN till "
-              f"...@<tenant>.onmicrosoft.com, och adressen ni lämnar ut fungerar inte.\n"
-              f"Verifierade: {', '.join(sorted(domains)) or 'inga'}", file=sys.stderr)
-        if not a.force:
-            print("Avbryter (--force skapar ändå).", file=sys.stderr)
-            return 2
-
-    try:
-        dc = onprem.host(a.host)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-
-    password = _read_password(a, upn)
-    if password is None:
-        print("Lösenorden skiljer sig, avbryter.", file=sys.stderr)
-        return 2
-    if not password:
-        print("Tomt lösenord, avbryter.", file=sys.stderr)
-        return 2
-
-    try:
-        cred = onprem.credential(a.ad_user, a.via)
-        pre = onprem.precheck(dc, cred, spec["SamAccountName"], upn, spec["ou"], a.like)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-
-    # The OU may have come from the template rather than from a flag, and the
-    # plan has to name the one that will actually be written to.
-    if pre.get("ou"):
-        spec["ou"] = pre["ou"]
-    ou = spec["ou"]
-
-    print(f"Skapar: {spec['DisplayName']} <{upn}>", file=sys.stderr)
-    print(f"        {dc} ({pre.get('domain') or 'AD'}), sam {spec['SamAccountName']}",
-          file=sys.stderr)
-    print(f"        OU {ou or 'SAKNAS'}", file=sys.stderr)
-    for label, key in (("förnamn", "GivenName"), ("efternamn", "Surname"),
-                       ("titel", "Title"), ("avdelning", "Department"),
-                       ("företag", "Company"), ("kontor", "Office"),
-                       ("mobil", "MobilePhone"), ("telefon", "OfficePhone"),
-                       ("mail", "EmailAddress"),
-                       ("anställningsnr", "EmployeeID"), ("chef", "Manager"),
-                       ("beskrivning", "Description")):
-        if spec.get(key):
-            print(f"        {label:<15}{spec[key]}", file=sys.stderr)
-
-    if pre.get("likeError"):
-        print(f"Mallkontot {a.like!r} gick inte att läsa i AD: {pre['likeError']}",
-              file=sys.stderr)
-        return 2
-    like_groups = pre.get("likeGroups") or []
-    if a.like:
-        print(f"Mall:   {pre.get('likeDn')}", file=sys.stderr)
-        print(f"        {len(like_groups)} grupp(er)"
-              + (" kopieras" if spec["copyGroups"] else " kopieras INTE (--no-copy-groups)"),
-              file=sys.stderr)
-    for g in (like_groups if spec["copyGroups"] else []) + spec["groups"]:
-        print(f"        + {g}", file=sys.stderr)
-
-    stop = False
-    if not ou:
-        print(f"Ingen OU angiven. Sätt --ou, lägg \"ou\" i {onprem.config_path()}, "
-              f"eller peka ut ett mallkonto med --like.\n"
-              f"Utan OU hamnar kontot i domänens standardcontainer, som Entra Connect "
-              f"oftast inte synkar alls — då finns kontot i AD och ingen annanstans.",
-              file=sys.stderr)
-        stop = True
-    elif pre.get("ouOk") is False:
-        print(f"OU:n finns inte i AD: {ou}", file=sys.stderr)
-        stop = True
-    candidates = []
-    seen = set()
-    for c in (pre.get("clash") or []):
-        # The same object comes back once per scope that could see it.
-        if c.get("dn") in seen:
-            continue
-        seen.add(c.get("dn"))
-        candidates.append(c)
-
-    if pre.get("samTaken") or pre.get("upnTaken"):
-        taken = []
-        if pre.get("samTaken"):
-            taken.append(f"samAccountName {spec['SamAccountName']}")
-        if pre.get("upnTaken"):
-            taken.append(f"UPN {upn}")
-        print(f"Upptaget i skogen: {' och '.join(taken)}.", file=sys.stderr)
-        for c in candidates:
-            print(_clash_line(c), file=sys.stderr)
-        if a.adopt and len(candidates) == 1 and not candidates[0].get("deleted"):
-            return _adopt(a, spec, candidates[0], password, dc, cred, pre)
-        if a.adopt and len(candidates) != 1:
-            print(f"  --adopt tar bara ett objekt i taget, och det här är "
-                  f"{len(candidates)}. Peka ut rätt objekt för hand.", file=sys.stderr)
-        elif a.adopt:
-            print("  --adopt kan inte återanvända ett raderat objekt. Återställ det först "
-                  "med Restore-ADObject, eller välj ett annat namn.", file=sys.stderr)
-        else:
-            print("  Är det samma person som kommer tillbaka, är det objektet vi ska "
-                  "använda: --adopt\n  flyttar in det i rätt OU igen i stället för att "
-                  "skapa ett andra konto. Ett\n  offboardat konto utanför synkens "
-                  "OU-filter syns inte i Entra, men AD vaktar\n  ändå dess UPN.",
-                  file=sys.stderr)
-        stop = True
-    if pre.get("problems"):
-        print("Namnkollen nådde inte hela skogen:", file=sys.stderr)
-        _problems(pre["problems"])
-        print("  Namnet kan vara upptaget där ändå — då faller New-ADUser på "
-              "\"not unique forest-wide\".", file=sys.stderr)
-    suffixes = pre.get("suffixes") or []
-    if suffixes and upn.rpartition("@")[2].casefold() not in {x.casefold() for x in suffixes}:
-        print(f"Obs: @{upn.rpartition('@')[2]} är inget registrerat UPN-suffix i skogen "
-              f"({', '.join(suffixes)}). AD skriver det ändå.", file=sys.stderr)
-    if stop:
-        return 2
-
-    print(f"Efteråt: kontot är {'aktiverat' if spec['enabled'] else 'BLOCKERAT'}, "
-          f"lösenordet "
-          + ("måste bytas vid första inloggningen" if spec["forceChange"]
-             else "gäller som det är")
-          + (", delta-sync startas" if a.sync else "")
-          + ".", file=sys.stderr)
-
-    if a.dry_run:
-        print(f"[torrkörning] {len(password)} tecken, inget skrivet.", file=sys.stderr)
-        if a.generate:
-            print(password)
-        return 0
-
-    if not _confirm(a, f"Skapa kontot i AD på {dc}? [j/N] "):
-        print("Avbryter.", file=sys.stderr)
-        return 1
-
-    try:
-        r = onprem.create_user(dc, cred, spec, password)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-
-    # Same split as everywhere else here: the password alone on stdout, so it
-    # pipes into a password manager without the report coming with it.
-    if a.generate:
-        print(password)
-    print(f"Skapat i AD: {r.get('dn')}", file=sys.stderr)
-    print(f"  {r.get('sam')}  {r.get('upn')}  "
-          f"{'aktiverat' if r.get('enabled') else 'BLOCKERAT'}  {r.get('guid')}",
-          file=sys.stderr)
-    if r.get("groups"):
-        print(f"  {len(r['groups'])} grupp(er) tillagda.", file=sys.stderr)
-    for g, why in (r.get("groupErrors") or {}).items():
-        print(f"  Gruppen gick inte att lägga till: {g}\n    {why}", file=sys.stderr)
-
-    if a.sync:
-        try:
-            sync = onprem.delta_sync(dc, cred)
-        except onprem.OnPremError as e:
-            sync = {"ran": False, "reason": str(e)}
-        if sync.get("ran"):
-            print(f"  Delta-sync startad: {sync.get('result')}.", file=sys.stderr)
-        else:
-            print(f"  Ingen delta-sync: {sync.get('reason')}", file=sys.stderr)
-
-    rc = _wait_for_user(upn, a.wait if a.wait is not None else (300 if a.sync else 0))
-    print("Kvar i molnet när kontot har synkat: licens — och därmed postlådan i "
-          "Exchange Online — Entra-grupper och MFA-registrering. Finns Exchange kvar "
-          "on-prem skapas postlådan där med Enable-RemoteMailbox, inte härifrån.",
-          file=sys.stderr)
-    return rc
-
-
-def _adopt(a, spec, found, password, dc, cred, pre):
-    """Put the account AD already has back into service, rather than adding a second.
-
-    The same person returning should get the same object: the SID goes with it,
-    and with the SID every on-prem permission ever granted to them. What this
-    cannot bring back is the cloud side - the Entra object was deleted when the
-    account fell out of the sync scope, so the mailbox that comes with the new
-    licence is a new and empty one.
-    """
-    ou = spec["ou"]
-    print(f"\nÅteranvänder det befintliga kontot i stället för att skapa ett nytt.",
-          file=sys.stderr)
-    print(f"        {found.get('dn')}", file=sys.stderr)
-    if found.get("enabled"):
-        print("        Kontot är AKTIVT där det står — det har aldrig stängts av, bara "
-              "flyttats.", file=sys.stderr)
-    parent = found.get("dn", "").split(",", 1)[-1]
-    if ou and parent.casefold() != ou.casefold():
-        print(f"        flyttas till  {ou}", file=sys.stderr)
-    else:
-        print(f"        står redan i  {ou}", file=sys.stderr)
-
-    like_groups = pre.get("likeGroups") or []
-    want = (like_groups if spec["copyGroups"] else []) + spec["groups"]
-    for g in want:
-        print(f"        + {g}", file=sys.stderr)
-    print("        Grupper det redan har rörs inte — läs dem efteråt med "
-          "wsg user onprem-find, gammal åtkomst följer med objektet.", file=sys.stderr)
-    print(f"Efteråt: {'aktiverat' if spec['enabled'] else 'BLOCKERAT'}, nytt lösenord som "
-          + ("måste bytas vid första inloggningen" if spec["forceChange"]
-             else "gäller som det är")
-          + (", delta-sync startas" if a.sync else "")
-          + ".", file=sys.stderr)
-
-    if a.dry_run:
-        print(f"[torrkörning] {len(password)} tecken, inget skrivet.", file=sys.stderr)
-        if a.generate:
-            print(password)
-        return 0
-
-    if not _confirm(a, f"Återanvänd {found.get('dn')}? [j/N] "):
-        print("Avbryter.", file=sys.stderr)
-        return 1
-
-    try:
-        r = onprem.adopt_user(dc, cred, found["dn"], spec, password)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-
-    if a.generate:
-        print(password)
-    print(f"Återanvänt: {r.get('dn')}", file=sys.stderr)
-    print(f"  {r.get('sam')}  {r.get('upn')}  "
-          f"{'aktiverat' if r.get('enabled') else 'BLOCKERAT'}  {r.get('guid')}",
-          file=sys.stderr)
-    if r.get("moved"):
-        print(f"  Flyttat från {r.get('wasDn')}", file=sys.stderr)
-    if r.get("wasEnabled") and not r.get("enabled"):
-        print("  Var aktivt, är nu blockerat.", file=sys.stderr)
-    had = r.get("hadGroups") or []
-    if had:
-        print(f"  Hade redan {len(had)} grupp(er) sedan förra gången:", file=sys.stderr)
-        for g in had:
-            print(f"    {g}", file=sys.stderr)
-    if r.get("groups"):
-        print(f"  {len(r['groups'])} grupp(er) tillagda.", file=sys.stderr)
-    for g, why in (r.get("groupErrors") or {}).items():
-        print(f"  Gruppen gick inte att lägga till: {g}\n    {why}", file=sys.stderr)
-    if isinstance(r.get("forceChange"), str):
-        print(f"  Flaggan 'byt vid nästa inloggning' gick inte att sätta: "
-              f"{r['forceChange']}", file=sys.stderr)
-
-    if a.sync:
-        try:
-            sync = onprem.delta_sync(dc, cred)
-        except onprem.OnPremError as e:
-            sync = {"ran": False, "reason": str(e)}
-        if sync.get("ran"):
-            print(f"  Delta-sync startad: {sync.get('result')}.", file=sys.stderr)
-        else:
-            print(f"  Ingen delta-sync: {sync.get('reason')}", file=sys.stderr)
-
-    rc = _wait_for_user(spec["UserPrincipalName"],
-                        a.wait if a.wait is not None else (300 if a.sync else 0))
-    print("Kvar i molnet: licens, Entra-grupper och MFA. Entra-objektet som fanns förr "
-          "är sedan länge borta, så det blir ett nytt konto där uppe med en ny, tom "
-          "postlåda — SID:et som följer med objektet gäller bara on-prem.",
-          file=sys.stderr)
-    return rc
-
-
-def _ascii_name(s):
-    """"Jönsson" -> "jonsson": the tenant's UPNs drop the accent (Göransson is goransson,
-    Jürs is jurs), they do not spell it out the German way. A surname in two
-    words is run together (Jouni von Wendt is jouni.vonwendt), so "Anderberg
-    Alm" is anderbergalm, not anderberg.alm."""
-    plain = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    return re.sub(r"[^a-z0-9.-]", "", plain.lower().replace(" ", ""))
-
-
-_NO_ALIAS = {"inget", "ingen", "nej", "-", "no", "none"}
-
-# Licences are always ordered from the CSP partner, never assigned from here
-# (decision 2026-10-08): the reseller buys and assigns them, and the tenant runs at
-# zero free seats anyway. Onboarding names the licence, marks the Grit item as
-# waiting on the reseller, and leaves "Skapa kontot och tilldela licens" open until
-# the licence is on the account - a rerun then ticks it off.
-_LICENSE_FROM = "the licence reseller"
-
-
-def cmd_user_onboard(a):
-    """Onboard the person on a Grit item: AD account, licence, groups, ticked off.
-
-    The answers come from the item's notes, where the Onboarding flow filed
-    them; the template account (the flow's "Samma rättigheter som") supplies
-    the OU, the licences and the groups that a person with the same job has.
-    Anything the item does not say is a flag here, never a guess.
-
-    It runs in two halves because the sync sits between them. The AD half is
-    `wsg user create`, unchanged. The cloud half needs the account in Entra,
-    so when the sync has not carried it across yet, running the same command
-    again later picks up there: an account that already exists, synced, is
-    not created twice.
-    """
-    try:
-        main_item, subs = grit.item(a.ref)
-    except grit.GritError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    ans = grit.answers(main_item.get("body"))
-    name = a.display_name or grit.subject(main_item.get("title"))
-    if not name or " " not in name:
-        print(f"Kan inte läsa ett för- och efternamn ur {main_item.get('title')!r}. "
-              f"Ange --display-name.", file=sys.stderr)
-        return 2
-    given, _, surname = name.partition(" ")
-
-    domain = (a.domain or ans.get("domain") or "").lstrip("@").strip().lower()
-    if a.upn:
-        upn = a.upn
-    elif domain:
-        upn = f"{_ascii_name(given)}.{_ascii_name(surname)}@{domain}"
-    else:
-        print("Posten säger ingen e-postdomän. Ange --domain eller --upn.", file=sys.stderr)
-        return 2
-
-    # The template is a person in Entra, read once for both kinds of group: most
-    # are cloud groups, written below through Graph, but the Role-*-WVD groups
-    # that open Garp and WSS are synced from AD and have to be written there, so
-    # they go to `user create` as --group (checked 2026-10-08 on Anna-Zarha).
-    like_who = a.like or ans.get("like")
-    template = None
-    if like_who:
-        try:
-            template = users.resolve(like_who)
-        except users.UserError as e:
-            print(f"Mallen {like_who!r}: {e}", file=sys.stderr)
-            return 2
-
-    # The manager goes to AD by DN, the one identity AD cannot misread. The Entra
-    # UPN is not it: AD looks the UPN up *in AD*, where a synced account can
-    # carry another suffix (person@example.com is not found there), and
-    # New-ADUser then refuses the whole account over one attribute.
-    manager_dn = None
-    if a.manager or ans.get("manager"):
-        try:
-            boss = users.resolve(a.manager or ans["manager"])
-        except users.UserError as e:
-            print(f"Chefen: {e}", file=sys.stderr)
-            return 2
-        manager_dn = boss.get("onPremisesDistinguishedName")
-        if not manager_dn:
-            print(f"Chefen {boss.get('displayName')} är ett molnkonto utan AD-objekt och kan "
-                  f"inte bli chef i AD. Sätt chefen i Entra efteråt.", file=sys.stderr)
-
-    ou = a.ou
-    if not ou and template and template.get("onPremisesDistinguishedName"):
-        ou = template["onPremisesDistinguishedName"].split(",", 1)[1]
-
-    try:
-        if a.license:
-            skus = [users.sku(x) for x in a.license]
-        else:
-            by_id = {s["skuId"]: s for s in users.subscribed_skus()}
-            skus = [by_id[x["skuId"]] for x in (template or {}).get("assignedLicenses") or []
-                    if x["skuId"] in by_id]
-        wanted = []
-        if template and not a.no_template_groups:
-            wanted += users.member_groups(template["id"])
-        wanted += [users.group(x) for x in a.group or []]
-    except users.UserError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    seen, groups, ad_groups = set(), [], []
-    for g in wanted:
-        if g["id"] in seen:
-            continue
-        seen.add(g["id"])
-        door = users.group_door(g)
-        if door == "ad":
-            ad_groups.append(g.get("onPremisesSamAccountName") or g["displayName"])
-        elif door in ("graph", "exchange"):
-            groups.append(g)
-    tpl = template or {}
-    usage = a.usage_location or tpl.get("usageLocation") or "SE"
-    department = a.department or tpl.get("department")
-    company = ans.get("company") or tpl.get("companyName")
-    office = ans.get("office") or tpl.get("officeLocation")
-
-    print(f"Grit {a.ref}: {main_item.get('title')}", file=sys.stderr)
-    if template:
-        print(f"  mall        {template.get('displayName')} <{template.get('userPrincipalName')}>",
-              file=sys.stderr)
-    if not skus:
-        print("Ingen licens angiven: ange --license, eller en mall som har en.", file=sys.stderr)
-        return 2
-    sku_names = ", ".join(s["skuPartNumber"] for s in skus)
-    free = {s["skuPartNumber"]: s["prepaidUnits"]["enabled"] - s["consumedUnits"] for s in skus}
-    print(f"  licens      {sku_names}  (usageLocation {usage}; lediga: "
-          + ", ".join(f"{k} {v}" for k, v in free.items()) + ")", file=sys.stderr)
-    print(f"              beställs hos {_LICENSE_FROM}, tilldelas aldrig härifrån",
-          file=sys.stderr)
-    for g in groups:
-        door = users.group_door(g)
-        print(f"  grupp       {g['displayName']}"
-              + ("  (distributionslista: Exchange, inte härifrån)" if door == "exchange" else ""),
-              file=sys.stderr)
-    for g in ad_groups:
-        print(f"  AD-grupp    {g}  (sätts i AD när kontot skapas)", file=sys.stderr)
-
-    existing = [u for u in users.find(upn, limit=5)
-                if (u.get("userPrincipalName") or "").casefold() == upn.casefold()]
-    if existing and not existing[0].get("onPremisesSyncEnabled"):
-        print(f"{upn} finns redan i Entra som molnkonto. Det går inte att ta över från AD; "
-              f"reda ut det för hand.", file=sys.stderr)
-        return 2
-
-    if existing:
-        print(f"{upn} finns redan i Entra, synkat från AD. Hoppar över att skapa och gör "
-              f"molndelen.", file=sys.stderr)
-    else:
-        if not ou:
-            print("Ingen OU: ange --ou, eller en mall vars konto ligger i rätt OU.",
-                  file=sys.stderr)
-            return 2
-        argv = ["user", "create", upn, "--given-name", given, "--surname", surname,
-                "--display-name", name, "--ou", ou, "--generate", "--sync"]
-        for g in ad_groups:
-            argv += ["--group", g]
-        for flag, value in (("--title", ans.get("title")), ("--company", company),
-                            ("--office", office), ("--department", department),
-                            ("--manager", manager_dn), ("--host", a.host),
-                            ("--ad-user", a.ad_user), ("--via", a.via)):
-            if value:
-                argv += [flag, value]
-        if a.dry_run:
-            argv.append("--dry-run")
-        if a.yes:
-            argv.append("--yes")
-        rc = main(argv)
-        if rc:
-            return rc
-
-    if a.dry_run:
-        _onboard_grit_plan(ans, subs)
-        print("[torrkörning] Ingen licens, inga grupper, inget i Grit.", file=sys.stderr)
-        return 0
-
-    try:
-        u = users.resolve(upn)
-    except users.UserError:
-        print(f"{upn} syns inte i Entra än. Kör samma kommando igen när synken har gått, "
-              f"så görs licens, grupper och Grit då.", file=sys.stderr)
-        return 0
-
-    problems, left_for_exchange = [], []
-    if u.get("usageLocation") != usage:
-        users.set_usage_location(u["id"], usage)
-    have = {x["skuId"] for x in u.get("assignedLicenses") or []}
-    to_order = [s["skuPartNumber"] for s in skus if s["skuId"] not in have]
-    for g in groups:
-        if users.group_door(g) == "exchange":
-            left_for_exchange.append(g)
-            continue
-        try:
-            added = users.add_member(g["id"], u["id"])
-            print(f"  {'+' if added else '='} {g['displayName']}", file=sys.stderr)
-        except users.UserError as e:
-            problems.append(f"{g['displayName']}: {e}")
-
-    for p in problems:
-        print(f"MISSLYCKADES: {p}", file=sys.stderr)
-    if left_for_exchange:
-        print("Distributionslistor tar inte medlemmar via Graph. I Exchange Online:",
-              file=sys.stderr)
-        for g in left_for_exchange:
-            print(f"  Add-DistributionGroupMember -Identity '{g.get('mail') or g['displayName']}' "
-                  f"-Member '{upn}'", file=sys.stderr)
-
-    if to_order:
-        print(f"Licens att beställa hos {_LICENSE_FROM}: {', '.join(to_order)} till {upn}.",
-              file=sys.stderr)
-
-    if a.no_grit:
-        return 1 if problems else 0
-    licensed = not to_order
-    done = []
-    try:
-        if to_order:
-            grit.set_waiting(main_item["id"],
-                             f"{_LICENSE_FROM}: licens {', '.join(to_order)} till {upn}")
-        elif (main_item.get("waitingFor") or "").startswith(_LICENSE_FROM):
-            grit.set_waiting(main_item["id"], None)
-        for title, ok in ((grit.STEP_ACCOUNT, licensed),
-                          (grit.STEP_ALIAS, (ans.get("alias") or "").lower() in _NO_ALIAS),
-                          (grit.STEP_RIGHTS, not problems and not left_for_exchange)):
-            s = grit.step(subs, title)
-            if ok and s and s.get("status") != "done":
-                grit.set_status(s["id"], "done")
-                done.append(title)
-        rest = [g["displayName"] for g in left_for_exchange]
-        line = (f"Konto {upn} skapat {datetime.now():%Y-%m-%d}"
-                + (f"; kvar i Exchange: {', '.join(rest)}" if rest else ""))
-        # A line someone else wrote ("Dator på Davildas plats") is kept after
-        # ours; only a line this command wrote itself is replaced.
-        # Grit caps a status line at 140 characters, so the old line only comes
-        # along when both fit.
-        before = main_item.get("statusLine") or ""
-        if before and not before.startswith("Konto ") and len(line) + 3 + len(before) <= 140:
-            line = f"{line} — {before}"
-        line = line[:140]
-        grit.set_line(main_item["id"], line)
-    except grit.GritError as e:
-        print(f"Grit: {e}", file=sys.stderr)
-        return 1
-    for t in done:
-        print(f"  Grit: bockat av \"{t}\"", file=sys.stderr)
-    return 1 if problems else 0
-
-
-def _onboard_grit_plan(ans, subs):
-    print("Grit efteråt:", file=sys.stderr)
-    print(f"  väntar på {_LICENSE_FROM} tills licensen sitter; \"{grit.STEP_ACCOUNT}\" "
-          f"bockas av vid en omkörning efter det", file=sys.stderr)
-    if (ans.get("alias") or "").lower() in _NO_ALIAS:
-        print(f"  \"{grit.STEP_ALIAS}\" bockas av: inget alias", file=sys.stderr)
-    print(f"  \"{grit.STEP_RIGHTS}\" bockas av om alla grupper gick in via Graph",
-          file=sys.stderr)
-    for t in (grit.STEP_ACCOUNT, grit.STEP_ALIAS, grit.STEP_RIGHTS):
-        if not grit.step(subs, t):
-            print(f"  (posten har inget steg som heter \"{t}\")", file=sys.stderr)
-
-
-def _wait_for_user(upn, seconds):
-    """Poll Entra until the sync has carried the new account across.
-
-    Not finding it inside the window is reported as "not yet", never as a
-    failure: the account exists in AD either way, and a scheduled cycle can be
-    half an hour away when no delta was started.
-    """
-    if not seconds:
-        return 0
-    print(f"Väntar på synken (upp till {seconds}s)", end="", file=sys.stderr, flush=True)
-    deadline = time.time() + seconds
-    while time.time() < deadline:
-        time.sleep(15)
-        print(".", end="", file=sys.stderr, flush=True)
-        try:
-            u = users.resolve(upn)
-        except users.UserError:
-            continue
-        print(f"\nKontot finns i Entra: {u.get('userPrincipalName')}  {u.get('id')}",
-              file=sys.stderr)
-        if not u.get("onPremisesSyncEnabled"):
-            print("  Men det är inte märkt som synkat, så det är ett annat objekt än "
-                  "det som just skapades.", file=sys.stderr)
-        return 0
-    print(f"\nInte i Entra ännu. Kontot finns i AD — synkcykeln går var 30:e minut när "
-          f"ingen delta startas. Kolla igen med: wsg user show {upn}", file=sys.stderr)
-    return 0
-
-
-def _problems(problems):
-    """Name every scope of the search that did not answer.
-
-    A forest-wide check that quietly skipped a domain is worse than no check:
-    it reports a free name with the same words either way.
-    """
-    for why in problems or []:
-        print(f"  kunde inte söka: {why}", file=sys.stderr)
-
-
-def _clash_line(c):
-    """One line about an object that already holds the name we want."""
-    what = []
-    if c.get("deleted"):
-        what.append("RADERAT, ligger kvar i papperskorgen")
-    elif c.get("enabled") is False:
-        what.append("BLOCKERAT")
-    elif c.get("enabled"):
-        what.append("aktivt")
-    if (c.get("class") or "user") != "user":
-        what.append(c["class"])
-    seen = c.get("lastLogon")
-    if seen:
-        what.append(f"senast inloggad {_ts(seen, with_time=False)}")
-    return (f"  {c.get('dn')}\n"
-            f"    {', '.join(what) or 'okänt tillstånd'}"
-            + (f"  [sedd i {c['source']}]" if c.get("source") else "")
-            + (f"\n    upn {c['upn']}" if c.get("upn") else "")
-            + (f"  sam {c['sam']}" if c.get("sam") else ""))
-
-
-def cmd_user_onprem_find(a):
-    """Who in the forest already answers to this name, deleted objects included.
-
-    The question this exists for is "why is the name taken": AD enforces UPN
-    uniqueness forest-wide, and the object holding it is regularly one nobody
-    remembers - offboarded out of the sync scope, or deleted and still held by
-    the Recycle Bin, in either case invisible from Entra.
-    """
-    try:
-        dc = onprem.host(a.host)
-        cred = onprem.credential(a.ad_user)
-        got = onprem.search(dc, cred, a.query)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    hits = got.get("hits") or []
-    problems = got.get("problems") or []
-    if a.json:
-        print(json.dumps(got, indent=2, ensure_ascii=False))
-        return 0
-    _problems(problems)
-    if not hits:
-        # A scope that could not be read is not the same answer as an empty one,
-        # and only the second one is worth acting on.
-        print(f"Inget objekt i skogen matchar {a.query!r}"
-              + (", i de delar som gick att läsa." if problems else "."), file=sys.stderr)
-        return 1
-    seen = set()
-    for c in hits:
-        if c.get("dn") in seen:
-            continue
-        seen.add(c.get("dn"))
-        print(f"{c.get('name') or c.get('sam') or '(namnlöst)'}")
-        print(_clash_line(c))
-    return 0
-
-
-def cmd_user_onprem_check(a):
-    """Whether the AD path is usable at all, before anyone needs it in a hurry."""
-    try:
-        dc = onprem.host(a.host)
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    print(f"Domänkontrollant: {dc}", file=sys.stderr)
-    saved = onprem.cred_path().exists()
-    print("Inloggning:       "
-          + (f"sparad i {onprem.cred_path()}" if saved
-             else f"frågas vid körning ({onprem.ad_user(a.ad_user) or 'inget konto angivet'})"),
-          file=sys.stderr)
-    try:
-        r = onprem.check(dc, onprem.credential(a.ad_user))
-    except onprem.OnPremError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if a.json:
-        print(json.dumps(r, indent=2, ensure_ascii=False))
-        return 0
-    print(f"Ansluten som:     {r.get('whoami')} på {r.get('computer')} ({r.get('domain')})")
-    print(f"ActiveDirectory:  {'finns' if r.get('ad') else 'SAKNAS — RSAT-modulen behövs för lösenordsbyte'}")
-    print(f"ADSync:           {'finns — Entra Connect kör här' if r.get('adsync') else 'saknas — Entra Connect kör på en annan server'}")
-    if not r.get("adsync"):
-        print("                  (ingen delta-sync härifrån; hash-synken går ändå av sig själv)")
-    return 0
-
-
-def _add_user_commands(sub):
-    def user_arg(s):
-        s.add_argument("user", help="UPN, object id, or part of a display name")
-
-    s = sub.add_parser("find", help="search the directory by name, UPN or mail")
-    s.add_argument("query")
-    s.add_argument("--top", type=int, default=25)
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_user_find)
-
-    s = sub.add_parser("stale", help="tenant-wide: accounts nobody is using, what they "
-                                     "cost and what they still reach")
-    s.add_argument("--days", type=int, default=90, metavar="N",
-                   help="how long an account has to have been silent to count, "
-                        "default 90")
-    s.add_argument("--sku", metavar="NAME",
-                   help="only accounts holding this licence, e.g. SPB")
-    s.add_argument("--domain", action="append", metavar="DOMAIN",
-                   help="only accounts with an address in this domain - the UPN, the "
-                        "primary address or any alias; repeatable. A guest is matched "
-                        "on their own address, not on the rewritten #EXT# one")
-    s.add_argument("--limit", type=int, default=20, metavar="N",
-                   help="rows shown per section, default 20")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_user_stale)
-
-    s = sub.add_parser("show", help="account state: enabled, licences, last sign-in, "
-                                    "password age, and the latest changes")
-    user_arg(s)
-    s.add_argument("--days", type=int, default=30, help="window for the change list, default 30")
-    s.add_argument("--no-audit", action="store_true", help="skip the change list")
-    s.add_argument("--auth-methods", action="store_true",
-                   help="also list registered MFA methods (extra consent)")
-    s.add_argument("-v", "--verbose", action="store_true", help="also proxy addresses")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_user_show)
-
-    s = sub.add_parser("audit", help="who changed this account, when, and what")
-    user_arg(s)
-    s.add_argument("--days", type=int, default=30, help="default 30, which is the retention")
-    s.add_argument("--top", type=int, default=100)
-    s.add_argument("--by-user", action="store_true",
-                   help="changes this account made, instead of changes made to it")
-    s.add_argument("-v", "--verbose", action="store_true", help="every modified property")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_user_audit)
-
-    s = sub.add_parser("signins", help="sign-in log for one account")
-    user_arg(s)
-    s.add_argument("--days", type=int, default=7)
-    s.add_argument("--top", type=int, default=50)
-    s.add_argument("--failed", action="store_true", help="only failed sign-ins")
-    s.add_argument("--kinds", choices=("all", "interactive", "noninteractive"),
-                   default="all",
-                   help="Graph returns interactive sign-ins only unless asked; "
-                        "default here is all of them")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_user_signins)
-
-    s = sub.add_parser("groups", help="group and directory role memberships")
-    user_arg(s)
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_user_groups)
-
-    s = sub.add_parser("password", help="set a new password on an account; the value is "
-                                        "read from stdin or generated, never an argument")
-    user_arg(s)
-    s.add_argument("--generate", action="store_true",
-                   help="generate a password and print it on stdout, instead of reading one")
-    s.add_argument("--length", type=int, default=20, metavar="N",
-                   help="length of the generated password, default 20")
-    s.add_argument("--no-force-change", dest="force_change", action="store_false",
-                   help="let the password stand; default is that the user must change it "
-                        "at next sign-in")
-    s.add_argument("--mfa", action="store_true",
-                   help="require MFA before that change (fails if the account has no method)")
-    s.add_argument("--revoke-sessions", action="store_true",
-                   help="also sign the account out everywhere; a reset alone leaves old "
-                        "refresh tokens working")
-    s.add_argument("--on-prem", dest="on_prem", action="store_true",
-                   help="reset in Active Directory over WinRM; this is already the default "
-                        "for a synced account, so the flag only makes it explicit")
-    s.add_argument("--entra", action="store_true",
-                   help="reset in Entra even for a synced account, where it is expected to "
-                        "fail while password writeback is off")
-    s.add_argument("--host", metavar="DC",
-                   help="domain controller to reset on, default WSG_AD_HOST or the "
-                        "configured one")
-    s.add_argument("--ad-user", dest="ad_user", metavar="USER",
-                   help="AD account that signs in to the DC, e.g. you@ad.example.com; "
-                        "default WSG_AD_USER or the configured one")
-    s.add_argument("--sync", action="store_true",
-                   help="with --on-prem, also start a delta sync cycle (note: the password "
-                        "itself rides hash sync, not this)")
-    s.add_argument("--wait", type=int, default=240, metavar="SEC",
-                   help="with --on-prem, wait this long for Entra to show the new password "
-                        "date; 0 skips the check (default 240)")
-    s.add_argument("--no-unlock", dest="unlock", action="store_false",
-                   help="with --on-prem, leave a locked-out account locked")
-    s.add_argument("--dry-run", action="store_true", help="show the account and stop")
-    s.add_argument("--force", action="store_true",
-                   help="send it even where it is known to fail: a synced account with "
-                        "writeback off, or a guest")
-    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
-    s.set_defaults(fn=cmd_user_password)
-
-    s = sub.add_parser("alias", help="add or remove a mail alias on a synced account, "
-                                     "in AD where its addresses live")
-    user_arg(s)
-    s.add_argument("address", help="the address, e.g. person@example.com")
-    s.add_argument("--remove", action="store_true", help="take the alias away instead")
-    s.add_argument("--host", metavar="DC",
-                   help="domain controller, default WSG_AD_HOST or the configured one")
-    s.add_argument("--ad-user", dest="ad_user", metavar="USER",
-                   help="AD account that signs in to the DC; default WSG_AD_USER or the "
-                        "configured one")
-    s.add_argument("--sync", action="store_true", help="also start a delta sync cycle")
-    s.add_argument("--wait", type=int, default=300, metavar="SEC",
-                   help="wait this long for Entra to show the change; 0 skips the check "
-                        "(default 300)")
-    s.add_argument("--dry-run", action="store_true",
-                   help="check the address in Entra and AD and stop")
-    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
-    s.set_defaults(fn=cmd_user_alias)
-
-    s = sub.add_parser("create", help="create an account in on-prem AD, where a synced "
-                                      "account has to start; the password is read from "
-                                      "stdin or generated, never an argument")
-    s.add_argument("upn", help="the full UPN, e.g. person@example.com")
-    s.add_argument("--ou", metavar="DN",
-                   help="OU to create it in; default WSG_AD_OU, the configured one, or "
-                        "the OU the --like account sits in")
-    s.add_argument("--like", metavar="USER",
-                   help="an existing AD account to copy the OU and the group memberships "
-                        "from (samAccountName, UPN or DN)")
-    s.add_argument("--no-copy-groups", dest="copy_groups", action="store_false",
-                   help="with --like, take the OU but not the groups")
-    s.add_argument("--group", action="append", metavar="GROUP",
-                   help="add to this AD group; repeatable")
-    s.add_argument("--sam", metavar="NAME",
-                   help="samAccountName; default is the part of the UPN before the @, "
-                        "which AD caps at 20 characters")
-    s.add_argument("--cn", metavar="NAME",
-                   help="the CN, which has to be unique inside the OU; default is the "
-                        "display name")
-    s.add_argument("--display-name", dest="display_name", metavar="NAME",
-                   help="default is the given name and surname derived from the UPN")
-    s.add_argument("--given-name", dest="given_name", metavar="NAME")
-    s.add_argument("--surname", metavar="NAME")
-    s.add_argument("--title", metavar="TITLE")
-    s.add_argument("--department", metavar="NAME")
-    s.add_argument("--company", metavar="NAME")
-    s.add_argument("--office", metavar="NAME")
-    s.add_argument("--mobile", metavar="NUMBER")
-    s.add_argument("--office-phone", dest="office_phone", metavar="NUMBER",
-                   help="AD telephoneNumber, which Graph reports as businessPhones; often\n"
-                        "the same number as --mobile")
-    s.add_argument("--employee-id", dest="employee_id", metavar="ID")
-    s.add_argument("--description", metavar="TEXT")
-    s.add_argument("--manager", metavar="USER",
-                   help="the manager's AD account (samAccountName, UPN or DN)")
-    s.add_argument("--mail", metavar="ADDRESS",
-                   help="the mail attribute; default is the UPN")
-    s.add_argument("--no-mail", dest="no_mail", action="store_true",
-                   help="leave the mail attribute empty")
-    s.add_argument("--disabled", action="store_true",
-                   help="create the account blocked, e.g. ahead of a start date")
-    s.add_argument("--generate", action="store_true",
-                   help="generate the first password and print it on stdout")
-    s.add_argument("--length", type=int, default=20, metavar="N",
-                   help="length of the generated password, default 20")
-    s.add_argument("--no-force-change", dest="force_change", action="store_false",
-                   help="let the first password stand; default is that it must be "
-                        "changed at first sign-in")
-    s.add_argument("--host", metavar="DC",
-                   help="domain controller to create on, default WSG_AD_HOST or the "
-                        "configured one")
-    s.add_argument("--ad-user", dest="ad_user", metavar="USER",
-                   help="AD account that signs in to the DC; default WSG_AD_USER or the "
-                        "configured one")
-    s.add_argument("--sync", action="store_true",
-                   help="start a delta sync cycle afterwards instead of waiting for the "
-                        "scheduled one")
-    s.add_argument("--wait", type=int, default=None, metavar="SEC",
-                   help="wait this long for the account to appear in Entra; default 300 "
-                        "with --sync and 0 without")
-    s.add_argument("--dry-run", action="store_true",
-                   help="check the name, the OU and the template, then stop")
-    s.add_argument("--adopt", action="store_true",
-                   help="when AD already has this account - offboarded out of the sync "
-                        "scope, say - put that object back into service instead of "
-                        "creating a second one; it keeps its SID and its old group "
-                        "memberships")
-    s.add_argument("--force", action="store_true",
-                   help="create it even with a UPN suffix the tenant has not verified")
-    s.add_argument("--via", choices=("winrm", "azure"),
-                   help="how to reach the DC: winrm with your AD password (default), or "
-                        "azure, Run Command on the DC with your az login; default "
-                        "WSG_AD_VIA or the configured one")
-    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
-    s.set_defaults(fn=cmd_user_create)
-
-    s = sub.add_parser("onboard", help="onboard the person on a Grit Onboarding item: the AD "
-                                       "account, then groups in Entra (the licence is ordered from the reseller), then the "
-                                       "steps ticked off in Grit")
-    s.add_argument("ref", help="the Grit item's number, e.g. 20261007-13")
-    s.add_argument("--like", metavar="USER",
-                   help="template account for OU, licences and groups; default is the item's "
-                        "\"Samma rättigheter som\"")
-    s.add_argument("--no-template-groups", dest="no_template_groups", action="store_true",
-                   help="take the OU and licences from the template, not its groups")
-    s.add_argument("--group", action="append", metavar="GROUP",
-                   help="an Entra group to add, by name, mail or id; repeatable")
-    s.add_argument("--license", action="append", metavar="SKU",
-                   help="licence by part number (SPB) or skuId; replaces the template's")
-    s.add_argument("--ou", metavar="DN", help="AD OU; default is the template's")
-    s.add_argument("--upn", help="default is firstname.lastname@ the item's domain")
-    s.add_argument("--domain", help="default is the item's \"Primär e-postdomän\"")
-    s.add_argument("--display-name", dest="display_name", metavar="NAME",
-                   help="default is the name in the item's title")
-    s.add_argument("--department", metavar="NAME", help="default is the template's")
-    s.add_argument("--manager", metavar="USER", help="default is the item's \"Chef\"")
-    s.add_argument("--usage-location", dest="usage_location", metavar="CC",
-                   help="licensing country; default the template's, else SE")
-    s.add_argument("--host", metavar="DC", help="as for user create")
-    s.add_argument("--ad-user", dest="ad_user", metavar="USER", help="as for user create")
-    s.add_argument("--via", choices=("winrm", "azure"), help="as for user create")
-    s.add_argument("--no-grit", dest="no_grit", action="store_true",
-                   help="do not tick anything off in Grit")
-    s.add_argument("--dry-run", action="store_true",
-                   help="print the plan, check the name and the OU, write nothing")
-    s.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
-    s.set_defaults(fn=cmd_user_onboard)
-
-    s = sub.add_parser("onprem-find", help="who in the AD forest already answers to this "
-                                          "name, deleted objects included")
-    s.add_argument("query", help="a UPN, a samAccountName, or part of a name")
-    s.add_argument("--host", metavar="DC", help="default WSG_AD_HOST or the configured one")
-    s.add_argument("--ad-user", dest="ad_user", metavar="USER",
-                   help="AD account that signs in to the DC; default WSG_AD_USER or the "
-                        "configured one")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_user_onprem_find)
-
-    s = sub.add_parser("onprem-check", help="can we reach the domain controller, and does "
-                                            "Entra Connect run there")
-    s.add_argument("--host", metavar="DC", help="default WSG_AD_HOST or the configured one")
-    s.add_argument("--ad-user", dest="ad_user", metavar="USER",
-                   help="AD account that signs in to the DC; default WSG_AD_USER or the "
-                        "configured one")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_user_onprem_check)
-
-
-def _add_graph_commands(sub, visible=True):
+def _add_graph_commands(sub, visible=True, client=None, scopes=DEFAULT_SCOPES, sendmail=True):
     """Graph subcommands. Registered under `wsg graph` and, for compatibility with
-    scripts written against 0.1 (`wsg token --header`), as hidden top-level aliases."""
+    scripts written against 0.1 (`wsg token --header`), as hidden top-level aliases.
+    wsg-admin-cli registers them a third time as `wsg admin`, against its own app
+    (client) and scopes, without sendmail: mail goes out as yourself, from the
+    ordinary login."""
     # argparse lists a subcommand in --help only when the `help` kwarg is present,
     # so the aliases are added without one.
     h = (lambda t: {"help": t}) if visible else (lambda t: {})
+    client = client or auth.CORE
 
-    s = sub.add_parser("login", **h("sign in interactively and cache the token"))
-    s.add_argument("--scopes", help="comma separated, default is the full list in wsg/scopes.py")
+    def add(name, **kw):
+        s = sub.add_parser(name, **kw)
+        s.set_defaults(client=client, default_scopes=scopes)
+        return s
+
+    s = add("login", **h("sign in interactively and cache the token"))
+    s.add_argument("--scopes", help="comma separated, default is the whole set this login is for")
     s.add_argument("--open", action="store_true", help="open the default browser instead of just printing the URL")
     s.add_argument("--browser", metavar="NAME", help="open in this browser: edge, chrome, firefox, or an executable")
     s.add_argument("--device", action="store_true", help="use device code flow (for machines without a browser)")
@@ -2793,19 +596,24 @@ def _add_graph_commands(sub, visible=True):
     s.add_argument("--timeout", type=int, default=600, help="seconds to wait for the browser, default 600")
     s.set_defaults(fn=cmd_graph_login)
 
-    s = sub.add_parser("token", **h("print a valid access token, refreshing silently"))
+    s = add("token", **h("print a valid access token, refreshing silently"))
     s.add_argument("--scopes", help="require these scopes (comma separated)")
     s.add_argument("--header", action="store_true", help="print as 'Bearer <token>'")
     s.set_defaults(fn=cmd_graph_token)
 
-    s = sub.add_parser("status", **h("show who is signed in and what was granted"))
+    s = add("status", **h("show who is signed in and what was granted"))
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_graph_status)
 
-    s = sub.add_parser("whoami", **h("call Graph /me"))
+    s = add("whoami", **h("call Graph /me"))
     s.set_defaults(fn=cmd_graph_whoami)
 
-    s = sub.add_parser("sendmail", **h("send mail as yourself via /me/sendMail; body read from stdin"))
+    if not sendmail:
+        s = add("logout", **h("delete the cached token"))
+        s.set_defaults(fn=cmd_graph_logout)
+        return
+
+    s = add("sendmail", **h("send mail as yourself via /me/sendMail; body read from stdin"))
     s.add_argument("--to", required=True, help="recipient, or several comma-separated")
     s.add_argument("--cc", help="cc recipients, comma-separated")
     s.add_argument("--subject", required=True)
@@ -2816,7 +624,7 @@ def _add_graph_commands(sub, visible=True):
     s.add_argument("--dry-run", action="store_true", help="print the exact request and send nothing")
     s.set_defaults(fn=cmd_graph_sendmail)
 
-    s = sub.add_parser("logout", **h("delete the cached token"))
+    s = add("logout", **h("delete the cached token"))
     s.set_defaults(fn=cmd_graph_logout)
 
 
@@ -3469,382 +1277,87 @@ def _add_secret_commands(sub):
     s.set_defaults(fn=cmd_secret_delete)
 
 
-# ── Garp ERP ──────────────────────────────────────────────────────────────────
-# The ERP half of the same question. `wsg ongoing last` says whether the warehouse
-# got the order; this says whether Garp ever sent it. Read together they locate the
-# stop, which neither can do alone.
+# ── skill and update ──────────────────────────────────────────────────────────
+# The same pair e37-cli has (2026-10-07): a colleague's Claude installs wsg from
+# INSTALL-FOR-CLAUDE.md, writes the skill, and later updates both with one command.
+
+REPO = "Wesports-Scandinavia-AB/wsg-cli"
 
 
-def cmd_garp_last(a):
-    try:
-        rows = garp.last_per_channel(a.company, days=a.days)
-    except auth.AuthError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-
-    names = ongoing.channel_names()
-    print(f"GARP   senaste order per kanal, senaste {a.days} dygnen\n")
-    waiting_total = 0
-    for comp in sorted({(r["company"], r["companyName"]) for r in rows}):
-        mine = [r for r in rows if r["company"] == comp[0]]
-        if not mine:
-            continue
-        # Letter codes are named B2B salespeople with their own rhythm; numeric ones
-        # are the webshops and marketplaces this is really about.
-        mine = [r for r in mine if a.all or r["channel"].isdigit() or r["waiting"]]
-        print(f"{comp[1].upper()} ({comp[0]}) — {len(mine)} kanaler")
-        w = max([len(_label(r["channel"], names, None)) for r in mine] + [22]) if mine else 22
-        for r in sorted(mine, key=lambda r: r["createdAt"] or ""):
-            waiting_total += r["waiting"]
-            # A queue that is not draining is the finding; say how old its head is.
-            q = ""
-            if r["waiting"]:
-                q = f"  väntar {r['waiting']:>3}"
-                if r["oldestWaitingAt"]:
-                    q += f", äldsta {_for(r['oldestWaitingAt'])}"
-            print(f"  {_label(r['channel'], names, None):{w}}{_for(r['createdAt']):>13}"
-                  f"  {str(r['order'] or ''):>10}{q}")
-        print()
-
-    if waiting_total:
-        # Saying "the handover is broken" here was wrong: orders wait on stock, on
-        # holds, on split deliveries, and the count sits in the dozens on a healthy
-        # day. Only the warehouse can settle it, so point at it instead of guessing.
-        print(f"{waiting_total} ordrar saknar plocklista. Det är inte ett fel i sig — "
-              f"ordrar väntar också på lagersaldo och spärrar.")
-        print("Jämför med `wsg ongoing last`: får lagret ordrar nu hålls de av något "
-              "annat skäl, är lagret tyst samtidigt är det överlämningen som står.")
-    else:
-        print("Inga ordrar väntar på plocklista.")
-    return 1 if waiting_total else 0
+def _skill_text():
+    from importlib.resources import files
+    return files("wsg").joinpath("skill/SKILL.md").read_text(encoding="utf-8")
 
 
-def _add_garp_commands(sub):
-    s = sub.add_parser("last", help="latest order per channel in Garp, and what has no picking list")
-    s.add_argument("--company", help="002 / 013, or a configured name; default is both")
-    s.add_argument("--days", type=int, default=2, metavar="N", help="look back N days (default 2)")
-    s.add_argument("--all", action="store_true", help="include B2B salespeople with nothing waiting")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_garp_last)
-
-
-# ── Garp SQL ──────────────────────────────────────────────────────────────────
-# The same box as `wsg garp`, the other door. The REST API on 8443 answers what
-# Garp was built to answer; the SQL mirror on 1433 answers the rest, and carries
-# the integration databases that never went near the ERP.
-
-
-def _print_rows(rows, empty="Inga rader."):
-    """Left-align text, right-align numbers, and let the widest value set the column."""
-    if not rows:
-        print(empty)
-        return
-    cols = list(rows[0].keys())
-    numeric = {c: all(isinstance(r.get(c), (int, float)) or r.get(c) is None for r in rows)
-               for c in cols}
-    def cell(v):
-        return "" if v is None else str(v)
-    width = {c: max([len(c)] + [len(cell(r.get(c))) for r in rows]) for c in cols}
-    print("  ".join(c.ljust(width[c]) if not numeric[c] else c.rjust(width[c]) for c in cols))
-    print("  ".join("-" * width[c] for c in cols))
-    for r in rows:
-        print("  ".join(cell(r.get(c)).ljust(width[c]) if not numeric[c]
-                        else cell(r.get(c)).rjust(width[c]) for c in cols))
-
-
-def cmd_garpdb_check(a):
-    try:
-        row = garpdb.check()
-    except garpdb.GarpDbError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    print(f"Server:    {row.get('server_name')}")
-    print(f"Version:   {row.get('version')}")
-    print(f"Login:     {row.get('login_name')}")
-    print(f"Databas:   {row.get('database_name')}")
-    reads = "ja" if row.get("datareader") else "nej"
-    denied = "ja" if row.get("denydatawriter") else "nej"
-    print(f"Lasratt:   {reads}    skrivsparr: {denied}")
-    if row.get("sysadmin"):
-        # Worth saying plainly: the read-only promise in the module docstring
-        # rests on db_denydatawriter, and sysadmin ignores it.
-        print("\nVARNING: det har loginet ar sysadmin. Skrivsparren galler inte for det.")
+def cmd_skill_show(a):
+    print(_skill_text())
     return 0
 
 
-def cmd_garpdb_databases(a):
-    try:
-        rows = garpdb.databases()
-    except garpdb.GarpDbError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    open_ = [r for r in rows if r.get("has_access")]
-    shut = [r for r in rows if not r.get("has_access")]
-    for r in rows:
-        r["has_access"] = "ja" if r["has_access"] else "nej"
-    _print_rows(rows, "Inga databaser.")
-    print(f"\n{len(open_)} oppna for loginet, {len(shut)} stangda.")
-    return 0
+def cmd_skill_install(a):
+    """Put SKILL.md where Claude Code finds it, so later conversations know wsg.
 
-
-def cmd_garpdb_tables(a):
-    try:
-        rows = garpdb.tables(a.db)
-    except garpdb.GarpDbError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    _print_rows(rows, "Databasen har inga tabeller, eller inga som loginet ser.")
-    return 0
-
-
-def cmd_garpdb_query(a):
-    sql = a.sql
-    if not sql:
-        if sys.stdin.isatty():
-            print("Ge fragan som argument eller pipa in den pa stdin.", file=sys.stderr)
-            return 2
-        sql = _stdin_text()
-    try:
-        rows = garpdb.query(sql, a.db, timeout=a.timeout)
-    except garpdb.GarpDbError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    if a.json:
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
-        return 0
-    _print_rows(rows)
-    if rows:
-        print(f"\n{len(rows)} rader.")
-    return 0
-
-
-def _add_garpdb_commands(sub):
-    s = sub.add_parser("check", help="who the login is on the instance, and what it may do")
-    s.set_defaults(fn=cmd_garpdb_check)
-
-    s = sub.add_parser("databases", help="every database on the instance, and which ones the login may open")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_garpdb_databases)
-
-    s = sub.add_parser("tables", help="tables in one database with row counts and size")
-    s.add_argument("--db", help=f"database to read (default {garpdb.DEFAULT_DATABASE})")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_garpdb_tables)
-
-    s = sub.add_parser("query", help="run one SELECT; the statement may also come from stdin")
-    s.add_argument("sql", nargs="?", help="the SELECT to run; omit it to read from stdin")
-    s.add_argument("--db", help=f"database to read (default {garpdb.DEFAULT_DATABASE})")
-    s.add_argument("--timeout", type=int, default=180, metavar="S", help="seconds to wait (default 180)")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_garpdb_query)
-
-
-# ── Ongoing WMS ───────────────────────────────────────────────────────────────
-# Our own client, straight at the warehouse. Ongoing can say whether it got an
-# order; it cannot say why it did not, because it knows nothing about the webshop
-# or the ERP. Read it as evidence, not as a verdict.
-
-
-def cmd_ongoing_accounts(a):
-    try:
-        rows = ongoing.accounts()
-    except auth.AuthError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    if a.json:
-        # The key never leaves the config file, not even into a script's stdout.
-        print(json.dumps([{k: v for k, v in r.items() if k != "key"} for r in rows],
-                         indent=2, ensure_ascii=False))
-        return 0
-    print(f"konfiguration  {ongoing.config_path()}\n")
-    for r in rows:
-        print(f"  {r['name']:14} {r['url']:52} goodsOwnerId={r['goodsOwnerId']}  "
-              f"api-användare {r['user']}")
-    return 0
-
-
-def _label(code, names, account=None):
-    """A channel as `code name`, or the bare code when the map has never heard of it.
-
-    The map is one goods owner's numbering, so it is only applied to that owner's
-    rows. That matters most for the EMPTY code: on Vartex it means the vartex.se
-    dealer portal, but on Rawbike or Living Sport an order with no marketPlace is
-    simply their own — labelling it vartex.se would be a plain lie.
+    Overwritten on every install: the file comes from this package, and an
+    upgrade should bring the instructions along with the code they describe.
     """
-    owner = names.get("__account__")
-    if owner and account and owner.lower() != account.lower():
-        return code or "(utan kanal)"
-    name = (names.get(code or "") or {}).get("name")
-    if not name:
-        return code or "(utan kanal)"
-    return f"{(code or '—'):5}{name}"
-
-
-def cmd_ongoing_last(a):
-    try:
-        if a.sweep or not ongoing.channel_names():
-            result = ongoing.last_per_channel(a.account, days=a.days, max_orders=a.top)
-        else:
-            result = ongoing.last_by_query(a.account)
-    except auth.AuthError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    if a.json:
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        return 0
-    rows = result["channels"]
-    # Names come from a local map built out of pulse; missing is normal, not an error.
-    names = ongoing.channel_names()
-
-    # Asking per channel reaches every code the register has ever had, including ones
-    # retired years ago — MP Cdon.dk last sold 853 days ago. A dead code is not a quiet
-    # channel, and listing them buries the ones that mean something. The cutoff is
-    # generous enough that a genuinely seasonal channel survives it.
-    dormant = []
-    if result.get("mode") == "query" and not a.all:
-        keep = []
-        for r in rows:
-            age = _dt(r["createdAt"])
-            days_ago = (datetime.now(age.tzinfo) - age).days if age else 0
-            (keep if days_ago <= a.dormant else dormant).append(r)
-        rows = keep
-
-    if result.get("mode") == "query":
-        # One query per known channel: no window to disclose, because each answer is
-        # that channel's latest order however old it is.
-        print(f"LAGRET   senaste order per kanal, en fråga per kanal ur registret")
-    else:
-        window = f"senaste {a.days} dygnen" if a.days else f"de {a.top} senaste ordrarna"
-        print(f"LAGRET   senaste order per kanal, ur {window}")
-    if result.get("reach"):
-        # The weakest account's reach — that is the coverage of the whole answer.
-        who = f", svagast: {result['reachAccount']}" if result.get("reachAccount") else ""
-        print(f"         täcker tillbaka till {_ts(result['reach'])} "
-              f"({_for(result['reach'])} sedan{who})")
-    print()
-    if not rows:
-        print("  Inga ordrar i fönstret.")
-        return 0
-    # Grouped per goods owner rather than one flat age-sorted list: these are separate
-    # legal entities sharing a warehouse, and a row means nothing until you know whose
-    # it is. Group order is config order, which puts the main goods owner first.
-    for acc in result.get("accounts") or [{"name": r["account"]} for r in rows]:
-        mine = [r for r in rows if r["account"] == acc["name"]]
-        if not mine:
-            continue
-        owner = f" (goodsOwnerId {acc['goodsOwnerId']})" if acc.get("goodsOwnerId") else ""
-        n = f"{len(mine)} {'kanal' if len(mine) == 1 else 'kanaler'}"
-        print(f"{acc['name'].upper()}{owner} — {n}")
-        w = max([len(_label(r["channel"], names, acc["name"])) for r in mine] + [22])
-
-        def line(r):
-            # referenceNumber where there is one, otherwise the order number — which
-            # on some accounts is a customer name, so the column is "whatever the
-            # warehouse calls this order" rather than an order number.
-            ref = r.get("reference") or r.get("orderNumber") or ""
-            print(f"  {_label(r['channel'], names, acc['name']):{w}}{_for(r['createdAt']):>13}"
-                  f"  {ref:16} {r.get('status') or ''}")
-
-        # Storefront groups come from pulse's migration and cover only the domains it
-        # named, so most channels have none. Group order is fixed rather than derived:
-        # a block that moves between runs is a block you have to re-find every time.
-        owner_ok = not names.get("__account__") or \
-            names["__account__"].lower() == acc["name"].lower()
-        buckets = {}
-        for r in mine:
-            g = (names.get(r["channel"] or "") or {}).get("group") if owner_ok else None
-            buckets.setdefault(g, []).append(r)
-        order = [g for g in ("Vartex Outdoor", "Vartex Fitness", "Vartex MC") if g in buckets]
-        order += sorted(g for g in buckets if g and g not in order)
-        blocks = [(g, buckets[g]) for g in order]
-        if buckets.get(None):
-            blocks.append(("Ogrupperade i pulse" if order else None, buckets[None]))
-
-        # Summary first: one line per group with its freshest order. A group that is
-        # minutes old next to one that is hours old is the comparison worth making,
-        # and it should not require reading to the end of every block to find. Same
-        # order as the detail below, so a summary line maps onto a block by position
-        # rather than by searching.
-        if len(blocks) > 1 or a.summary:
-            gw = max(len(g or "") for g, _ in blocks)
-            # _label pads the code into a column; a summary line wants it tight, but
-            # the "äldst" half still has to line up across rows to be scannable.
-            tight = lambda r: " ".join(_label(r["channel"], names, acc["name"]).split())
-            nw = max(len(tight(b[-1])) for _, b in blocks)
-            for g, bucket in blocks:
-                newest = bucket[-1]           # rows are oldest-first
-                who = f"{tight(newest):{nw}}" if a.summary else tight(newest)
-                # The oldest is the one worth acting on, so a summary that hides the
-                # rows still has to say how far behind the group's slowest channel is.
-                oldest = bucket[0]
-                behind = ""
-                if len(bucket) > 1 and a.summary:
-                    behind = f"   äldst {_for(oldest['createdAt']):>11}: {tight(oldest)}"
-                print(f"  {(g or ''):{gw}}  {_for(newest['createdAt']):>13}  {who}{behind}")
-            print()
-
-        if a.summary:
-            continue
-        for g, bucket in blocks:
-            if g:
-                print(f"  ── {g}")
-            for r in bucket:
-                line(r)
-        print()
-    # A channel absent here is not idle. Whether that absence carries any
-    # information at all depends on whether the sweep was cut short.
-    owner = names.get("__account__")
-    unknown = sorted({r["channel"] for r in rows
-                      if (not owner or r["account"].lower() == owner.lower())
-                      and not (names.get(r["channel"] or "") or {}).get("name")})
-    unknown = [u for u in unknown if u]      # the empty code is a channel, not a gap
-    if unknown and names:
-        # A code the map has not heard of is a channel nobody told pulse about.
-        print(f"Utan namn i kanalkartan: {', '.join(unknown)} "
-              f"— lägg till i pulse och kör scripts/channels-from-pulse.py.\n")
-    print(f"{len(rows)} {'kanal' if len(rows) == 1 else 'kanaler'} totalt.", end=" ")
-    if result.get("mode") == "query":
-        if dormant:
-            print(f"{len(dormant)} vilande (ingen order på {a.dormant} dygn, --all visar dem).", end=" ")
-        # The register is the channel list here, so a channel outside it is invisible
-        # — the opposite blind spot to the sweep's, and worth naming as such.
-        print("Kanaler utanför Garps register syns inte — kör --sweep för att leta.")
-    elif result.get("capped"):
-        print(f"Hämtningen slog i taket på {a.top} ordrar, så en kanal som saknas "
-              f"säger ingenting — höj --top.")
-    else:
-        print("Ingen kanal utöver dessa har en order i fönstret.")
+    target = Path(a.dir).expanduser() if a.dir else Path.home() / ".claude" / "skills" / "wsg"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "SKILL.md").write_text(_skill_text(), encoding="utf-8")
+    print(f"Skill installerad: {target / 'SKILL.md'}")
     return 0
 
 
-def _add_ongoing_commands(sub):
-    s = sub.add_parser("accounts", help="the configured Ongoing accounts (never the key)")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_ongoing_accounts)
+def cmd_update(a):
+    """Reinstall from GitHub, then refresh the skill with the NEW code.
 
-    s = sub.add_parser("last", help="how long since the warehouse last got an order, per channel")
-    s.add_argument("--account", help="one configured account; default is all of them")
-    s.add_argument("--days", type=int, help="look back N days instead of the newest --top orders")
-    s.add_argument("--top", type=int, default=ongoing.DEFAULT_MAX_ORDERS, metavar="N",
-                   help=f"how many recent orders to sweep (default {ongoing.DEFAULT_MAX_ORDERS})")
-    s.add_argument("--all", action="store_true", help="include dormant channels")
-    s.add_argument("--dormant", type=int, default=90, metavar="DAYS",
-                   help="a channel with no order in this many days is dormant (default 90)")
-    s.add_argument("--sweep", action="store_true",
-                   help="fetch every order in the window instead of one per known channel")
-    s.add_argument("-s", "--summary", action="store_true",
-                   help="one line per group, newest and oldest; no channel rows")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_ongoing_last)
+    --force-reinstall because pip treats a URL whose version did not change as
+    already satisfied, and main moves between version bumps. --user only outside
+    a virtualenv, where it is refused. The skill step runs in a fresh process so
+    it writes the new SKILL.md, not the one this old process has loaded.
+
+    An editable install (pip install -e, a clone you work in) is left alone: the
+    clone is the version, and `git pull` is how it moves. Reinstalling over it
+    would swap the clone for a copy and stop your edits from taking effect.
+    """
+    import shutil
+    import subprocess
+    from importlib.metadata import distribution
+    from . import __version__
+
+    def editable(name):
+        try:
+            raw = distribution(name).read_text("direct_url.json") or "{}"
+        except Exception:
+            return False
+        return bool(json.loads(raw).get("dir_info", {}).get("editable"))
+
+    if editable("wsg-cli"):
+        print("wsg-cli är installerat från en lokal klon (pip install -e). Uppdatera med git pull där.",
+              file=sys.stderr)
+        return 1
+    url = (f"git+https://github.com/{REPO}" if shutil.which("git")
+           else f"https://github.com/{REPO}/archive/refs/heads/main.zip")
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "--no-deps",
+           "--quiet", "--disable-pip-version-check", f"wsg-cli @ {url}"]
+    if sys.prefix == sys.base_prefix:
+        cmd.insert(4, "--user")
+    print(f"Hämtar senaste wsg-cli (har {__version__}) ...", file=sys.stderr)
+    if subprocess.run(cmd).returncode:
+        print("Uppdateringen misslyckades, se pip-utskriften ovan.", file=sys.stderr)
+        return 1
+    new = subprocess.run([sys.executable, "-c", "import wsg; print(wsg.__version__)"],
+                         capture_output=True, text=True).stdout.strip()
+    subprocess.run([sys.executable, "-m", "wsg", "skill", "install"])
+    print(f"wsg-cli {__version__} -> {new or '?'}")
+    return 0
+
+
+def _add_skill_commands(sub):
+    s = sub.add_parser("install", help="write SKILL.md to ~/.claude/skills/wsg/ for Claude Code")
+    s.add_argument("--dir", help="another directory than ~/.claude/skills/wsg")
+    s.set_defaults(fn=cmd_skill_install)
+    s = sub.add_parser("show", help="print the skill")
+    s.set_defaults(fn=cmd_skill_show)
 
 
 def main(argv=None):
@@ -3859,37 +1372,26 @@ def main(argv=None):
     p = argparse.ArgumentParser(
         prog="wsg",
         description="Sign in once per service, reuse the token from any script. "
-                    "Services: graph (Microsoft Graph via Entra), arena (WeSports Arena via Cloudflare Access).",
+                    "Services: graph (Microsoft Graph via Entra), arena (WeSports Arena), "
+                    "secret (one-time links).",
+        epilog="If you are an assistant: run `wsg skill show` for how to use this tool. Never ask\n"
+               "for a password or token in the chat; every sign-in prints a URL the person opens\n"
+               "themselves.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    # metavar hides the compatibility aliases from the usage line.
+    from . import __version__
+    p.add_argument("--version", action="version", version=f"wsg-cli {__version__}")
+    plugins = _plugins("wsg.commands")
+    # metavar hides the compatibility aliases from the usage line. Plugin commands are
+    # not in it; they show in --help under their own names.
     sub = p.add_subparsers(dest="cmd", required=True,
-                           metavar="{graph,user,device,arena,intune,ongoing,garp,garpdb,calendar,planner,secret}")
+                           metavar="{graph,arena,calendar,planner,secret,skill,update" + (",..." if plugins else "") + "}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
 
-    us = sub.add_parser("user", help="M365/Entra accounts: state, licences, sign-ins, audit trail")
-    _add_user_commands(us.add_subparsers(dest="user_cmd", required=True))
-
-    dv = sub.add_parser("device", help="Windows clients: who has one, and handing it to "
-                                       "someone else")
-    _add_device_commands(dv.add_subparsers(dest="device_cmd", required=True))
-
     ar = sub.add_parser("arena", help="WeSports Arena, signed in with Arena's own OAuth")
     _add_arena_commands(ar.add_subparsers(dest="arena_cmd", required=True))
-
-    it = sub.add_parser("intune", help="Intune app management: list, status, publish Store and Win32 apps")
-    _add_intune_commands(it.add_subparsers(dest="intune_cmd", required=True))
-
-    og = sub.add_parser("ongoing", help="Ongoing WMS directly: what the warehouse has actually received")
-    _add_ongoing_commands(og.add_subparsers(dest="ongoing_cmd", required=True))
-
-    ga = sub.add_parser("garp", help="Garp ERP, read-only: what the ERP took in and has not handed over")
-    _add_garp_commands(ga.add_subparsers(dest="garp_cmd", required=True))
-
-    gd = sub.add_parser("garpdb", help="Garp's SQL Server directly, read-only: the ERP mirror and "
-                                       "the integration databases beside it")
-    _add_garpdb_commands(gd.add_subparsers(dest="garpdb_cmd", required=True))
 
     ca = sub.add_parser("calendar", help="mirror a private booking onto the work calendar as busy")
     _add_calendar_commands(ca.add_subparsers(dest="calendar_cmd", required=True))
@@ -3900,10 +1402,25 @@ def main(argv=None):
     se = sub.add_parser("secret", help="one-time links on secrets.wesports.io, encrypted before they leave")
     _add_secret_commands(se.add_subparsers(dest="secret_cmd", required=True))
 
+    sk = sub.add_parser("skill", help="the Claude skill for wsg: install, show")
+    _add_skill_commands(sk.add_subparsers(dest="skill_cmd", required=True))
+
+    s = sub.add_parser("update", help="get the latest wsg-cli from GitHub and refresh the Claude skill")
+    s.set_defaults(fn=cmd_update)
+
+    for ep in plugins:
+        ep.load()(sub)
+
     _add_graph_commands(sub, visible=False)   # wsg login / token / status / whoami / logout
 
     a = p.parse_args(argv)
-    return a.fn(a)
+    # Most commands catch a missing login themselves; the ones that do not used to
+    # end in a traceback. The message already names the login to run.
+    try:
+        return a.fn(a)
+    except auth.AuthError as e:
+        print(str(e), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

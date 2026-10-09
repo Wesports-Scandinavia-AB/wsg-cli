@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wsg-cli"
-version = "0.4.0"
-description = "Sign in to Microsoft Graph once, reuse the token from any script."
+dynamic = ["version"]
+description = "Sign in once to Microsoft Graph and WeSports Arena as yourself, reuse the token from any script."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -16,3 +16,11 @@ wsg = "wsg.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+wsg = ["skill/*.md"]
+
+# One place for the version: until 0.5.0 it lived here and in __init__.py, and
+# they had drifted (0.4.0 here, 0.3.0 there).
+[tool.setuptools.dynamic]
+version = {attr = "wsg.__version__"}
