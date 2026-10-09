@@ -48,10 +48,12 @@ DEFAULT_SCOPES = [
     # Teams-chatt: skriva till en kollega i 1:1. Chat.Create hittar eller skapar
     # chatten (POST /chats returnerar den befintliga), ChatMessage.Send postar i den.
     # Chat.Read läser chattar, inklusive inklistrade bilder (hostedContents) som
-    # M365-connectorn inte visar.
+    # M365-connectorn inte visar. ChatMember.ReadWrite lägger till och tar bort
+    # medlemmar, till exempel för att lämna en gruppchatt.
     "Chat.Create",
     "ChatMessage.Send",
     "Chat.Read",
+    "ChatMember.ReadWrite",
     # Intune
     "DeviceManagementManagedDevices.Read.All",
     "DeviceManagementManagedDevices.ReadWrite.All",
