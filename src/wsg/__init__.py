@@ -5,7 +5,7 @@
     arena.get("/api/me")               # WeSports Arena, Cloudflare Access
 """
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 from . import auth as graph  # noqa: E402,F401
 from . import arena  # noqa: E402,F401

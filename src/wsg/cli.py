@@ -1192,6 +1192,88 @@ def _add_planner_commands(sub):
     s.set_defaults(fn=cmd_planner_task)
 
 
+# ── Teams ─────────────────────────────────────────────────────────────────────
+# Posting in a chat as yourself. The text is markdown and goes out as the HTML
+# Teams shows; see teams.py for why Graph needs it that way. Before 0.6.0 every
+# script that wrote to Teams carried its own copy of the token call, the POST and
+# a markdown converter on a third-party package.
+
+def _message_text(a):
+    """The message from the arguments, or from stdin when there are none."""
+    if a.text:
+        return " ".join(a.text)
+    if sys.stdin.isatty():
+        return ""
+    return _stdin_text()
+
+
+def cmd_teams_send(a):
+    from . import teams
+
+    text = _message_text(a).strip()
+    if not text:
+        print("Tom text, inget skickat. Ge texten som argument eller på stdin.", file=sys.stderr)
+        return 2
+    content = text if a.html else teams.to_html(text)
+    target = a.chat or f"1:1-chatten med {a.to}"
+
+    if a.dry_run:
+        print(f"[torrkörning] till {target} - inget skickat")
+        print(text)
+        print("--- som HTML:")
+        print(content)
+        return 0
+
+    try:
+        chat = a.chat or teams.chat_with(a.to)
+        r = teams.send(chat, content)
+    except Exception as e:  # urllib raises HTTPError; its body carries Graph's reason
+        detail = ""
+        read = getattr(e, "read", None)
+        if callable(read):
+            try:
+                detail = ": " + read().decode(errors="replace")[:400]
+            except Exception:
+                detail = ""
+        print(f"Sändningen misslyckades{detail or ': ' + str(e)}", file=sys.stderr)
+        return 2
+    if a.sent_log:
+        # A loop that answers in a chat tells its own messages from the ones the
+        # person typed by these ids.
+        with open(a.sent_log, "a", encoding="utf-8") as f:
+            print(r["id"], file=f)
+    if a.json:
+        print(json.dumps({"chatId": chat, "id": r["id"], "createdDateTime": r["createdDateTime"]}))
+    else:
+        print(f"Skickat till {target}: {r['id']} {_ts(r['createdDateTime'])}")
+    return 0
+
+
+def cmd_teams_md(a):
+    from . import teams
+
+    sys.stdout.write(teams.to_html(_message_text(a)))
+    print()
+    return 0
+
+
+def _add_teams_commands(sub):
+    s = sub.add_parser("send", help="post a message in a chat as yourself; markdown in, Teams HTML out")
+    who = s.add_mutually_exclusive_group(required=True)
+    who.add_argument("--to", metavar="ADDRESS", help="the 1:1 chat with this person, found or made by address")
+    who.add_argument("--chat", metavar="CHAT-ID", help="a chat by id, e.g. a group chat 19:...@thread.v2")
+    s.add_argument("text", nargs="*", help="the message; read from stdin when left out")
+    s.add_argument("--html", action="store_true", help="the text is HTML already, send it as it is")
+    s.add_argument("--dry-run", action="store_true", help="print the text and its HTML, send nothing")
+    s.add_argument("--sent-log", metavar="FILE", help="append the sent message's id to this file")
+    s.add_argument("--json", action="store_true", help="print chatId, id and createdDateTime as JSON")
+    s.set_defaults(fn=cmd_teams_send)
+
+    s = sub.add_parser("md", help="print the Teams HTML for a markdown text, send nothing")
+    s.add_argument("text", nargs="*", help="the text; read from stdin when left out")
+    s.set_defaults(fn=cmd_teams_md)
+
+
 # ── One-time links (secrets.wesports.io) ──────────────────────────────────────
 # How a credential leaves this machine for someone else: as a link that burns on
 # first read, never as text in a mail or a Teams thread, which are archived,
@@ -1385,7 +1467,7 @@ def main(argv=None):
     # metavar hides the compatibility aliases from the usage line. Plugin commands are
     # not in it; they show in --help under their own names.
     sub = p.add_subparsers(dest="cmd", required=True,
-                           metavar="{graph,arena,calendar,planner,secret,skill,update" + (",..." if plugins else "") + "}")
+                           metavar="{graph,arena,calendar,planner,teams,secret,skill,update" + (",..." if plugins else "") + "}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
@@ -1398,6 +1480,9 @@ def main(argv=None):
 
     pl = sub.add_parser("planner", help="Planner boards, read-only: what is on them and what is mine")
     _add_planner_commands(pl.add_subparsers(dest="planner_cmd", required=True))
+
+    te = sub.add_parser("teams", help="Teams chat: post as yourself, markdown in, Teams HTML out")
+    _add_teams_commands(te.add_subparsers(dest="teams_cmd", required=True))
 
     se = sub.add_parser("secret", help="one-time links on secrets.wesports.io, encrypted before they leave")
     _add_secret_commands(se.add_subparsers(dest="secret_cmd", required=True))

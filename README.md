@@ -69,6 +69,9 @@ wsg planner mine       tasks assigned to you, nearest due first
 wsg planner task ID    one task with its description and checklist
 wsg planner link X     the address of one board, --bare for the URL alone
 
+wsg teams send         post in a Teams chat as yourself, markdown in, --dry-run first
+wsg teams md           print the Teams HTML for a markdown text, send nothing
+
 wsg secret create      encrypt a value or --file here, print a one-time link
 wsg secret delete      destroy a link before it is opened
 
@@ -207,6 +210,35 @@ attachment. Above that ceiling the file needs `createUploadSession` against a dr
 or OneDrive and a link; this command refuses up front rather than failing halfway.
 
 Needs `Mail.Send`, which is in the default scope set.
+
+## Teams messages
+
+`teams send` posts in a chat as the signed-in user. `--to ADDRESS` finds the 1:1
+chat with that person — `POST /chats` returns the one you already share, or makes
+it — and `--chat ID` posts in a chat you know the id of, such as a group chat.
+
+```
+wsg teams send --to someone@example.com --dry-run <<'EOF'
+**Done!** Here's how:
+1. Open settings
+2. Paste the `key`
+EOF
+```
+
+Graph does not render markdown: sent as text, `**bold**` keeps its asterisks.
+The text is therefore markdown, converted to the HTML subset Teams shows (bold,
+italic, strikethrough, inline code, code blocks, links, headings, quotes, tables
+and lists) and sent as `contentType: html`. It reads like chat rather than strict
+markdown: a line break stays a line break, and a list directly under a line of
+text is a list. `--html` sends HTML as it is; `wsg teams md` prints the HTML
+without sending.
+
+For scripts and loops: `--json` prints `chatId`, `id` and `createdDateTime`, and
+`--sent-log FILE` appends the message id to a file, so a loop can tell its own
+messages from the ones a person typed.
+
+Needs `ChatMessage.Send`, plus `Chat.Create` for `--to`; both are in the default
+scope set.
 
 ## One-time secret links
 

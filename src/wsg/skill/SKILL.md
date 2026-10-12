@@ -1,6 +1,6 @@
 ---
 name: wsg
-description: Logga in som sig själv mot Microsoft 365 (Graph) och WeSports Arena med wsg-cli, och använd det för att skicka mail, läsa Planner-tavlor, skapa engångslänkar för lösenord och nycklar, eller hämta en token till ett eget script. Use when the user wants to send a mail from the terminal, asks what is on a Planner board or what Planner tasks are theirs, needs to hand someone a password or API key safely, asks for a Graph or Arena token, or says "wsg". Exempel "skicka ett mail till Anna med rapporten", "vad har jag i Planner", "vad ligger på tavlan Vartex Service", "skicka lösenordet till Erik på ett säkert sätt", "logga in wsg", "uppdatera wsg".
+description: Logga in som sig själv mot Microsoft 365 (Graph) och WeSports Arena med wsg-cli, och använd det för att skicka mail, skriva i Teams, läsa Planner-tavlor, skapa engångslänkar för lösenord och nycklar, eller hämta en token till ett eget script. Use when the user wants to send a mail or a Teams message from the terminal, asks what is on a Planner board or what Planner tasks are theirs, needs to hand someone a password or API key safely, asks for a Graph or Arena token, or says "wsg". Exempel "skicka ett mail till Anna med rapporten", "skriv till Erik i Teams att det är klart", "vad har jag i Planner", "vad ligger på tavlan Vartex Service", "skicka lösenordet till Erik på ett säkert sätt", "logga in wsg", "uppdatera wsg".
 ---
 
 # wsg: inloggning mot Microsoft 365 och Arena
@@ -43,6 +43,31 @@ EOF
 - `sendmail` skickar direkt, det blir inget utkast. En kopia hamnar i Skickat.
 - `--attach FIL` för bilagor (upprepa för flera), högst cirka 3 MB totalt.
 - `--cc` för kopia, `--html` om texten är HTML.
+
+## Skriva i Teams
+
+```
+python -m wsg teams send --to erik@example.com --dry-run <<'EOF'
+**Klart!** Så här gör du:
+1. Öppna inställningarna
+2. Klistra in `nyckeln`
+EOF
+```
+
+- Texten är markdown och går ut formaterad: fetstil, listor, `kod`, kodblock,
+  citat, tabeller och länkar. En radbrytning blir en radbrytning, och en lista
+  direkt under en textrad blir en lista.
+- `--to ADRESS` skriver i 1:1-chatten med personen (den hittas, eller skapas om den
+  inte finns). `--chat ID` skriver i en bestämd chatt, t.ex. en gruppchatt.
+- Texten tas från argumenten eller från stdin. Kör `--dry-run` först och **visa
+  meddelandet för personen** innan det skickas. Ett skickat meddelande syns direkt
+  hos mottagaren.
+- Formatera efter innehållet: steg som numrerad lista, det mottagaren ska klistra in
+  i ett kodblock, fetstil på det enda som inte får missas. Ett kort svar är en mening
+  utan formatering.
+- `wsg teams md` visar bara HTML:en för en text, utan att skicka något.
+- För script: `--json` skriver ut chatId, id och tid, och `--sent-log FIL` lägger
+  meddelandets id sist i en fil.
 
 ## Planner
 
