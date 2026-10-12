@@ -40,4 +40,8 @@ DEFAULT_SCOPES = [
     "Chat.Create",
     "ChatMessage.Send",
     "Chat.Read",
+    # wsg teams find: /search/query över chattmeddelanden kräver ChannelMessage.Read.All
+    # bredvid Chat.Read, även när alla träffar ligger i chattar (2026-10-12). Delegerat:
+    # bara kanaler personen redan ser i Teams.
+    "ChannelMessage.Read.All",
 ]

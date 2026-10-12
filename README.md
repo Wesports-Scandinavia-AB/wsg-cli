@@ -72,7 +72,7 @@ wsg planner link X     the address of one board, --bare for the URL alone
 wsg teams send         post in a Teams chat as yourself, markdown in, --dry-run first
 wsg teams chats [X]    your chats, most recent first, filtered by topic or member
 wsg teams read         one chat, oldest first: --chat ID, --to ADDRESS or --name TEXT
-wsg teams find TEXT    messages holding TEXT in your most recent chats
+wsg teams find TEXT    search your chats and channels for TEXT, the whole history
 wsg teams md           print the Teams HTML for a markdown text, send nothing
 
 wsg secret create      encrypt a value or --file here, print a one-time link
@@ -246,7 +246,8 @@ Reading:
 wsg teams chats "anna"                         chats whose topic or member matches
 wsg teams read --name "Anna Berg" -n 50        one chat, oldest first, local times
 wsg teams read --to someone@example.com --since 2026-10-12 --images ./img
-wsg teams find "invoice" --chats 40 --days 60  messages holding the text
+wsg teams find "invoice"                       search chats and channels, whole history
+wsg teams find "from:anna invoice" --json      KQL works; JSON has chatId and webLink
 ```
 
 `read --to` looks the 1:1 chat up in your chat list rather than through
@@ -256,13 +257,15 @@ anything ambiguous lists the candidates instead of guessing. `--images DIR`
 downloads pasted images, which sit behind a Graph URL that wants the token.
 `--json` gives raw `createdDateTime`, sender id, text, images and files.
 
-`find` reads your most recent chats and matches the text locally. Graph's
-`/search/query` would search everything, but for chat messages it wants
-`ChannelMessage.Read.All` beside `Chat.Read` — even for chats alone — and that is
-not in the base set. So `find` sees what is recent, not your whole history.
+`find` goes through Graph's `/search/query`, which covers your whole history in
+chats and the channels you can see. For chat messages it wants
+`ChannelMessage.Read.All` beside `Chat.Read` — even when every hit is in a chat —
+which is why that scope is in the base set from 0.8.0. A login without it falls
+back to reading your most recent chats and matching locally, and says so;
+`--recent` (with `--chats` and `--days`) does that on purpose.
 
-Needs `ChatMessage.Send`, `Chat.Create` for `send --to`, and `Chat.Read`; all three
-are in the default scope set.
+Needs `ChatMessage.Send`, `Chat.Create` for `send --to`, `Chat.Read`, and
+`ChannelMessage.Read.All` for `find`; all four are in the default scope set.
 
 ## One-time secret links
 

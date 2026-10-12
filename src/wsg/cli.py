@@ -1359,9 +1359,43 @@ def cmd_teams_read(a):
 
 
 def cmd_teams_find(a):
+    from urllib.error import HTTPError
+
     from . import teams
 
-    since = (datetime.now() - timedelta(days=a.days)).astimezone(
+    if a.recent:
+        return _find_recent(a)
+    try:
+        hits = teams.search(a.query, a.n)
+    except (auth.AuthError, HTTPError) as e:
+        # A login from before 0.8.0 may lack ChannelMessage.Read.All; read the
+        # recent chats rather than fail.
+        print(f"Sökningen gick inte ({e}); letar i de senaste chattarna i stället. "
+              "wsg graph login en gång till ger sökning i hela historiken.", file=sys.stderr)
+        return _find_recent(a)
+    if a.json:
+        print(json.dumps(hits, ensure_ascii=False, indent=2))
+        return 0
+    if not hits:
+        print(f"Inget om \"{a.query}\" i Teams.")
+        return 1
+    # Chat names cost one list call; channel names would need another scope, so a
+    # channel hit is shown as a channel with its link.
+    me = teams.me_id()
+    names = {c["id"]: teams.chat_name(c, me) for c in teams.chats(200)}
+    for h in hits:
+        where = names.get(h["chatId"], "chatt") if h["chatId"] else "kanal"
+        print(f"--- {_ts(h['createdDateTime'])}  {where}  ·  {h['from']}")
+        print(f"    {h['summary']}")
+        print(f"    {h['chatId'] or h['webLink']}")
+    return 0
+
+
+def _find_recent(a):
+    """Read the most recent chats and match here; the fallback without search."""
+    from . import teams
+
+    since =(datetime.now() - timedelta(days=a.days)).astimezone(
         timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     hits = teams.find(a.query, a.chats, since)
     me = teams.me_id()
@@ -1413,10 +1447,11 @@ def _add_teams_commands(sub):
     s.add_argument("--json", action="store_true", help="raw createdDateTime, sender id, text, images and files")
     s.set_defaults(fn=cmd_teams_read)
 
-    s = sub.add_parser("find", help="messages holding a text, in your most recent chats")
-    s.add_argument("query")
-    s.add_argument("--chats", type=int, default=25, help="how many recent chats to read, default 25")
-    s.add_argument("--days", type=int, default=30, help="how far back, default 30 days")
+    s = sub.add_parser("find", help="search your chats and channels for a text, the whole history")
+    s.add_argument("query", help="words, or KQL such as 'from:anna invoice'")
+    s.add_argument("--recent", action="store_true", help="read recent chats and match here instead of searching")
+    s.add_argument("--chats", type=int, default=25, help="with --recent: how many recent chats to read, default 25")
+    s.add_argument("--days", type=int, default=30, help="with --recent: how far back, default 30 days")
     s.add_argument("-n", type=int, default=20, help="show at most N hits, default 20")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_teams_find)

@@ -82,9 +82,12 @@ python -m wsg teams find "returfrakt"         meddelanden som nämner texten
   person ger 1:1-chatten med hen.
 - `--images MAPP` sparar inklistrade bilder och skriver ut sökvägarna. **Titta på
   bilderna**: ofta står frågan i en skärmbild, inte i texten.
-- `find` läser de 25 senaste chattarna 30 dagar bakåt (`--chats`, `--days`) och
-  letar i texten. Det tar en stund och ser bara det som är nyligen. Hittas inget,
-  säg det och fråga om du ska leta längre bakåt.
+- `find` söker i hela historiken, i chattar och kanaler, och visar var och vem.
+  Sökordet kan vara KQL: `find "from:Anna faktura"`. Med chatt-id:t från en träff
+  läser du sedan sammanhanget med `read --chat`.
+- Säger `find` att sökningen inte gick har personen loggat in före 0.8.0. Den letar
+  då bara i de senaste chattarna. `wsg graph login` en gång till ger full sökning.
+  `--recent` gör samma lokala sökning med flit.
 - Tider skrivs i lokal tid. `--json` ger råa tider, avsändarens id, text, bilder och
   filer, för script.
 - För script: `--json` skriver ut chatId, id och tid, och `--sent-log FIL` lägger

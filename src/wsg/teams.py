@@ -19,14 +19,16 @@ Three things here that are easy to get wrong by hand:
    Reading must not make a chat, so `one_on_one(address)` looks through the
    chat list instead. A group chat is found by its topic or a member's name
    (`find_chats`) and used by its id (`19:...@thread.v2`).
-4. **Search is not available, so finding is reading.** Graph's `/search/query`
-   over chat messages wants `ChannelMessage.Read.All` beside `Chat.Read`, even
-   for chats alone, and that is not in the base set. `find` therefore reads the
-   most recent chats and matches the text here: it sees what is recent, not
-   everything.
+4. **Search wants a channel scope even for chats.** Graph's `/search/query`
+   over chat messages requires `ChannelMessage.Read.All` beside `Chat.Read`,
+   even when every hit is in a chat. With it (added 2026-10-12), `search` finds
+   a word in the whole history, channels included. `find` is the fallback for
+   a token without it: it reads the most recent chats and matches here, so it
+   sees what is recent, not everything.
 
 Sending needs `ChatMessage.Send`, finding a 1:1 chat to post in `Chat.Create`,
-reading `Chat.Read`. All three are in the default scope set.
+reading `Chat.Read`, searching `ChannelMessage.Read.All`. All four are in the
+default scope set.
 """
 
 import html
@@ -386,3 +388,37 @@ def find(query, n_chats=25, since=None, per_chat=200):
                 hits.append((c, m))
     hits.sort(key=lambda h: h[1]["createdDateTime"], reverse=True)
     return hits
+
+
+def search(query, n=25):
+    """Messages matching `query` (KQL, e.g. `from:anna faktura`), best first.
+
+    Pages through /search/query 25 at a time. Each hit is a dict with id,
+    createdDateTime, from, summary, chatId (or teamId/channelId for a channel)
+    and webLink.
+    """
+    out = []
+    while len(out) < n:
+        size = min(25, n - len(out))
+        r = graph("POST", "/search/query", body={"requests": [{
+            "entityTypes": ["chatMessage"], "query": {"queryString": query},
+            "from": len(out), "size": size}]})
+        box = ((r.get("value") or [{}])[0].get("hitsContainers") or [{}])[0]
+        hits = box.get("hits") or []
+        for h in hits:
+            res = h.get("resource") or {}
+            ident = res.get("channelIdentity") or {}
+            summary = re.sub(r"</?c0>|<ddd/>", "", h.get("summary") or "")
+            out.append({
+                "id": res.get("id"),
+                "createdDateTime": res.get("createdDateTime"),
+                "from": ((res.get("from") or {}).get("emailAddress") or {}).get("name") or "?",
+                "summary": html.unescape(re.sub(r"\s+", " ", summary)).strip(),
+                "chatId": res.get("chatId"),
+                "teamId": ident.get("teamId"),
+                "channelId": None if res.get("chatId") else ident.get("channelId"),
+                "webLink": res.get("webLink"),
+            })
+        if not hits or not box.get("moreResultsAvailable"):
+            break
+    return out[:n]
