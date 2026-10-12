@@ -3,7 +3,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import arena, auth, mscal, onetime, planner
@@ -1193,7 +1193,7 @@ def _add_planner_commands(sub):
 
 
 # ── Teams ─────────────────────────────────────────────────────────────────────
-# Posting in a chat as yourself. The text is markdown and goes out as the HTML
+# Finding, reading and posting in chats as yourself. Posted text is markdown and goes out as the HTML
 # Teams shows; see teams.py for why Graph needs it that way. Before 0.6.0 every
 # script that wrote to Teams carried its own copy of the token call, the POST and
 # a markdown converter on a third-party package.
@@ -1257,6 +1257,133 @@ def cmd_teams_md(a):
     return 0
 
 
+def _chat_line(c, me):
+    from . import teams
+
+    last = (c.get("lastMessagePreview") or {}).get("createdDateTime")
+    kind = {"oneOnOne": "1:1", "group": "grupp", "meeting": "möte"}.get(c.get("chatType"), c.get("chatType") or "?")
+    return f"{_ts(last)}  {kind:5}  {teams.chat_name(c, me)}\n                   {c['id']}"
+
+
+def cmd_teams_chats(a):
+    from . import teams
+
+    me = teams.me_id()
+    found = teams.find_chats(a.filter, a.limit) if a.filter else teams.chats(a.limit)
+    if a.json:
+        print(json.dumps([{"id": c["id"], "type": c.get("chatType"), "name": teams.chat_name(c, me),
+                           "members": [{"name": m.get("displayName"), "email": m.get("email")}
+                                       for m in c.get("members", [])],
+                           "last": (c.get("lastMessagePreview") or {}).get("createdDateTime")}
+                          for c in found], ensure_ascii=False, indent=2))
+        return 0
+    if not found:
+        print(f"Ingen chatt bland de {a.limit} senaste matchar \"{a.filter}\"." if a.filter
+              else "Inga chattar.")
+        return 1
+    for c in found:
+        print(_chat_line(c, me))
+    return 0
+
+
+def _resolve_chat(a):
+    """The chat id from --chat, --to or --name; prints why not and returns None."""
+    from . import teams
+
+    if a.chat:
+        return a.chat
+    if a.to:
+        chat = teams.one_on_one(a.to)
+        if not chat:
+            print(f"Ingen 1:1-chatt med {a.to} bland de senaste 500 chattarna.", file=sys.stderr)
+        return chat
+    found = teams.find_chats(a.name)
+    if len(found) == 1:
+        return found[0]["id"]
+    if not found:
+        print(f"Ingen chatt matchar \"{a.name}\". Prova wsg teams chats.", file=sys.stderr)
+        return None
+    # A person's name means the 1:1 chat with them, even when the same person is
+    # in ten group chats too - but only a whole name: "Erik" is not "Erikson".
+    q = a.name.casefold().split()
+    exact = [c for c in found if c.get("chatType") == "oneOnOne" and any(
+        all(w in (m.get("displayName") or "").casefold().split() for w in q)
+        for m in c.get("members", []))]
+    if len(exact) == 1:
+        return exact[0]["id"]
+    me = teams.me_id()
+    print(f"{len(found)} chattar matchar \"{a.name}\", välj med --chat:", file=sys.stderr)
+    for c in found[:15]:
+        print(_chat_line(c, me), file=sys.stderr)
+    return None
+
+
+def _message_json(m, images):
+    from . import teams
+
+    name, uid = teams.sender(m)
+    return {"id": m["id"], "createdDateTime": m["createdDateTime"], "from": name, "fromId": uid,
+            "text": teams.text_of(m), "images": images,
+            "files": [{"name": n, "url": u} for n, u in teams.files_of(m)]}
+
+
+def cmd_teams_read(a):
+    from . import teams
+
+    chat = _resolve_chat(a)
+    if not chat:
+        return 1
+    since = None
+    if a.since:
+        since = datetime.fromisoformat(a.since).astimezone().astimezone(
+            timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    msgs = teams.messages(chat, a.n, since)
+    out = []
+    for m in msgs:
+        images = teams.save_images(m, a.images) if a.images else []
+        out.append(_message_json(m, images))
+    if a.json:
+        print(json.dumps({"chatId": chat, "messages": out}, ensure_ascii=False, indent=2))
+        return 0
+    for m in out:
+        print(f"--- {_ts(m['createdDateTime'])} {m['from']}")
+        if m["text"]:
+            print(m["text"])
+        for p in m["images"]:
+            print(f"  bild: {p}")
+        for f in m["files"]:
+            print(f"  fil: {f['name']} {f['url'] or ''}".rstrip())
+    if not out:
+        print("Inga meddelanden" + (f" sedan {a.since}." if a.since else "."))
+    return 0
+
+
+def cmd_teams_find(a):
+    from . import teams
+
+    since = (datetime.now() - timedelta(days=a.days)).astimezone(
+        timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    hits = teams.find(a.query, a.chats, since)
+    me = teams.me_id()
+    if a.json:
+        print(json.dumps([dict(_message_json(m, []), chatId=c["id"], chat=teams.chat_name(c, me))
+                          for c, m in hits[:a.n]], ensure_ascii=False, indent=2))
+        return 0
+    if not hits:
+        print(f"Inget om \"{a.query}\" i de {a.chats} senaste chattarna, senaste {a.days} dagarna.")
+        return 1
+    for c, m in hits[:a.n]:
+        text = re.sub(r"\s+", " ", teams.text_of(m))
+        i = text.casefold().find(a.query.casefold())
+        snippet = ("…" if i > 60 else "") + text[max(0, i - 60):i + 140] + ("…" if len(text) > i + 140 else "")
+        print(f"--- {_ts(m['createdDateTime'])}  {teams.chat_name(c, me)}  ·  {teams.sender(m)[0]}")
+        print(f"    {snippet}")
+        print(f"    {c['id']}")
+    if len(hits) > a.n:
+        print(f"(+{len(hits) - a.n} till, -n för fler)")
+    return 0
+
+
 def _add_teams_commands(sub):
     s = sub.add_parser("send", help="post a message in a chat as yourself; markdown in, Teams HTML out")
     who = s.add_mutually_exclusive_group(required=True)
@@ -1268,6 +1395,31 @@ def _add_teams_commands(sub):
     s.add_argument("--sent-log", metavar="FILE", help="append the sent message's id to this file")
     s.add_argument("--json", action="store_true", help="print chatId, id and createdDateTime as JSON")
     s.set_defaults(fn=cmd_teams_send)
+
+    s = sub.add_parser("chats", help="your chats, most recent first; a filter matches topic, member name or address")
+    s.add_argument("filter", nargs="?", help="e.g. a person's name or a group chat's topic")
+    s.add_argument("-n", "--limit", type=int, default=30, help="how many recent chats to look through, default 30")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_teams_chats)
+
+    s = sub.add_parser("read", help="the messages in one chat, oldest first")
+    which = s.add_mutually_exclusive_group(required=True)
+    which.add_argument("--chat", metavar="CHAT-ID")
+    which.add_argument("--to", metavar="ADDRESS", help="the 1:1 chat with this person")
+    which.add_argument("--name", metavar="TEXT", help="the one chat whose topic or member matches")
+    s.add_argument("-n", type=int, default=30, help="the last N messages, default 30")
+    s.add_argument("--since", metavar="DATE", help="only messages from this local date/time on, e.g. 2026-10-12 or 2026-10-12T09:00")
+    s.add_argument("--images", metavar="DIR", help="save pasted images here and print their paths")
+    s.add_argument("--json", action="store_true", help="raw createdDateTime, sender id, text, images and files")
+    s.set_defaults(fn=cmd_teams_read)
+
+    s = sub.add_parser("find", help="messages holding a text, in your most recent chats")
+    s.add_argument("query")
+    s.add_argument("--chats", type=int, default=25, help="how many recent chats to read, default 25")
+    s.add_argument("--days", type=int, default=30, help="how far back, default 30 days")
+    s.add_argument("-n", type=int, default=20, help="show at most N hits, default 20")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_teams_find)
 
     s = sub.add_parser("md", help="print the Teams HTML for a markdown text, send nothing")
     s.add_argument("text", nargs="*", help="the text; read from stdin when left out")
@@ -1481,7 +1633,7 @@ def main(argv=None):
     pl = sub.add_parser("planner", help="Planner boards, read-only: what is on them and what is mine")
     _add_planner_commands(pl.add_subparsers(dest="planner_cmd", required=True))
 
-    te = sub.add_parser("teams", help="Teams chat: post as yourself, markdown in, Teams HTML out")
+    te = sub.add_parser("teams", help="Teams chats: find, read and post as yourself, markdown in")
     _add_teams_commands(te.add_subparsers(dest="teams_cmd", required=True))
 
     se = sub.add_parser("secret", help="one-time links on secrets.wesports.io, encrypted before they leave")

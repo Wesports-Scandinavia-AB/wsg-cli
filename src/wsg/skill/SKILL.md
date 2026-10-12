@@ -1,6 +1,6 @@
 ---
 name: wsg
-description: Logga in som sig själv mot Microsoft 365 (Graph) och WeSports Arena med wsg-cli, och använd det för att skicka mail, skriva i Teams, läsa Planner-tavlor, skapa engångslänkar för lösenord och nycklar, eller hämta en token till ett eget script. Use when the user wants to send a mail or a Teams message from the terminal, asks what is on a Planner board or what Planner tasks are theirs, needs to hand someone a password or API key safely, asks for a Graph or Arena token, or says "wsg". Exempel "skicka ett mail till Anna med rapporten", "skriv till Erik i Teams att det är klart", "vad har jag i Planner", "vad ligger på tavlan Vartex Service", "skicka lösenordet till Erik på ett säkert sätt", "logga in wsg", "uppdatera wsg".
+description: Logga in som sig själv mot Microsoft 365 (Graph) och WeSports Arena med wsg-cli, och använd det för att skicka mail, skriva, läsa och söka i Teams, läsa Planner-tavlor, skapa engångslänkar för lösenord och nycklar, eller hämta en token till ett eget script. Use when the user wants to send a mail or a Teams message from the terminal, read a Teams chat or find something said in Teams, asks what is on a Planner board or what Planner tasks are theirs, needs to hand someone a password or API key safely, asks for a Graph or Arena token, or says "wsg". Exempel "skicka ett mail till Anna med rapporten", "skriv till Erik i Teams att det är klart", "vad skrev Gustav i Teams idag", "var var det någon nämnde returfrakten i Teams", "vad har jag i Planner", "vad ligger på tavlan Vartex Service", "skicka lösenordet till Erik på ett säkert sätt", "logga in wsg", "uppdatera wsg".
 ---
 
 # wsg: inloggning mot Microsoft 365 och Arena
@@ -66,6 +66,27 @@ EOF
   i ett kodblock, fetstil på det enda som inte får missas. Ett kort svar är en mening
   utan formatering.
 - `wsg teams md` visar bara HTML:en för en text, utan att skicka något.
+
+### Läsa och hitta i Teams
+
+```
+python -m wsg teams chats                     de senaste chattarna, med id
+python -m wsg teams chats "Anna"              chattar vars namn eller deltagare matchar
+python -m wsg teams read --name "Anna Berg"   en chatt, äldst först (-n 30 som standard)
+python -m wsg teams read --to anna@example.com --since 2026-10-12
+python -m wsg teams find "returfrakt"         meddelanden som nämner texten
+```
+
+- `read` väljer chatt med `--chat ID`, `--to ADRESS` (1:1-chatten) eller `--name TEXT`.
+  Matchar namnet flera chattar listas de, välj då med `--chat`. Ett helt namn på en
+  person ger 1:1-chatten med hen.
+- `--images MAPP` sparar inklistrade bilder och skriver ut sökvägarna. **Titta på
+  bilderna**: ofta står frågan i en skärmbild, inte i texten.
+- `find` läser de 25 senaste chattarna 30 dagar bakåt (`--chats`, `--days`) och
+  letar i texten. Det tar en stund och ser bara det som är nyligen. Hittas inget,
+  säg det och fråga om du ska leta längre bakåt.
+- Tider skrivs i lokal tid. `--json` ger råa tider, avsändarens id, text, bilder och
+  filer, för script.
 - För script: `--json` skriver ut chatId, id och tid, och `--sent-log FIL` lägger
   meddelandets id sist i en fil.
 

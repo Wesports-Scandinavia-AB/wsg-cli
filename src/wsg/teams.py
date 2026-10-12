@@ -16,17 +16,25 @@ Three things here that are easy to get wrong by hand:
 3. **A 1:1 chat has an id nobody knows.** `POST /chats` with the two members
    returns the chat that already exists rather than making a second one, so
    `chat_with(address)` finds the chat to post in from a mail address alone.
-   Group chats have no such lookup; post in one by its id (`19:...@thread.v2`).
+   Reading must not make a chat, so `one_on_one(address)` looks through the
+   chat list instead. A group chat is found by its topic or a member's name
+   (`find_chats`) and used by its id (`19:...@thread.v2`).
+4. **Search is not available, so finding is reading.** Graph's `/search/query`
+   over chat messages wants `ChannelMessage.Read.All` beside `Chat.Read`, even
+   for chats alone, and that is not in the base set. `find` therefore reads the
+   most recent chats and matches the text here: it sees what is recent, not
+   everything.
 
-Sending needs `ChatMessage.Send`, finding a 1:1 chat `Chat.Create`. Both are in
-the default scope set.
+Sending needs `ChatMessage.Send`, finding a 1:1 chat to post in `Chat.Create`,
+reading `Chat.Read`. All three are in the default scope set.
 """
 
 import html
+import os
 import re
-from urllib import parse
+from urllib import parse, request
 
-from .auth import graph
+from .auth import get_token, graph
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 
@@ -241,3 +249,140 @@ def send(chat_id, content_html):
     """Post one message in a chat as the signed-in user; returns Graph's message."""
     return graph("POST", f"/chats/{parse.quote(chat_id)}/messages",
                  body={"body": {"contentType": "html", "content": content_html}})
+
+
+def me_id():
+    return graph("GET", "/me?$select=id")["id"]
+
+
+def chats(limit=50):
+    """The chats the signed-in user is in, most recent message first, with members."""
+    out = []
+    url = ("/me/chats?$expand=members,lastMessagePreview"
+           "&$orderby=lastMessagePreview/createdDateTime%20desc&$top=50")
+    while url and len(out) < limit:
+        r = graph("GET", url)
+        out.extend(r.get("value", []))
+        url = r.get("@odata.nextLink")
+    return out[:limit]
+
+
+def chat_name(chat, me=None):
+    """The topic, or the other members' names, which is what Teams shows."""
+    if chat.get("topic"):
+        return chat["topic"]
+    names = [m.get("displayName") or m.get("email") or "?" for m in chat.get("members", [])
+             if not me or m.get("userId") != me]
+    return ", ".join(names) or "(ingen annan)"
+
+
+def _matches(chat, query):
+    q = query.casefold()
+    hay = [chat.get("topic") or ""]
+    for m in chat.get("members", []):
+        hay += [m.get("displayName") or "", m.get("email") or ""]
+    return any(q in h.casefold() for h in hay)
+
+
+def find_chats(query, limit=200):
+    """Recent chats whose topic, member name or member address holds `query`."""
+    return [c for c in chats(limit) if _matches(c, query)]
+
+
+def one_on_one(address, limit=500):
+    """The id of the 1:1 chat with `address`, or None. Reads only."""
+    a = address.casefold()
+    for c in chats(limit):
+        if c.get("chatType") == "oneOnOne" and any(
+                (m.get("email") or "").casefold() == a for m in c.get("members", [])):
+            return c["id"]
+    return None
+
+
+def messages(chat_id, n=30, since=None):
+    """The last `n` real messages in a chat, oldest first.
+
+    System events (members added, calls) and deleted messages are left out.
+    `since` is an ISO timestamp; reading stops at the first message older.
+    """
+    out = []
+    url = f"/chats/{parse.quote(chat_id)}/messages?$top=50&$orderby=createdDateTime%20desc"
+    while url and len(out) < n:
+        r = graph("GET", url)
+        page = r.get("value", [])
+        for m in page:
+            if since and m["createdDateTime"] < since:
+                url = None
+                break
+            if m.get("messageType") == "message" and not m.get("deletedDateTime"):
+                out.append(m)
+        else:
+            url = r.get("@odata.nextLink")
+    out = out[:n]
+    out.sort(key=lambda m: m["createdDateTime"])
+    return out
+
+
+def sender(m):
+    who = (m.get("from") or {}).get("user") or (m.get("from") or {}).get("application") or {}
+    return who.get("displayName") or "?", who.get("id")
+
+
+def text_of(m):
+    """A message's body as plain text: lists stay lists, images become [bild]."""
+    raw = (m.get("body") or {}).get("content") or ""
+    if (m.get("body") or {}).get("contentType") != "html":
+        return raw.strip()
+    t = re.sub(r"<img[^>]*>", "[bild]", raw)
+    t = re.sub(r"<attachment[^>]*>\s*</attachment>", "", t)
+    t = re.sub(r"<li>", "- ", t)
+    t = re.sub(r"<br\s*/?>|</p>|</div>|</li>|</h\d>|</pre>|</blockquote>|</tr>", "\n", t)
+    t = html.unescape(re.sub(r"<[^>]+>", "", t))
+    return re.sub(r"\n\s*\n+", "\n", t).strip()
+
+
+def files_of(m):
+    """Shared files (reference attachments) as (name, url)."""
+    return [(a.get("name"), a.get("contentUrl")) for a in m.get("attachments", [])
+            if a.get("contentType") == "reference"]
+
+
+def save_images(m, folder):
+    """Download the images pasted into a message; returns the paths, or why not.
+
+    Pasted images are hostedContents behind a Graph URL that wants the token, which
+    is why a browser link to them does not work for anyone else.
+    """
+    paths = []
+    srcs = re.findall(r'<img[^>]+src="([^"]+)"', (m.get("body") or {}).get("content") or "")
+    if not srcs:
+        return paths
+    os.makedirs(folder, exist_ok=True)
+    token = get_token()
+    for i, src in enumerate(srcs):
+        p = os.path.join(folder, f"{m['id']}_{i}.png")
+        if not os.path.exists(p):
+            try:
+                req = request.Request(html.unescape(src), headers={"Authorization": f"Bearer {token}"})
+                with request.urlopen(req) as r, open(p, "wb") as f:
+                    f.write(r.read())
+            except Exception as e:
+                p = f"(bilden gick inte att hämta: {e})"
+        paths.append(p)
+    return paths
+
+
+def find(query, n_chats=25, since=None, per_chat=200):
+    """Messages holding `query` in the `n_chats` most recent chats, newest first.
+
+    Read here and matched here (see the module notes on why not /search/query).
+    Returns (chat, message) pairs.
+    """
+    q = query.casefold()
+    hits = []
+    for c in chats(n_chats):
+        for m in messages(c["id"], per_chat, since):
+            if q in text_of(m).casefold():
+                hits.append((c, m))
+    hits.sort(key=lambda h: h[1]["createdDateTime"], reverse=True)
+    return hits

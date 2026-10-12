@@ -70,6 +70,9 @@ wsg planner task ID    one task with its description and checklist
 wsg planner link X     the address of one board, --bare for the URL alone
 
 wsg teams send         post in a Teams chat as yourself, markdown in, --dry-run first
+wsg teams chats [X]    your chats, most recent first, filtered by topic or member
+wsg teams read         one chat, oldest first: --chat ID, --to ADDRESS or --name TEXT
+wsg teams find TEXT    messages holding TEXT in your most recent chats
 wsg teams md           print the Teams HTML for a markdown text, send nothing
 
 wsg secret create      encrypt a value or --file here, print a one-time link
@@ -237,8 +240,29 @@ For scripts and loops: `--json` prints `chatId`, `id` and `createdDateTime`, and
 `--sent-log FILE` appends the message id to a file, so a loop can tell its own
 messages from the ones a person typed.
 
-Needs `ChatMessage.Send`, plus `Chat.Create` for `--to`; both are in the default
-scope set.
+Reading:
+
+```
+wsg teams chats "anna"                         chats whose topic or member matches
+wsg teams read --name "Anna Berg" -n 50        one chat, oldest first, local times
+wsg teams read --to someone@example.com --since 2026-10-12 --images ./img
+wsg teams find "invoice" --chats 40 --days 60  messages holding the text
+```
+
+`read --to` looks the 1:1 chat up in your chat list rather than through
+`POST /chats`, so reading never makes a chat. `--name` takes the one chat whose
+topic or member matches; a whole person's name picks the 1:1 chat with them, and
+anything ambiguous lists the candidates instead of guessing. `--images DIR`
+downloads pasted images, which sit behind a Graph URL that wants the token.
+`--json` gives raw `createdDateTime`, sender id, text, images and files.
+
+`find` reads your most recent chats and matches the text locally. Graph's
+`/search/query` would search everything, but for chat messages it wants
+`ChannelMessage.Read.All` beside `Chat.Read` — even for chats alone — and that is
+not in the base set. So `find` sees what is recent, not your whole history.
+
+Needs `ChatMessage.Send`, `Chat.Create` for `send --to`, and `Chat.Read`; all three
+are in the default scope set.
 
 ## One-time secret links
 
