@@ -119,7 +119,7 @@ me = graph.graph("GET", "/me")
 ### Scopes
 
 `wsg graph login` asks for the base set in `src/wsg/scopes.py`: your own mail,
-calendar, files and chats, Planner, and reading the directory for names. That is
+calendar, files and chats, files others have shared with you, Planner, and reading the directory for names. That is
 also exactly what the app is consented for, so there is no consent prompt and no
 admin role involved.
 
@@ -246,6 +246,7 @@ Reading:
 wsg teams chats "anna"                         chats whose topic or member matches
 wsg teams read --name "Anna Berg" -n 50        one chat, oldest first, local times
 wsg teams read --to someone@example.com --since 2026-10-12 --images ./img
+wsg teams read --name "Anna Berg" -n 5 --files ./files   also save the files shared there
 wsg teams find "invoice"                       search chats and channels, whole history
 wsg teams find "from:anna invoice" --json      KQL works; JSON has chatId and webLink
 ```
@@ -255,6 +256,9 @@ wsg teams find "from:anna invoice" --json      KQL works; JSON has chatId and we
 topic or member matches; a whole person's name picks the 1:1 chat with them, and
 anything ambiguous lists the candidates instead of guessing. `--images DIR`
 downloads pasted images, which sit behind a Graph URL that wants the token.
+`--files DIR` downloads the files shared in the chat. Such a file lives in the
+sender's OneDrive, not in the chat, so it needs `Files.Read.All` (from 0.9.0):
+delegated, it opens only what you could already open in Teams.
 `--json` gives raw `createdDateTime`, sender id, text, images and files.
 
 `find` goes through Graph's `/search/query`, which covers your whole history in
@@ -264,8 +268,9 @@ which is why that scope is in the base set from 0.8.0. A login without it falls
 back to reading your most recent chats and matching locally, and says so;
 `--recent` (with `--chats` and `--days`) does that on purpose.
 
-Needs `ChatMessage.Send`, `Chat.Create` for `send --to`, `Chat.Read`, and
-`ChannelMessage.Read.All` for `find`; all four are in the default scope set.
+Needs `ChatMessage.Send`, `Chat.Create` for `send --to`, `Chat.Read`,
+`ChannelMessage.Read.All` for `find` and `Files.Read.All` for `read --files`; all
+five are in the default scope set.
 
 ## One-time secret links
 

@@ -44,4 +44,8 @@ DEFAULT_SCOPES = [
     # bredvid Chat.Read, även när alla träffar ligger i chattar (2026-10-12). Delegerat:
     # bara kanaler personen redan ser i Teams.
     "ChannelMessage.Read.All",
+    # wsg teams read --files: a file shared in a chat lives in the sender's OneDrive,
+    # and Files.ReadWrite reaches only your own. Files.Read.All is delegated, so it
+    # opens what the person could already open in Teams and nothing else (2026-10-13).
+    "Files.Read.All",
 ]

@@ -82,6 +82,9 @@ python -m wsg teams find "returfrakt"         meddelanden som nämner texten
   person ger 1:1-chatten med hen.
 - `--images MAPP` sparar inklistrade bilder och skriver ut sökvägarna. **Titta på
   bilderna**: ofta står frågan i en skärmbild, inte i texten.
+- `--files MAPP` sparar filer som delats i chatten (en Excel-fil, en PDF) och skriver
+  ut sökvägarna. Filen ligger i avsändarens OneDrive, så det kräver en inloggning från
+  0.9.0 eller senare. Står det 403 vid filen, kör `wsg graph login` en gång till.
 - `find` söker i hela historiken, i chattar och kanaler, och visar var och vem.
   Sökordet kan vara KQL: `find "from:Anna faktura"`. Med chatt-id:t från en träff
   läser du sedan sammanhanget med `read --chat`.

@@ -1,7 +1,7 @@
 """
 Teams chat over Graph: post a message as the signed-in user.
 
-Three things here that are easy to get wrong by hand:
+Five things here that are easy to get wrong by hand:
 
 1. **Graph does not render markdown.** A message sent as `contentType: text`
    shows `**bold**` with the asterisks, and a numbered list is one long line.
@@ -26,11 +26,17 @@ Three things here that are easy to get wrong by hand:
    a token without it: it reads the most recent chats and matches here, so it
    sees what is recent, not everything.
 
+5. **A shared file is not in the chat.** It is a link into the sender's OneDrive,
+   which `Files.ReadWrite` does not reach. `save_files` opens it through
+   `/shares/{encoded url}` with `Files.Read.All` (added 2026-10-13) and fetches
+   the bytes from the item's pre-signed download URL, which wants no token.
+
 Sending needs `ChatMessage.Send`, finding a 1:1 chat to post in `Chat.Create`,
-reading `Chat.Read`, searching `ChannelMessage.Read.All`. All four are in the
-default scope set.
+reading `Chat.Read`, searching `ChannelMessage.Read.All`, fetching a shared file
+`Files.Read.All`. All five are in the default scope set.
 """
 
+import base64
 import html
 import os
 import re
@@ -370,6 +376,27 @@ def save_images(m, folder):
                     f.write(r.read())
             except Exception as e:
                 p = f"(bilden gick inte att hämta: {e})"
+        paths.append(p)
+    return paths
+
+
+def save_files(m, folder):
+    """Download the files shared in a message: one path, or why not, per files_of entry."""
+    paths = []
+    for name, url in files_of(m):
+        if not url:
+            paths.append("(filen har ingen adress)")
+            continue
+        os.makedirs(folder, exist_ok=True)
+        p = os.path.join(folder, os.path.basename(name or "") or f"{m['id']}.bin")
+        if not os.path.exists(p):
+            try:
+                share = "u!" + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+                item = graph("GET", f"/shares/{share}/driveItem")
+                with request.urlopen(item["@microsoft.graph.downloadUrl"]) as r, open(p, "wb") as f:
+                    f.write(r.read())
+            except Exception as e:
+                p = f"(filen gick inte att hämta: {e})"
         paths.append(p)
     return paths
 

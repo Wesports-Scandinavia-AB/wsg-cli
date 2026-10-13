@@ -1318,13 +1318,15 @@ def _resolve_chat(a):
     return None
 
 
-def _message_json(m, images):
+def _message_json(m, images, saved=None):
     from . import teams
 
     name, uid = teams.sender(m)
+    saved = saved or []
     return {"id": m["id"], "createdDateTime": m["createdDateTime"], "from": name, "fromId": uid,
             "text": teams.text_of(m), "images": images,
-            "files": [{"name": n, "url": u} for n, u in teams.files_of(m)]}
+            "files": [{"name": n, "url": u, **({"path": saved[i]} if i < len(saved) else {})}
+                      for i, (n, u) in enumerate(teams.files_of(m))]}
 
 
 def cmd_teams_read(a):
@@ -1341,7 +1343,8 @@ def cmd_teams_read(a):
     out = []
     for m in msgs:
         images = teams.save_images(m, a.images) if a.images else []
-        out.append(_message_json(m, images))
+        saved = teams.save_files(m, a.files) if a.files else []
+        out.append(_message_json(m, images, saved))
     if a.json:
         print(json.dumps({"chatId": chat, "messages": out}, ensure_ascii=False, indent=2))
         return 0
@@ -1353,6 +1356,8 @@ def cmd_teams_read(a):
             print(f"  bild: {p}")
         for f in m["files"]:
             print(f"  fil: {f['name']} {f['url'] or ''}".rstrip())
+            if "path" in f:
+                print(f"  sparad: {f['path']}")
     if not out:
         print("Inga meddelanden" + (f" sedan {a.since}." if a.since else "."))
     return 0
@@ -1444,6 +1449,7 @@ def _add_teams_commands(sub):
     s.add_argument("-n", type=int, default=30, help="the last N messages, default 30")
     s.add_argument("--since", metavar="DATE", help="only messages from this local date/time on, e.g. 2026-10-12 or 2026-10-12T09:00")
     s.add_argument("--images", metavar="DIR", help="save pasted images here and print their paths")
+    s.add_argument("--files", metavar="DIR", help="save shared files here and print their paths")
     s.add_argument("--json", action="store_true", help="raw createdDateTime, sender id, text, images and files")
     s.set_defaults(fn=cmd_teams_read)
 
