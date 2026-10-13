@@ -74,6 +74,8 @@ wsg teams chats [X]    your chats, most recent first, filtered by topic or membe
 wsg teams read         one chat, oldest first: --chat ID, --to ADDRESS or --name TEXT
 wsg teams find TEXT    search your chats and channels for TEXT, the whole history
 wsg teams md           print the Teams HTML for a markdown text, send nothing
+wsg mail reply ID      answer a mail in its thread, text from stdin, --dry-run first
+wsg mail archive ID    move every message in a mail's thread from the inbox to Archive
 
 wsg secret create      encrypt a value or --file here, print a one-time link
 wsg secret delete      destroy a link before it is opened
@@ -213,6 +215,36 @@ attachment. Above that ceiling the file needs `createUploadSession` against a dr
 or OneDrive and a link; this command refuses up front rather than failing halfway.
 
 Needs `Mail.Send`, which is in the default scope set.
+
+### Replying in the thread, archiving the thread
+
+```
+wsg mail reply <message-id> --dry-run <<'EOF'
+Thursday works, see you then.
+EOF
+wsg mail reply <message-id> --all --attach notes.pdf --archive <<'EOF'
+...
+EOF
+wsg mail archive <message-id> --dry-run
+```
+
+A reply sent with `sendmail` and "Re:" in the subject is a new conversation: the
+recipient sees it apart from the thread, without the quote. `mail reply` goes through
+`createReply` (`createReplyAll` with `--all`), so the answer carries the thread's
+headers and the quoted original. The text is written into the draft's HTML above the
+quote rather than passed as `comment`, which joins its lines into one. Attachments are
+added to the draft before it is sent, under the same ~3 MB ceiling as `sendmail`.
+`--dry-run` shows who it would go to, worked out as Outlook does: the sender (or
+Reply-To), plus To and Cc with `--all`, minus yourself.
+
+`mail archive` moves every message in the inbox that shares the message's
+`conversationId` to the Archive folder, so the whole thread leaves the inbox, not only
+the message that was answered. `reply --archive` does both in one go. A moved message
+gets a new id in Archive.
+
+The message id is Graph's, or the M365 connector's `mail:///messages/<id>`, which
+carries the same id. Needs `Mail.ReadWrite` beside `Mail.Send`; both are in the
+default scope set.
 
 ## Teams messages
 

@@ -1467,6 +1467,119 @@ def _add_teams_commands(sub):
     s.set_defaults(fn=cmd_teams_md)
 
 
+# ── Mail ──────────────────────────────────────────────────────────────────────
+# Answering in the thread and archiving the thread; see mail.py. sendmail stays
+# under graph, where it has always been.
+
+def _graph_error(prefix, e):
+    detail = ""
+    read = getattr(e, "read", None)
+    if callable(read):
+        try:
+            detail = ": " + read().decode(errors="replace")[:400]
+        except Exception:
+            detail = ""
+    print(f"{prefix}{detail or ': ' + str(e)}", file=sys.stderr)
+    return 2
+
+
+def _print_thread(msgs):
+    from . import mail
+
+    for m in msgs:
+        print(f"  {_ts(m.get('receivedDateTime'))}  {mail._addr(m.get('from'))}  {m.get('subject') or ''}")
+
+
+def cmd_mail_reply(a):
+    from . import mail
+
+    if sys.stdin.isatty():
+        print("Svarstexten läses från stdin. Pipa in den, t.ex. med en here-doc.", file=sys.stderr)
+        return 2
+    text = _stdin_text().strip()
+    if not text:
+        print("Tom svarstext, inget skickat.", file=sys.stderr)
+        return 2
+    mid = mail.message_id(a.message)
+    try:
+        attachments = mail.file_attachments(a.attach)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    try:
+        msg = mail.get(mid)
+        to, cc = mail.reply_recipients(msg, a.all, mail.me_address())
+    except Exception as e:
+        return _graph_error("Kunde inte läsa mailet", e)
+
+    if a.dry_run:
+        print(f"[torrkörning] {'svara alla' if a.all else 'svara'} på \"{msg.get('subject') or ''}\" - inget skickat")
+        print(f"Till: {', '.join(to) or '-'}")
+        if cc:
+            print(f"Kopia: {', '.join(cc)}")
+        for att in attachments:
+            print(f"Bilaga: {att['name']} ({len(att['contentBytes']) * 3 // 4 // 1024} kB)")
+        print("---")
+        print(text)
+        if a.archive:
+            print("--- arkiveras sedan ur inkorgen:")
+            _print_thread(mail.thread_in_inbox(mid))
+        return 0
+
+    try:
+        mail.reply(mid, text, a.all, attachments)
+    except Exception as e:
+        return _graph_error("Svaret gick inte iväg", e)
+    print(f"Svarat till {', '.join(to)}" + (f" (kopia {', '.join(cc)})" if cc else "")
+          + f" på \"{msg.get('subject') or ''}\"")
+    if a.archive:
+        try:
+            n = mail.archive(mail.thread_in_inbox(mid))
+        except Exception as e:
+            return _graph_error("Svaret gick iväg, men arkiveringen misslyckades", e)
+        print(f"Tråden arkiverad: {n} meddelanden flyttade från inkorgen.")
+    return 0
+
+
+def cmd_mail_archive(a):
+    from . import mail
+
+    mid = mail.message_id(a.message)
+    try:
+        msgs = mail.thread_in_inbox(mid)
+    except Exception as e:
+        return _graph_error("Kunde inte läsa tråden", e)
+    if not msgs:
+        print("Inget från den tråden ligger i inkorgen.")
+        return 0
+    if a.dry_run:
+        print(f"[torrkörning] {len(msgs)} meddelanden skulle flyttas till Arkiv:")
+        _print_thread(msgs)
+        return 0
+    try:
+        n = mail.archive(msgs)
+    except Exception as e:
+        return _graph_error("Arkiveringen misslyckades", e)
+    print(f"Tråden arkiverad: {n} meddelanden flyttade från inkorgen.")
+    _print_thread(msgs)
+    return 0
+
+
+def _add_mail_commands(sub):
+    s = sub.add_parser("reply", help="answer a mail in its thread, text from stdin; --dry-run first")
+    s.add_argument("message", help="the message id, or the connector's mail:///messages/<id>")
+    s.add_argument("--all", action="store_true", help="reply to everyone on it, not only the sender")
+    s.add_argument("--attach", action="append", metavar="FILE", help="attach a file (repeat; ~3 MB in total)")
+    s.add_argument("--archive", action="store_true", help="then move the whole thread out of the inbox")
+    s.add_argument("--dry-run", action="store_true", help="show who it goes to and the text, send nothing")
+    s.set_defaults(fn=cmd_mail_reply)
+
+    s = sub.add_parser("archive", help="move every message in a mail's thread from the inbox to Archive")
+    s.add_argument("message", help="any message in the thread: its id, or mail:///messages/<id>")
+    s.add_argument("--dry-run", action="store_true", help="list what would move, move nothing")
+    s.set_defaults(fn=cmd_mail_archive)
+
+
 # ── One-time links (secrets.wesports.io) ──────────────────────────────────────
 # How a credential leaves this machine for someone else: as a link that burns on
 # first read, never as text in a mail or a Teams thread, which are archived,
@@ -1660,7 +1773,7 @@ def main(argv=None):
     # metavar hides the compatibility aliases from the usage line. Plugin commands are
     # not in it; they show in --help under their own names.
     sub = p.add_subparsers(dest="cmd", required=True,
-                           metavar="{graph,arena,calendar,planner,teams,secret,skill,update" + (",..." if plugins else "") + "}")
+                           metavar="{graph,arena,calendar,planner,teams,mail,secret,skill,update" + (",..." if plugins else "") + "}")
 
     g = sub.add_parser("graph", help="Microsoft Graph: sign in as yourself with Entra, get a Graph token")
     _add_graph_commands(g.add_subparsers(dest="graph_cmd", required=True))
@@ -1676,6 +1789,9 @@ def main(argv=None):
 
     te = sub.add_parser("teams", help="Teams chats: find, read and post as yourself, markdown in")
     _add_teams_commands(te.add_subparsers(dest="teams_cmd", required=True))
+
+    ma = sub.add_parser("mail", help="answer a mail in its thread, archive a thread")
+    _add_mail_commands(ma.add_subparsers(dest="mail_cmd", required=True))
 
     se = sub.add_parser("secret", help="one-time links on secrets.wesports.io, encrypted before they leave")
     _add_secret_commands(se.add_subparsers(dest="secret_cmd", required=True))

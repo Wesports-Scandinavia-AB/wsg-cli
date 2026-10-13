@@ -1,6 +1,6 @@
 ---
 name: wsg
-description: Logga in som sig själv mot Microsoft 365 (Graph) och WeSports Arena med wsg-cli, och använd det för att skicka mail, skriva, läsa och söka i Teams, läsa Planner-tavlor, skapa engångslänkar för lösenord och nycklar, eller hämta en token till ett eget script. Use when the user wants to send a mail or a Teams message from the terminal, read a Teams chat or find something said in Teams, asks what is on a Planner board or what Planner tasks are theirs, needs to hand someone a password or API key safely, asks for a Graph or Arena token, or says "wsg". Exempel "skicka ett mail till Anna med rapporten", "skriv till Erik i Teams att det är klart", "vad skrev Gustav i Teams idag", "var var det någon nämnde returfrakten i Teams", "vad har jag i Planner", "vad ligger på tavlan Vartex Service", "skicka lösenordet till Erik på ett säkert sätt", "logga in wsg", "uppdatera wsg".
+description: Logga in som sig själv mot Microsoft 365 (Graph) och WeSports Arena med wsg-cli, och använd det för att skicka mail, svara på mail i tråden och arkivera trådar, skriva, läsa och söka i Teams, läsa Planner-tavlor, skapa engångslänkar för lösenord och nycklar, eller hämta en token till ett eget script. Use when the user wants to send a mail, answer a mail in its thread, archive a mail thread, or send a Teams message from the terminal, read a Teams chat or find something said in Teams, asks what is on a Planner board or what Planner tasks are theirs, needs to hand someone a password or API key safely, asks for a Graph or Arena token, or says "wsg". Exempel "skicka ett mail till Anna med rapporten", "svara Erik att torsdag funkar", "arkivera tråden", "skriv till Erik i Teams att det är klart", "vad skrev Gustav i Teams idag", "var var det någon nämnde returfrakten i Teams", "vad har jag i Planner", "vad ligger på tavlan Vartex Service", "skicka lösenordet till Erik på ett säkert sätt", "logga in wsg", "uppdatera wsg".
 ---
 
 # wsg: inloggning mot Microsoft 365 och Arena
@@ -43,6 +43,26 @@ EOF
 - `sendmail` skickar direkt, det blir inget utkast. En kopia hamnar i Skickat.
 - `--attach FIL` för bilagor (upprepa för flera), högst cirka 3 MB totalt.
 - `--cc` för kopia, `--html` om texten är HTML.
+
+## Svara på mail och arkivera tråden
+
+```
+python -m wsg mail reply MAIL-ID --dry-run <<'EOF'
+Tack, torsdag funkar!
+EOF
+python -m wsg mail archive MAIL-ID --dry-run
+```
+
+- **Ett svar ska vara ett svar, inte ett nytt mail.** `sendmail` med "Re:" i ämnet
+  hamnar utanför tråden. `mail reply` svarar i tråden och citerar originalet.
+- MAIL-ID är mailets id, eller `mail:///messages/<id>` som M365-connectorn ger.
+  Hitta mailet med connectorns sökning och svara sedan med wsg.
+- `--all` svarar alla (avsändaren plus Till och Kopia, utom personen själv).
+  `--attach FIL` för bilagor, högst cirka 3 MB.
+- `--dry-run` visar mottagare, kopia och text. **Visa dem för personen** innan
+  svaret går iväg.
+- `--archive` flyttar sedan hela tråden från inkorgen till Arkiv. `mail archive`
+  gör bara det, för en tråd som är klar utan svar. Ett flyttat mail får nytt id.
 
 ## Skriva i Teams
 
