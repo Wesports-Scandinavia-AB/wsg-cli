@@ -132,6 +132,10 @@ def cmd_graph_sendmail(a):
     to go up through createUploadSession against a draft, or into OneDrive as a link —
     neither of which this command pretends to do, so it refuses up front instead of
     failing halfway with an error nobody can act on.
+
+    --send-at hands the message to Exchange now with PidTagDeferredSendTime set, so
+    it waits in Outbox and leaves at that time even if this machine is off. Deleting
+    it from Outbox before then cancels it.
     """
     import base64
     import mimetypes
@@ -141,6 +145,18 @@ def cmd_graph_sendmail(a):
     if not recipients:
         print("--to kraver minst en adress (kommaseparerat for flera)", file=sys.stderr)
         return 2
+    send_at = None
+    if a.send_at:
+        try:
+            # A time without an offset is local time, the way a person says "08:00".
+            send_at = datetime.fromisoformat(a.send_at).astimezone()
+        except ValueError:
+            print(f"--send-at forstas inte: {a.send_at!r}. Skriv t.ex. 2026-10-15T08:00",
+                  file=sys.stderr)
+            return 2
+        if send_at <= datetime.now().astimezone():
+            print(f"--send-at {send_at:%Y-%m-%d %H:%M} har redan passerat.", file=sys.stderr)
+            return 2
     if sys.stdin.isatty():
         print("Brodtexten lases fran stdin. Pipa in den, t.ex. med en here-doc.", file=sys.stderr)
         return 2
@@ -182,6 +198,10 @@ def cmd_graph_sendmail(a):
         message["ccRecipients"] = [{"emailAddress": {"address": x}} for x in cc]
     if attachments:
         message["attachments"] = attachments
+    if send_at:
+        utc = send_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        message["singleValueExtendedProperties"] = [
+            {"id": "SystemTime 0x3FEF", "value": utc}]
     payload = {"message": message, "saveToSentItems": not a.no_save}
 
     if a.dry_run:
@@ -194,6 +214,8 @@ def cmd_graph_sendmail(a):
                 for att in attachments
             ]
         print("[torrkorning] POST /me/sendMail - inget skickat")
+        if send_at:
+            print(f"Skulle ga {send_at:%Y-%m-%d %H:%M} ({utc} UTC)")
         print(json.dumps({"message": preview, "saveToSentItems": payload["saveToSentItems"]},
                          indent=2, ensure_ascii=False))
         return 0
@@ -210,6 +232,10 @@ def cmd_graph_sendmail(a):
                 detail = ""
         print(f"Sandningen misslyckades{detail or ': ' + str(e)}", file=sys.stderr)
         return 2
+    if send_at:
+        print(f"Lagt i Utkorgen till {', '.join(recipients)}, gar {send_at:%Y-%m-%d %H:%M}."
+              " Ta bort det ur Utkorgen for att stoppa det.")
+        return 0
     print(f"Skickat till {', '.join(recipients)}"
           + ("" if a.no_save else " (kopia i Skickat)"))
     return 0
@@ -621,6 +647,8 @@ def _add_graph_commands(sub, visible=True, client=None, scopes=DEFAULT_SCOPES, s
                    help="attach a file inline (repeatable; ~3 MB total after base64)")
     s.add_argument("--html", action="store_true", help="send the body as HTML instead of plain text")
     s.add_argument("--no-save", action="store_true", help="do not keep a copy in Sent Items")
+    s.add_argument("--send-at", metavar="TIME",
+                   help="send later, e.g. 2026-10-15T08:00 (local time); waits in Outbox")
     s.add_argument("--dry-run", action="store_true", help="print the exact request and send nothing")
     s.set_defaults(fn=cmd_graph_sendmail)
 

@@ -43,6 +43,8 @@ EOF
 - `sendmail` skickar direkt, det blir inget utkast. En kopia hamnar i Skickat.
 - `--attach FIL` för bilagor (upprepa för flera), högst cirka 3 MB totalt.
 - `--cc` för kopia, `--html` om texten är HTML.
+- `--send-at 2026-10-15T08:00` skickar senare, i lokal tid. Mailet väntar i Utkorgen
+  och går även om datorn är avstängd. Ta bort det ur Utkorgen för att stoppa det.
 
 ## Svara på mail och arkivera tråden
 

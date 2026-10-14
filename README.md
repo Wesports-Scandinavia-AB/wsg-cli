@@ -207,6 +207,11 @@ The body is read from stdin so a here-doc keeps its formatting, which a shell
 argument would mangle. `--dry-run` prints the exact request and sends nothing; use
 it first, because there is no unsend.
 
+`--send-at 2026-10-15T08:00` sends later. A time without an offset is local time.
+The message goes to Exchange right away with the deferred-send property set
+(`PidTagDeferredSendTime`), so it waits in Outbox and leaves on time even if this
+machine is off. Delete it from Outbox to cancel.
+
 Attachments go inline as `#microsoft.graph.fileAttachment` with base64 in
 `contentBytes`, so Graph caps the whole request at roughly 3 MB. `--attach` is
 repeatable and the limit is checked against the *encoded* size before sending —
