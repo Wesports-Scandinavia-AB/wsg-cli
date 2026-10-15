@@ -189,9 +189,18 @@ def cmd_graph_sendmail(a):
               file=sys.stderr)
         return 2
 
+    # Markdown by default: a text body shows **bold** with its asterisks and code
+    # like the rest of the text. --html sends HTML as it is, --plain text as it is.
+    if a.plain:
+        body = {"contentType": "Text", "content": body_text}
+    elif a.html:
+        body = {"contentType": "HTML", "content": body_text}
+    else:
+        from .markdown import to_mail_html
+        body = {"contentType": "HTML", "content": to_mail_html(body_text)}
     message = {
         "subject": a.subject or "",
-        "body": {"contentType": "HTML" if a.html else "Text", "content": body_text},
+        "body": body,
         "toRecipients": [{"emailAddress": {"address": x}} for x in recipients],
     }
     if cc:
@@ -639,13 +648,15 @@ def _add_graph_commands(sub, visible=True, client=None, scopes=DEFAULT_SCOPES, s
         s.set_defaults(fn=cmd_graph_logout)
         return
 
-    s = add("sendmail", **h("send mail as yourself via /me/sendMail; body read from stdin"))
+    s = add("sendmail", **h("send mail as yourself via /me/sendMail; markdown body read from stdin"))
     s.add_argument("--to", required=True, help="recipient, or several comma-separated")
     s.add_argument("--cc", help="cc recipients, comma-separated")
     s.add_argument("--subject", required=True)
     s.add_argument("--attach", action="append", metavar="FILE",
                    help="attach a file inline (repeatable; ~3 MB total after base64)")
-    s.add_argument("--html", action="store_true", help="send the body as HTML instead of plain text")
+    fmt = s.add_mutually_exclusive_group()
+    fmt.add_argument("--html", action="store_true", help="the body is HTML already, send it as it is")
+    fmt.add_argument("--plain", action="store_true", help="send the body as plain text, not rendered from markdown")
     s.add_argument("--no-save", action="store_true", help="do not keep a copy in Sent Items")
     s.add_argument("--send-at", metavar="TIME",
                    help="send later, e.g. 2026-10-15T08:00 (local time); waits in Outbox")
@@ -1547,7 +1558,7 @@ def cmd_mail_reply(a):
             print(f"Kopia: {', '.join(cc)}")
         for att in attachments:
             print(f"Bilaga: {att['name']} ({len(att['contentBytes']) * 3 // 4 // 1024} kB)")
-        print("---")
+        print("---" if a.plain else "--- (markdown, skickas formaterad; se HTML:en med wsg mail md)")
         print(text)
         if a.archive:
             print("--- arkiveras sedan ur inkorgen:")
@@ -1555,7 +1566,7 @@ def cmd_mail_reply(a):
         return 0
 
     try:
-        mail.reply(mid, text, a.all, attachments)
+        mail.reply(mid, text, a.all, attachments, a.plain)
     except Exception as e:
         return _graph_error("Svaret gick inte iväg", e)
     print(f"Svarat till {', '.join(to)}" + (f" (kopia {', '.join(cc)})" if cc else "")
@@ -1566,6 +1577,19 @@ def cmd_mail_reply(a):
         except Exception as e:
             return _graph_error("Svaret gick iväg, men arkiveringen misslyckades", e)
         print(f"Tråden arkiverad: {n} meddelanden flyttade från inkorgen.")
+    return 0
+
+
+def cmd_mail_md(a):
+    from .markdown import to_mail_html
+
+    out = to_mail_html(_message_text(a))
+    if a.out:
+        Path(a.out).write_text(f'<!doctype html><meta charset="utf-8">{out}\n', encoding="utf-8")
+        print(f"Skrev {a.out}")
+        return 0
+    sys.stdout.write(out)
+    print()
     return 0
 
 
@@ -1599,8 +1623,14 @@ def _add_mail_commands(sub):
     s.add_argument("--all", action="store_true", help="reply to everyone on it, not only the sender")
     s.add_argument("--attach", action="append", metavar="FILE", help="attach a file (repeat; ~3 MB in total)")
     s.add_argument("--archive", action="store_true", help="then move the whole thread out of the inbox")
+    s.add_argument("--plain", action="store_true", help="send the text as it is, not rendered from markdown")
     s.add_argument("--dry-run", action="store_true", help="show who it goes to and the text, send nothing")
     s.set_defaults(fn=cmd_mail_reply)
+
+    s = sub.add_parser("md", help="print the mail HTML for a markdown text, send nothing")
+    s.add_argument("text", nargs="*", help="the text; read from stdin when left out")
+    s.add_argument("-o", "--out", metavar="FILE", help="write it to FILE as a page to open in a browser")
+    s.set_defaults(fn=cmd_mail_md)
 
     s = sub.add_parser("archive", help="move every message in a mail's thread from the inbox to Archive")
     s.add_argument("message", help="any message in the thread: its id, or mail:///messages/<id>")

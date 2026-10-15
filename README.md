@@ -42,7 +42,7 @@ wsg graph login      prints a URL, open it in your browser, sign in
 wsg graph status     who is signed in, token expiry, granted scopes
 wsg graph token      prints an access token, refreshed silently
 wsg graph whoami     calls Graph /me
-wsg graph sendmail   send mail as yourself, body from stdin, --dry-run first
+wsg graph sendmail   send mail as yourself, markdown from stdin, --dry-run first
 wsg graph logout     deletes the cache
 
 wsg arena login      sign in to WeSports Arena (prints the URL, loopback redirect)
@@ -74,7 +74,8 @@ wsg teams chats [X]    your chats, most recent first, filtered by topic or membe
 wsg teams read         one chat, oldest first: --chat ID, --to ADDRESS or --name TEXT
 wsg teams find TEXT    search your chats and channels for TEXT, the whole history
 wsg teams md           print the Teams HTML for a markdown text, send nothing
-wsg mail reply ID      answer a mail in its thread, text from stdin, --dry-run first
+wsg mail reply ID      answer a mail in its thread, markdown from stdin, --dry-run first
+wsg mail md            print the mail HTML for a markdown text (-o FILE to view it), send nothing
 wsg mail archive ID    move every message in a mail's thread from the inbox to Archive
 
 wsg secret create      encrypt a value or --file here, print a one-time link
@@ -204,7 +205,12 @@ EOF
 ```
 
 The body is read from stdin so a here-doc keeps its formatting, which a shell
-argument would mangle. `--dry-run` prints the exact request and sends nothing; use
+argument would mangle. It is markdown, rendered the way `teams send` renders it
+(bold, italic, `code`, code blocks, links, headings, quotes, tables, lists), with
+the look written inline on every tag: Outlook on Windows renders mail with Word
+and ignores a `<style>` block. `--plain` sends the text as it is, `--html` sends
+HTML you wrote yourself, and `wsg mail md -o page.html` shows what a text will
+look like without sending anything. `--dry-run` prints the exact request and sends nothing; use
 it first, because there is no unsend.
 
 `--send-at 2026-10-15T08:00` sends later. A time without an offset is local time.
@@ -236,7 +242,8 @@ wsg mail archive <message-id> --dry-run
 A reply sent with `sendmail` and "Re:" in the subject is a new conversation: the
 recipient sees it apart from the thread, without the quote. `mail reply` goes through
 `createReply` (`createReplyAll` with `--all`), so the answer carries the thread's
-headers and the quoted original. The text is written into the draft's HTML above the
+headers and the quoted original. The text is markdown, as with `sendmail`
+(`--plain` for text as it is), and is written into the draft's HTML above the
 quote rather than passed as `comment`, which joins its lines into one. Attachments are
 added to the draft before it is sent, under the same ~3 MB ceiling as `sendmail`.
 `--dry-run` shows who it would go to, worked out as Outlook does: the sender (or

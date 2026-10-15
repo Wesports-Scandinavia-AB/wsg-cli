@@ -34,15 +34,26 @@ python -m wsg graph status       vem som är inloggad och vad inloggningen omfat
 
 ```
 python -m wsg graph sendmail --to anna@example.com --subject "Ämne" --dry-run <<'EOF'
-Texten här, radbrytningar följer med.
+Hej Anna,
+
+**Det viktiga:** texten är markdown, radbrytningar följer med.
 EOF
 ```
+
+- Texten är markdown och går ut formaterad, som i Teams: fetstil, listor, `kod`,
+  kodblock, citat, tabeller och länkar, med stilarna inline så att Outlook visar
+  dem. Formatera efter innehållet: fetstil på det som inte får missas, det
+  mottagaren ska klistra in eller känna igen (ett kommando, ett fältnamn, JSON)
+  som `kod` eller kodblock, steg som numrerad lista. Ett kort mail är bara stycken.
+- `--plain` skickar texten som ren text, `--html` om texten redan är HTML.
+  `wsg mail md` visar HTML:en, och `-o FIL` sparar den som en sida att öppna i
+  webbläsaren.
 
 - Kör alltid med `--dry-run` först och **visa hela mailet för personen** innan det
   skickas på riktigt. Det finns inget sätt att ta tillbaka ett skickat mail.
 - `sendmail` skickar direkt, det blir inget utkast. En kopia hamnar i Skickat.
 - `--attach FIL` för bilagor (upprepa för flera), högst cirka 3 MB totalt.
-- `--cc` för kopia, `--html` om texten är HTML.
+- `--cc` för kopia.
 - `--send-at 2026-10-15T08:00` skickar senare, i lokal tid. Mailet väntar i Utkorgen
   och går även om datorn är avstängd. Ta bort det ur Utkorgen för att stoppa det.
 
@@ -61,6 +72,7 @@ python -m wsg mail archive MAIL-ID --dry-run
   Hitta mailet med connectorns sökning och svara sedan med wsg.
 - `--all` svarar alla (avsändaren plus Till och Kopia, utom personen själv).
   `--attach FIL` för bilagor, högst cirka 3 MB.
+- Texten är markdown, precis som i `sendmail`. `--plain` skickar den som den är.
 - `--dry-run` visar mottagare, kopia och text. **Visa dem för personen** innan
   svaret går iväg.
 - `--archive` flyttar sedan hela tråden från inkorgen till Arkiv. `mail archive`

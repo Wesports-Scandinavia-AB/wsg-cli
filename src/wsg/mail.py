@@ -1,7 +1,7 @@
 """
 Mail over Graph beyond sendMail: answer in the thread, then archive the thread.
 
-Three things here that are easy to get wrong by hand:
+Four things here that are easy to get wrong by hand:
 
 1. **A reply is not a new mail.** `sendMail` with "Re: " in the subject starts a
    new conversation: the recipient's client shows it apart from the thread, and
@@ -13,7 +13,11 @@ Three things here that are easy to get wrong by hand:
    leaves the rest of the conversation in the inbox, where it looks like it is
    still waiting. `archive` moves every message in the inbox that shares the
    answered message's `conversationId`.
-3. **The connector's ids are Graph's ids.** The M365 connector hands out
+3. **Graph does not render markdown.** A text body shows `**bold**` with its
+   asterisks and code like the rest of the text, so a mail's text is rendered
+   with `markdown.to_mail_html`, its look inline on every tag because Outlook
+   on Windows ignores a <style> block. `plain` sends the text as it is.
+4. **The connector's ids are Graph's ids.** The M365 connector hands out
    `mail:///messages/<id>`; the part after the last slash is the Graph message
    id, so both commands take either form. A message moved to Archive gets a new
    id there; the old one stops working.
@@ -30,6 +34,7 @@ from pathlib import Path
 from urllib import parse
 
 from .auth import graph
+from .markdown import MAIL_FONT, to_mail_html
 
 # Graph caps a request at about 4 MB; base64 adds a third. Same ceiling as sendmail.
 INLINE_LIMIT = 3 * 1024 * 1024
@@ -105,17 +110,25 @@ def file_attachments(paths):
     return out
 
 
-def reply(mid, text, reply_all=False, attachments=None):
+def body_html(text, plain=False):
+    """A mail's text as HTML: markdown rendered (bold, code, lists, tables), or
+    with plain=True escaped as it is, a line break per line."""
+    if plain:
+        lines = "<br>".join(html.escape(l) for l in text.split("\n"))
+        return f'<div style="{MAIL_FONT}">{lines}</div>'
+    return to_mail_html(text)
+
+
+def reply(mid, text, reply_all=False, attachments=None, plain=False):
     """Answer in the thread; returns the sent draft's id."""
     action = "createReplyAll" if reply_all else "createReply"
     draft = graph("POST", f"{_path(mid)}/{action}", body={})
     # `comment` would be simpler, but Graph joins its lines into one (2026-10-13),
     # so the text goes into the draft's HTML right above the quote instead.
-    lines = "<br>".join(html.escape(l) for l in text.split("\n"))
     content = draft["body"]["content"]
     head = re.search(r"<body[^>]*>", content, re.I)
     at = head.end() if head else 0
-    content = content[:at] + f'<div style="font-family:Aptos,Calibri,sans-serif">{lines}</div><br>' + content[at:]
+    content = content[:at] + body_html(text, plain) + "<br>" + content[at:]
     graph("PATCH", _path(draft["id"]), body={"body": {"contentType": "HTML", "content": content}})
     for att in attachments or []:
         graph("POST", f"{_path(draft['id'])}/attachments", body=att)
