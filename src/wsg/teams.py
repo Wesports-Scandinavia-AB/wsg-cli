@@ -1,7 +1,7 @@
 """
 Teams chat over Graph: post a message as the signed-in user.
 
-Five things here that are easy to get wrong by hand:
+Six things here that are easy to get wrong by hand:
 
 1. **Graph does not render markdown.** A message sent as `contentType: text`
    shows `**bold**` with the asterisks, and a numbered list is one long line.
@@ -19,21 +19,29 @@ Five things here that are easy to get wrong by hand:
    Reading must not make a chat, so `one_on_one(address)` looks through the
    chat list instead. A group chat is found by its topic or a member's name
    (`find_chats`) and used by its id (`19:...@thread.v2`).
-4. **Search wants a channel scope even for chats.** Graph's `/search/query`
+4. **A mail address is not a user principal name.** `users('{address}')`
+   resolves the object id and the UPN, nothing else, so binding a chat member
+   to the address people write fails with `NotFound` for every mailbox whose
+   UPN sits on another domain. That is the normal state after a merge or a
+   domain change, and the address still works in mail, which makes the error
+   look like a missing person. `resolve_user` asks the directory instead and
+   matches the mail, the UPN and the proxy addresses, so any address the person
+   answers on reaches them.
+5. **Search wants a channel scope even for chats.** Graph's `/search/query`
    over chat messages requires `ChannelMessage.Read.All` beside `Chat.Read`,
    even when every hit is in a chat. With it (added 2026-10-12), `search` finds
    a word in the whole history, channels included. `find` is the fallback for
    a token without it: it reads the most recent chats and matches here, so it
    sees what is recent, not everything.
 
-5. **A shared file is not in the chat.** It is a link into the sender's OneDrive,
+6. **A shared file is not in the chat.** It is a link into the sender's OneDrive,
    which `Files.ReadWrite` does not reach. `save_files` opens it through
    `/shares/{encoded url}` with `Files.Read.All` (added 2026-10-13) and fetches
    the bytes from the item's pre-signed download URL, which wants no token.
 
 Sending needs `ChatMessage.Send`, finding a 1:1 chat to post in `Chat.Create`,
 reading `Chat.Read`, searching `ChannelMessage.Read.All`, fetching a shared file
-`Files.Read.All`. All five are in the default scope set.
+`Files.Read.All`. All of them are in the default scope set.
 """
 
 import base64
@@ -50,13 +58,48 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 
 # ---------------------------------------------------------------- Graph
 
+def resolve_user(address):
+    """The directory user behind a mail address, in whatever form it is written.
+
+    Matches the mailbox address, the user principal name and the proxy
+    addresses (the aliases), case-insensitively, which covers every form a
+    person could reasonably type for a colleague. Needs User.Read.All, which is
+    in the default scopes; no advanced query header is required for the lambda.
+    Raises LookupError when the directory has no one, or more than one.
+    """
+    quoted = address.replace("'", "''")
+    terms = (f"mail eq '{quoted}' or userPrincipalName eq '{quoted}'"
+             f" or proxyAddresses/any(p:p eq 'smtp:{quoted}')")
+    hits = graph("GET", "/users?$select=id,displayName,userPrincipalName,mail"
+                        f"&$filter={parse.quote(terms)}").get("value", [])
+    if not hits:
+        raise LookupError(f"Ingen användare i katalogen har adressen {address}.")
+    if len(hits) > 1:
+        who = ", ".join(f"{u.get('displayName')} <{u.get('mail') or u.get('userPrincipalName')}>"
+                        for u in hits)
+        raise LookupError(f"Flera användare matchar {address}: {who}. "
+                          "Välj chatten med --chat, se wsg teams chats.")
+    return hits[0]
+
+
 def chat_with(address):
     """The id of the 1:1 chat with `address`, made if it does not exist yet.
 
     POST /chats answers with the chat the two already share, so this is a
-    lookup as much as a create. It needs Chat.Create.
+    lookup as much as a create. It needs Chat.Create. The member is bound by
+    object id, because the address alone resolves only when it doubles as the
+    UPN (see 4 in the module docstring).
     """
     me = graph("GET", "/me?$select=id")["id"]
+    try:
+        them = resolve_user(address)["id"]
+    except Exception:
+        # Outside the directory (a federated chat partner), or a token without
+        # User.Read.All: an existing chat still carries the address.
+        existing = one_on_one(address)
+        if existing:
+            return existing
+        raise
     member = "#microsoft.graph.aadUserConversationMember"
     body = {
         "chatType": "oneOnOne",
@@ -64,7 +107,7 @@ def chat_with(address):
             {"@odata.type": member, "roles": ["owner"],
              "user@odata.bind": f"{GRAPH}/users('{me}')"},
             {"@odata.type": member, "roles": ["owner"],
-             "user@odata.bind": f"{GRAPH}/users('{parse.quote(address)}')"},
+             "user@odata.bind": f"{GRAPH}/users('{them}')"},
         ],
     }
     return graph("POST", "/chats", body=body)["id"]
@@ -115,12 +158,30 @@ def find_chats(query, limit=200):
 
 
 def one_on_one(address, limit=500):
-    """The id of the 1:1 chat with `address`, or None. Reads only."""
-    a = address.casefold()
+    """The id of the 1:1 chat with `address`, or None. Reads only.
+
+    A chat member carries one address, which need not be the one the person
+    was asked for, so the directory lookup decides who is meant and the member
+    is recognised by object id. Without it (no directory read, or someone
+    outside it) the written address is still compared to the member's own.
+    """
+    wanted = {address.casefold()}
+    user_id = None
+    try:
+        user = resolve_user(address)
+        user_id = user["id"]
+        wanted |= {(user.get("mail") or "").casefold(),
+                   (user.get("userPrincipalName") or "").casefold()} - {""}
+    except Exception:
+        pass
     for c in chats(limit):
-        if c.get("chatType") == "oneOnOne" and any(
-                (m.get("email") or "").casefold() == a for m in c.get("members", [])):
-            return c["id"]
+        if c.get("chatType") != "oneOnOne":
+            continue
+        for m in c.get("members", []):
+            if user_id and m.get("userId") == user_id:
+                return c["id"]
+            if (m.get("email") or "").casefold() in wanted:
+                return c["id"]
     return None
 
 

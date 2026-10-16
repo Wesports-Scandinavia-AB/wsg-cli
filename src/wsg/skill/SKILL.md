@@ -93,6 +93,10 @@ EOF
   direkt under en textrad blir en lista.
 - `--to ADRESS` skriver i 1:1-chatten med personen (den hittas, eller skapas om den
   inte finns). `--chat ID` skriver i en bestämd chatt, t.ex. en gruppchatt.
+- Adressen får vara vilken som helst som personen har: mailadressen, inloggningsnamnet
+  eller ett alias. De behöver inte vara samma sak, och wsg slår upp personen i
+  katalogen i stället för att gissa (0.12.1). Får du ändå "Ingen användare i katalogen
+  har adressen ...", ta chatt-id:t från `wsg teams chats` och skriv med `--chat`.
 - Texten tas från argumenten eller från stdin. Kör `--dry-run` först och **visa
   meddelandet för personen** innan det skickas. Ett skickat meddelande syns direkt
   hos mottagaren.
