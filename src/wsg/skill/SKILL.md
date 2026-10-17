@@ -169,6 +169,33 @@ python -m wsg secret create --file nyckel.json --title "API-nyckel" --ttl 7d
   aldrig vad det innehåller.
 - Ingen inloggning behövs.
 
+## Korta länkar
+
+En lång adress blir kort på go.wesports.io. Länken kan gälla för alltid eller
+försvinna efter en användning, och allt däremellan:
+
+```
+python -m wsg link create "https://lang.adress/..."              gäller för alltid
+python -m wsg link create "https://..." --once                   borta efter en användning
+python -m wsg link create "https://..." --times 5                fungerar fem gånger
+python -m wsg link create "https://..." --until 2026-10-23       till och med den dagen
+python -m wsg link create "https://..." --name offsite-2026      välj namnet själv
+python -m wsg link list                                          de aktiva länkarna
+python -m wsg link revoke SLUG                                   ta tillbaka en länk
+```
+
+- **Det här är inte vägen för ett lösenord.** En kort länk skickar vidare, den
+  döljer ingenting. Hemligheter går via `wsg secret create` ovan.
+- stdout är bara länken, resten går till stderr, precis som `secret create`.
+- `--name` fungerar bara på en länk utan användningstak. En engångslänk får ett
+  slumpat namn, för ett namn som går att gissa kan någon annan bränna innan
+  mottagaren hinner öppna.
+- `--until` läses som UTC. Ett datum utan klockslag betyder slutet av den dagen.
+- Länken förbrukas inte av att klistras in i Teams eller Outlook: tjänsten
+  skiljer en människa som klickar från en förhandsvisning som hämtar.
+- Kräver en service token i `go.json` i wsg:s konfigkatalog. Saknas den säger
+  kommandot det.
+
 ## Arena
 
 ```

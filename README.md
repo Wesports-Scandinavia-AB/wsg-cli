@@ -7,6 +7,7 @@ do. Three services today:
 - `wsg graph` — Microsoft Graph, signed in with your Entra account
 - `wsg arena` — WeSports Arena, signed in with Arena's own OAuth (no Cloudflare Access since 2026-09-20)
 - `wsg secret` — one-time links on secrets.wesports.io, no sign-in
+- `wsg link` — short links on go.wesports.io, with a service token
 
 ## Install
 
@@ -80,6 +81,10 @@ wsg mail archive ID    move every message in a mail's thread from the inbox to A
 
 wsg secret create      encrypt a value or --file here, print a one-time link
 wsg secret delete      destroy a link before it is opened
+
+wsg link create        shorten a URL: for ever, or gone after one use
+wsg link list          your short links
+wsg link revoke        withdraw one
 
 wsg skill install      write the Claude skill to ~/.claude/skills/wsg/
 wsg update             get the latest wsg-cli from GitHub and refresh the skill
@@ -350,6 +355,46 @@ secret — whoever holds it can open it, once.
 AES-GCM is implemented in plain Python in `onetime.py`, since the package has no
 dependencies and the standard library has no AES. It was checked against the
 `cryptography` package and against the service's reveal endpoint.
+
+## Short links
+
+A long URL as a short one on go.wesports.io. The lifetime is the interesting
+part: a link can last for ever, or be gone the moment somebody uses it.
+
+```
+wsg link create "https://long.example/..."                 unlimited, no expiry
+wsg link create "https://..." --once                       spent on first use
+wsg link create "https://..." --times 5                    works five times
+wsg link create "https://..." --until 2026-10-23           through the end of that day, UTC
+wsg link create "https://..." --name offsite-2026          choose the short name
+wsg link list [--all]                                      yours; --all includes spent ones
+wsg link revoke SLUG                                       it stops working for everyone
+```
+
+- **This is not how a password travels.** A short link forwards, it hides
+  nothing. Secrets go through `secret create` above.
+- `--name` only works on a link with no use limit. One that can run out gets a
+  random name, because a name that can be guessed is a one-use link a stranger
+  can spend before the recipient opens their mail.
+- Pasting a one-use link into Teams or Outlook does not spend it. The service
+  tells a person clicking from a preview fetching, and only the first spends a
+  use.
+- stdout is the link alone so it pipes; the lifetime and the revoke command go
+  to stderr.
+
+Unlike `secret`, this needs a credential: creating a link goes through the
+service's machine door, behind its own Cloudflare Access application. Put the
+service token in `go.json` in the config directory (`%LOCALAPPDATA%\wsg` on
+Windows, `~/.config/wsg` otherwise), or in `WSG_GO_CLIENT_ID` and
+`WSG_GO_CLIENT_SECRET`:
+
+```json
+{"client_id": "....access", "client_secret": "..."}
+```
+
+secrets.wesports.io is public and needs nothing; go.wesports.io is not, because
+an open redirector on a wesports.io hostname would be a phishing tool wearing
+our own domain.
 
 ## The work calendar
 

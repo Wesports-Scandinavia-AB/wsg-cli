@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import arena, auth, mscal, onetime, planner
+from . import arena, auth, mscal, onetime, planner, shortlink
 from .scopes import DEFAULT_SCOPES
 
 
@@ -1723,6 +1723,109 @@ def _add_secret_commands(sub):
     s.set_defaults(fn=cmd_secret_delete)
 
 
+# ── Short links (go.wesports.io) ──────────────────────────────────────────────
+# A long URL as a short one. The neighbouring `secret` commands hand over a value
+# that burns on first read; these hand over a destination, and it can burn the
+# same way or last for ever. This one needs a service token, because an open
+# redirector on a wesports.io hostname is a phishing tool wearing our domain —
+# see shortlink.py.
+
+
+def _link_mode(a):
+    """The one lifetime flag that was given, as (mode, uses)."""
+    if a.once:
+        return "once", None
+    if a.times is not None:
+        return "times", a.times
+    if a.until:
+        return "until", None
+    return "forever", None
+
+
+def cmd_link_create(a):
+    mode, uses = _link_mode(a)
+    try:
+        r = shortlink.create(a.url, mode=mode, uses=uses, until=a.until, name=a.name, title=a.title)
+    except shortlink.ShortLinkError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return 0
+    # The link alone on stdout so it pipes; the rest is for the person at the prompt.
+    print(r["url"])
+    print(f"{r['lifetime']} → {r['target']}", file=sys.stderr)
+    if r.get("maxUses") == 1:
+        print("Engångslänk: den som öppnar den först kommer fram, nästa får veta att den är använd.",
+              file=sys.stderr)
+    print(f"Ta tillbaka den: wsg link revoke {r['slug']}", file=sys.stderr)
+    return 0
+
+
+def cmd_link_list(a):
+    try:
+        rows = shortlink.links()
+    except shortlink.ShortLinkError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("Inga länkar än.")
+        return 0
+    if not a.all:
+        rows = [r for r in rows if r.get("state") == "live"]
+        if not rows:
+            print("Inga aktiva länkar. Visa de använda och återkallade med --all.")
+            return 0
+    width = max(len(r["url"]) for r in rows)
+    for r in rows:
+        # State as a word, never as a colour: this is read in whatever terminal
+        # the person happens to have.
+        print(f"{r['url']:<{width}}  {r['state']:<8}  {r['lifetime']}")
+        print(f"{'':<{width}}  → {r['target']}")
+    return 0
+
+
+def cmd_link_revoke(a):
+    try:
+        shortlink.revoke(a.slug)
+    except shortlink.ShortLinkError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(f"Återkallad. {shortlink.BASE}/{a.slug} skickar ingen vidare längre.")
+    return 0
+
+
+def _add_link_commands(sub):
+    s = sub.add_parser("create", help="shorten a URL; it lasts for ever unless you say otherwise")
+    s.add_argument("url", metavar="URL", help="the destination, http:// or https://")
+    life = s.add_mutually_exclusive_group()
+    life.add_argument("--once", action="store_true",
+                      help="gone after one use — the first person through gets it, nobody else")
+    life.add_argument("--times", type=int, metavar="N", help="works N times, then it is spent")
+    life.add_argument("--until", metavar="TIME",
+                      help="works until this moment, UTC: 2026-10-23T17:00, or a bare date "
+                           "for the end of that day")
+    s.add_argument("--name", metavar="SLUG",
+                   help="choose the short name instead of getting a random one. Only for a link "
+                        "with no use limit: a name that can be guessed is a one-use link somebody "
+                        "else can spend")
+    s.add_argument("--title", help="a note to yourself, shown only in your own list")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_link_create)
+
+    s = sub.add_parser("list", help="your short links, newest first")
+    s.add_argument("--all", action="store_true", help="include spent, expired and revoked links")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_link_list)
+
+    s = sub.add_parser("revoke", help="withdraw a link; it stops working for everyone")
+    s.add_argument("slug", metavar="SLUG", help="the short name, e.g. arena or j93ccdcp04")
+    s.set_defaults(fn=cmd_link_revoke)
+
+
 # ── skill and update ──────────────────────────────────────────────────────────
 # The same pair e37-cli has (2026-10-07): a colleague's Claude installs wsg from
 # INSTALL-FOR-CLAUDE.md, writes the skill, and later updates both with one command.
@@ -1853,6 +1956,9 @@ def main(argv=None):
 
     se = sub.add_parser("secret", help="one-time links on secrets.wesports.io, encrypted before they leave")
     _add_secret_commands(se.add_subparsers(dest="secret_cmd", required=True))
+
+    li = sub.add_parser("link", help="short links on go.wesports.io, for ever or gone after one use")
+    _add_link_commands(li.add_subparsers(dest="link_cmd", required=True))
 
     sk = sub.add_parser("skill", help="the Claude skill for wsg: install, show")
     _add_skill_commands(sk.add_subparsers(dest="skill_cmd", required=True))
