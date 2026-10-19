@@ -595,13 +595,23 @@ def cmd_arena_logout(a):
     return 0
 
 
+def _never(s):
+    """True for a timestamp that stands for "never".
+
+    Graph writes 0001-01-01T00:00:00Z rather than omitting the field: a device
+    that has not checked in yet, a record nobody has booted. It is a sentinel,
+    not a date, and astimezone() raises OSError on year 1 on Windows, so it has
+    to be caught before anything tries to convert it."""
+    return not s or s.startswith("0001-01-01")
+
+
 def _ts(s, with_time=True):
     """Graph timestamps are ISO 8601 in UTC; show them as local wall clock."""
-    if not s:
+    if _never(s):
         return "-"
     try:
         d = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone()
-    except ValueError:
+    except (ValueError, OSError):
         return s
     return d.strftime("%Y-%m-%d %H:%M" if with_time else "%Y-%m-%d")
 
