@@ -1745,7 +1745,8 @@ def _link_mode(a):
 def cmd_link_create(a):
     mode, uses = _link_mode(a)
     try:
-        r = shortlink.create(a.url, mode=mode, uses=uses, until=a.until, name=a.name, title=a.title)
+        r = shortlink.create(a.url, mode=mode, uses=uses, until=a.until, name=a.name,
+                             title=a.title, confirm=a.confirm)
     except shortlink.ShortLinkError as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -1758,6 +1759,9 @@ def cmd_link_create(a):
     if r.get("maxUses") == 1:
         print("Engångslänk: den som öppnar den först kommer fram, nästa får veta att den är använd.",
               file=sys.stderr)
+    if r.get("confirm"):
+        print("Frågar först: mottagaren får en sida med en knapp, och bara knappen "
+              "förbrukar användningen.", file=sys.stderr)
     print(f"Ta tillbaka den: wsg link revoke {r['slug']}", file=sys.stderr)
     return 0
 
@@ -1812,6 +1816,10 @@ def _add_link_commands(sub):
                    help="choose the short name instead of getting a random one. Only for a link "
                         "with no use limit: a name that can be guessed is a one-use link somebody "
                         "else can spend")
+    s.add_argument("--confirm", action="store_true",
+                   help="open a page with a button instead of redirecting, and spend the use "
+                        "only when it is pressed. Without this the service reads Sec-Fetch-* "
+                        "and lets an obvious click through in one hop. Needs --once or --times")
     s.add_argument("--title", help="a note to yourself, shown only in your own list")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_link_create)

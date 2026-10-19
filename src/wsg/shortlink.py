@@ -1,6 +1,7 @@
 """
 Short links on go.wesports.io: turn a long URL into a short one that either lasts
-for ever or is gone after one use.
+for ever or is gone after one use, and which can insist on a click before it
+spends that use.
 
 Unlike `wsg secret create`, this needs a credential. secrets.wesports.io is public;
 go.wesports.io is not, because an open redirector on a wesports.io hostname is a
@@ -78,10 +79,22 @@ def normalise_until(value):
     return v
 
 
-def create(target, *, mode="forever", uses=None, until=None, name=None, title=None):
-    """Make a link. Returns the service's JSON, whose `url` is the short link."""
+def create(target, *, mode="forever", uses=None, until=None, name=None, title=None,
+           confirm=False):
+    """Make a link. Returns the service's JSON, whose `url` is the short link.
+
+    `confirm` makes the link always open a page with a button, and nothing but
+    that button can spend its use. Without it the service reads `Sec-Fetch-*`
+    and lets a request that is unmistakably somebody clicking through in one
+    hop, which is right nearly always and is still a judgement. The service
+    refuses `confirm` on a link with no use limit: there would be nothing to
+    protect.
+    """
     if mode not in MODES:
         raise ShortLinkError(f"mode måste vara en av {', '.join(MODES)}")
+    if confirm and mode not in ("once", "times"):
+        raise ShortLinkError("--confirm går bara ihop med --once eller --times: "
+                             "en länk utan användningsgräns har inget att spara.")
     body = {"target": target, "mode": mode}
     if mode == "times":
         body["uses"] = uses
@@ -91,6 +104,8 @@ def create(target, *, mode="forever", uses=None, until=None, name=None, title=No
         body["slug"] = name
     if title:
         body["title"] = title
+    if confirm:
+        body["confirm"] = True
     return _call("POST", "/api/machine/links", body)
 
 

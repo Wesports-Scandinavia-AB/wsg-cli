@@ -82,7 +82,7 @@ wsg mail archive ID    move every message in a mail's thread from the inbox to A
 wsg secret create      encrypt a value or --file here, print a one-time link
 wsg secret delete      destroy a link before it is opened
 
-wsg link create        shorten a URL: for ever, or gone after one use
+wsg link create        shorten a URL: for ever, gone after one use, or after one click
 wsg link list          your short links
 wsg link revoke        withdraw one
 
@@ -367,6 +367,7 @@ wsg link create "https://..." --once                       spent on first use
 wsg link create "https://..." --times 5                    works five times
 wsg link create "https://..." --until 2026-10-23           through the end of that day, UTC
 wsg link create "https://..." --name offsite-2026          choose the short name
+wsg link create "https://..." --once --confirm             a page with a button, then through
 wsg link list [--all]                                      yours; --all includes spent ones
 wsg link revoke SLUG                                       it stops working for everyone
 ```
@@ -379,6 +380,10 @@ wsg link revoke SLUG                                       it stops working for 
 - Pasting a one-use link into Teams or Outlook does not spend it. The service
   tells a person clicking from a preview fetching, and only the first spends a
   use.
+- `--confirm` takes that judgement away: the link always opens a page with a
+  button, and only the button spends the use. Worth it when losing the one use
+  to something that was not a person would be worse than the extra click. It
+  needs `--once` or `--times`, since a link with no limit has nothing to save.
 - stdout is the link alone so it pipes; the lifetime and the revoke command go
   to stderr.
 
