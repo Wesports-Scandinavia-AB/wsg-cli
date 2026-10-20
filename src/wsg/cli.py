@@ -1714,8 +1714,9 @@ def _add_secret_commands(sub):
     s = sub.add_parser("create", help="encrypt a value here and print a one-time link; the "
                                       "value comes from stdin or --file, never an argument")
     s.add_argument("--file", metavar="PATH", help="send this file's contents, unchanged")
-    s.add_argument("--ttl", choices=onetime.TTLS, default="1d",
-                   help="how long the link lives if nobody opens it (default 1d)")
+    s.add_argument("--ttl", default="1d", metavar="DUR",
+                   help="how long the link lives if nobody opens it: a number and a unit, "
+                        f"m, h, d or w ({onetime.TTL_EXEMPEL}); at most 365d (default 1d)")
     s.add_argument("--views", type=int, default=1, metavar="N",
                    help=f"how many times it can be opened, 1-{onetime.MAX_VIEWS} (default 1)")
     s.add_argument("--title", help="shown before opening, readable by anyone with the link "

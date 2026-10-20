@@ -30,12 +30,17 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets as _secrets
 from urllib import request
 from urllib.error import HTTPError, URLError
 
 BASE = os.environ.get("WSG_SECRETS_URL", "https://secrets.wesports.io").rstrip("/")
-TTLS = ("1h", "1d", "7d")
+# Speglar tjänstens egen tolkning: ett tal och en enhet, från en minut till ett
+# år. Kontrollen här finns bara för att svara direkt i stället för att gå ut på
+# nätet med något som ändå avvisas; servern validerar om.
+TTL_RE = re.compile(r"^\d{1,6}[mhdw]$")
+TTL_EXEMPEL = "30m, 12h, 21d, 4w"
 MAX_VIEWS = 10
 PBKDF2_ITERS = 310000   # same as crypto.js; the reveal page reads it from the envelope
 
@@ -164,8 +169,9 @@ def _aes_key(raw, passphrase, salt):
 def create(value, *, ttl="1d", views=1, title=None, passphrase=None):
     """Encrypt `value` here and store the envelope. Returns the service's answer
     plus `link`, the only place the key exists."""
-    if ttl not in TTLS:
-        raise OnetimeError(f"--ttl måste vara en av {', '.join(TTLS)}")
+    ttl = ttl.strip().lower()
+    if not TTL_RE.match(ttl):
+        raise OnetimeError(f"--ttl är ett tal och en enhet: m, h, d eller w. Till exempel {TTL_EXEMPEL}")
     if not 1 <= views <= MAX_VIEWS:
         raise OnetimeError(f"--views måste vara 1–{MAX_VIEWS}")
     raw = _secrets.token_bytes(32)
