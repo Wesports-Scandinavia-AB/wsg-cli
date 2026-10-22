@@ -40,8 +40,8 @@ from .markdown import MAIL_FONT, to_mail_html
 INLINE_LIMIT = 3 * 1024 * 1024
 
 
-def messages(n=30, senders=None, unread=False):
-    """Own mailbox, newest first; n counts matches across all Graph pages.
+def messages(n=30, senders=None, unread=False, all_folders=False):
+    """Own inbox by default, newest first; n counts matches across Graph pages.
 
     Match name/address fragments locally: Graph's search has result limits and
     different ordering, and combining sender filters with orderby can fail with
@@ -57,7 +57,8 @@ def messages(n=30, senders=None, unread=False):
         "$orderby": "receivedDateTime desc",
         "$top": 100 if terms or unread else min(n, 100),
     })
-    url = f"/me/messages?{query}"
+    path = "/me/messages" if all_folders else "/me/mailFolders/inbox/messages"
+    url = f"{path}?{query}"
     out = []
     while url:
         page = graph("GET", url)
@@ -76,7 +77,7 @@ def messages(n=30, senders=None, unread=False):
             # Never send the cached credential to a different host or mailbox.
             target = parse.urlsplit(url)
             if (target.scheme != "https" or target.netloc != "graph.microsoft.com"
-                    or target.path != "/v1.0/me/messages" or target.fragment):
+                    or target.path != f"/v1.0{path}" or target.fragment):
                 raise ValueError("Graph returnerade en ogiltig sidlänk.")
     return out
 

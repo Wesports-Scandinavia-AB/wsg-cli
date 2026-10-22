@@ -1544,7 +1544,7 @@ def cmd_mail_list(a):
     from urllib.error import HTTPError, URLError
 
     try:
-        rows = mail.messages(a.number, a.senders, a.unread)
+        rows = mail.messages(a.number, a.senders, a.unread, a.all_folders)
     except auth.AuthError:
         # Token endpoint errors may contain credentials; do not echo them.
         print("Kunde inte använda inloggningen. Kör: wsg graph login", file=sys.stderr)
@@ -1682,7 +1682,8 @@ def cmd_mail_archive(a):
 
 
 def _add_mail_commands(sub):
-    s = sub.add_parser("list", help="list your own mail, newest first, across all folders")
+    s = sub.add_parser("list", help="list your inbox, newest first")
+    s.add_argument("--all-folders", action="store_true", help="include all mailbox folders instead of only Inbox")
     s.add_argument("--from", dest="senders", action="append", type=_mail_sender, metavar="TEXT",
                    help="case-insensitive name or address fragment (repeat to match any)")
     s.add_argument("-n", "--number", "--limit", type=_mail_count, default=30,

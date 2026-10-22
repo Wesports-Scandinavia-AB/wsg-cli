@@ -36,15 +36,17 @@ python -m wsg graph status       vem som är inloggad och vad inloggningen omfat
 python -m wsg mail list                                  senaste 30, nyast först
 python -m wsg mail list --from Alex --from Sam -n 10       från någon av avsändarna
 python -m wsg mail list --from someone@example.com --unread --json
+python -m wsg mail list --all-folders                     även övriga mappar
 ```
 
-- Använder befintlig `wsg graph login`, bara personens egen brevlåda. Alla mappar
-  ingår, även Skickat och Borttaget. Inga mejl markeras som lästa.
+- Använder befintlig `wsg graph login`, bara personens egen inkorg som standard.
+  `--all-folders` tar med alla egna mappar, även Skickat och Borttaget.
+  Inga mejl markeras som lästa.
 - `--from TEXT` matchar en del av avsändarens namn eller adress utan hänsyn till
   stora/små bokstäver. Upprepa flaggan för flera alternativ (någon av dem).
 - `--unread` tar bara olästa. `-n`, `--number` och `--limit` anger ett positivt
   maxantal träffar, 30 som standard. Senare sidor hämtas tills antalet uppnåtts
-  eller brevlådan tar slut. Glesa filter kan därför ta tid.
+  eller de valda mapparna tar slut. Glesa filter kan därför ta tid.
 - Visar datum i lokal tid, avsändare, ämne och lässtatus. `--json` ger en array
   med `id`, `receivedDateTime`, `from.emailAddress`, `subject` och `isRead`;
   tomt resultat är `[]`. Använd `id` för svar eller arkivering.

@@ -17,6 +17,23 @@ def message(mid, name="Alex", address="alex@example.com", read=False):
 
 class MailMessagesTests(unittest.TestCase):
     @patch("wsg.mail.graph")
+    def test_all_folders_opt_in_uses_mailbox_endpoint_and_pagination(self, graph):
+        link = "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=opaque%2B1"
+        rows = [message("first"), message("second")]
+        graph.side_effect = [{"value": rows[:1], "@odata.nextLink": link}, {"value": rows[1:]}]
+        self.assertEqual(mail.messages(2, all_folders=True), rows)
+        self.assertEqual(urlsplit(graph.call_args_list[0].args[1]).path, "/me/messages")
+        self.assertEqual(graph.call_args_list[1].args, ("GET", link))
+
+    @patch("wsg.mail.graph")
+    def test_inbox_pagination_cannot_expand_to_all_folders(self, graph):
+        graph.return_value = {"value": [],
+                              "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=1"}
+        with self.assertRaises(ValueError):
+            mail.messages()
+        graph.assert_called_once()
+
+    @patch("wsg.mail.graph")
     def test_query_and_limit_stop_before_another_page(self, graph):
         rows = [message(str(i)) for i in range(3)]
         graph.return_value = {"value": rows, "@odata.nextLink": "unused"}
@@ -24,7 +41,7 @@ class MailMessagesTests(unittest.TestCase):
         graph.assert_called_once()
         method, url = graph.call_args.args
         self.assertEqual(method, "GET")
-        self.assertEqual(urlsplit(url).path, "/me/messages")
+        self.assertEqual(urlsplit(url).path, "/me/mailFolders/inbox/messages")
         query = parse_qs(urlsplit(url).query)
         self.assertEqual(query["$orderby"], ["receivedDateTime desc"])
         self.assertEqual(query["$top"], ["2"])
@@ -34,7 +51,7 @@ class MailMessagesTests(unittest.TestCase):
 
     @patch("wsg.mail.graph")
     def test_filters_count_matches_across_empty_pages_and_preserve_nextlink(self, graph):
-        links = [f"https://graph.microsoft.com/v1.0/me/messages?$skiptoken=opaque%2B{i}"
+        links = [f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skiptoken=opaque%2B{i}"
                  for i in range(3)]
         wanted = [message("name", name="ÅLEX Berg"),
                   message("address", name="Other", address="TEAM@example.com")]
@@ -60,7 +77,7 @@ class MailMessagesTests(unittest.TestCase):
 
     @patch("wsg.mail.graph")
     def test_large_count_pages_and_caps_page_size(self, graph):
-        link = "https://graph.microsoft.com/v1.0/me/messages?$skip=100"
+        link = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skip=100"
         first = [message(str(i)) for i in range(100)]
         last = message("last")
         graph.side_effect = [{"value": first, "@odata.nextLink": link}, {"value": [last]}]
@@ -76,8 +93,8 @@ class MailMessagesTests(unittest.TestCase):
 
     @patch("wsg.mail.graph")
     def test_reject_untrusted_pagination_before_sending_credentials(self, graph):
-        for link in ["https://example.com/v1.0/me/messages", "http://graph.microsoft.com/v1.0/me/messages",
-                     "https://graph.microsoft.com.evil/v1.0/me/messages",
+        for link in ["https://example.com/v1.0/me/mailFolders/inbox/messages", "http://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages",
+                     "https://graph.microsoft.com.evil/v1.0/me/mailFolders/inbox/messages",
                      "https://graph.microsoft.com/v1.0/users/other/messages"]:
             with self.subTest(link=link):
                 graph.reset_mock()
@@ -95,6 +112,12 @@ class MailListCliTests(unittest.TestCase):
         return code, stdout.getvalue(), stderr.getvalue()
 
     @patch("wsg.mail.messages")
+    def test_all_folders_option(self, messages):
+        messages.return_value = []
+        self.assertEqual(self.run_cli(["--all-folders", "--json"]), (0, "[]\n", ""))
+        messages.assert_called_once_with(30, None, False, True)
+
+    @patch("wsg.mail.messages")
     def test_json_and_parser_options(self, messages):
         rows = [message("graph-id")]
         messages.return_value = rows
@@ -103,14 +126,14 @@ class MailListCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(stdout), rows)
         self.assertEqual(stderr, "")
-        messages.assert_called_once_with(7, ["Alex", "Sam"], True)
+        messages.assert_called_once_with(7, ["Alex", "Sam"], True, False)
 
     @patch("wsg.mail.messages")
     def test_default_and_count_aliases(self, messages):
         messages.return_value = []
         for args, n in [([], 30), (["--number", "4"], 4), (["--limit", "5"], 5)]:
             self.assertEqual(self.run_cli(args)[0], 0)
-            messages.assert_called_with(n, None, False)
+            messages.assert_called_with(n, None, False, False)
 
     @patch("wsg.mail.messages")
     def test_invalid_arguments_fail_before_auth(self, messages):
@@ -148,7 +171,7 @@ class MailListCliTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 graph.side_effect = [
                     {"value": [message("partial")],
-                     "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=1"},
+                     "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skip=1"},
                     error,
                 ]
                 code, stdout, stderr = self.run_cli(["--json"])
@@ -170,7 +193,7 @@ class MailListCliTests(unittest.TestCase):
         get_token.assert_called_once_with(None, None)
         req = urlopen.call_args.args[0]
         self.assertEqual(req.get_method(), "GET")
-        self.assertTrue(req.full_url.startswith("https://graph.microsoft.com/v1.0/me/messages?"))
+        self.assertTrue(req.full_url.startswith("https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?"))
         self.assertEqual(req.get_header("Authorization"), "Bearer test-only-credential")
         self.assertNotIn("test-only-credential", stdout + stderr)
 
