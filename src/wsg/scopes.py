@@ -27,6 +27,10 @@ DEFAULT_SCOPES = [
     "MailboxSettings.ReadWrite",
     # wsg calendar: speglade bokningar som upptagen-tid i den egna kalendern
     "Calendars.ReadWrite",
+    # Läsa kalendern på en delad brevlåda man har FullAccess till, t.ex.
+    # coordination@wesportsgroup.com. Calendars.ReadWrite räcker bara för den
+    # egna kalendern; Graph kräver .Shared för en annans, FullAccess eller ej.
+    "Calendars.Read.Shared",
     # Namn på personer och grupper, t.ex. vilka som är tilldelade i Planner
     # (directoryObjects/getByIds). Bara läsning, samma katalog som Outlook visar.
     "User.Read.All",
