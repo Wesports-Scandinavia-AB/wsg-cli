@@ -1,5 +1,5 @@
 """
-Mail over Graph beyond sendMail: answer in the thread, then archive the thread.
+Mail over Graph beyond sendMail: list mail, reply and archive threads.
 
 Four things here that are easy to get wrong by hand:
 
@@ -38,6 +38,47 @@ from .markdown import MAIL_FONT, to_mail_html
 
 # Graph caps a request at about 4 MB; base64 adds a third. Same ceiling as sendmail.
 INLINE_LIMIT = 3 * 1024 * 1024
+
+
+def messages(n=30, senders=None, unread=False):
+    """Own mailbox, newest first; n counts matches across all Graph pages.
+
+    Match name/address fragments locally: Graph's search has result limits and
+    different ordering, and combining sender filters with orderby can fail with
+    InefficientFilter. Fetch metadata only, following nextLink unchanged.
+    """
+    if n < 1:
+        raise ValueError("Antalet måste vara minst 1.")
+    terms = [s.strip().casefold() for s in senders or []]
+    if any(not s for s in terms):
+        raise ValueError("Avsändarfiltret får inte vara tomt.")
+    query = parse.urlencode({
+        "$select": "id,receivedDateTime,from,subject,isRead",
+        "$orderby": "receivedDateTime desc",
+        "$top": 100 if terms or unread else min(n, 100),
+    })
+    url = f"/me/messages?{query}"
+    out = []
+    while url:
+        page = graph("GET", url)
+        for msg in page.get("value", []):
+            if unread and msg.get("isRead") is not False:
+                continue
+            sender = (msg.get("from") or {}).get("emailAddress") or {}
+            values = [(sender.get(k) or "").casefold() for k in ("name", "address")]
+            if terms and not any(term in value for term in terms for value in values):
+                continue
+            out.append(msg)
+            if len(out) == n:
+                return out
+        url = page.get("@odata.nextLink")
+        if url:
+            # Never send the cached credential to a different host or mailbox.
+            target = parse.urlsplit(url)
+            if (target.scheme != "https" or target.netloc != "graph.microsoft.com"
+                    or target.path != "/v1.0/me/messages" or target.fragment):
+                raise ValueError("Graph returnerade en ogiltig sidlänk.")
+    return out
 
 
 def message_id(ref):

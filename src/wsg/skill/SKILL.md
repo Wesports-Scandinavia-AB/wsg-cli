@@ -1,6 +1,6 @@
 ---
 name: wsg
-description: Logga in som sig själv mot Microsoft 365 (Graph) och WeSports Arena med wsg-cli, och använd det för att skicka mail, svara på mail i tråden och arkivera trådar, skriva, läsa och söka i Teams, läsa Planner-tavlor, skapa engångslänkar för lösenord och nycklar, eller hämta en token till ett eget script. Use when the user wants to send a mail, answer a mail in its thread, archive a mail thread, or send a Teams message from the terminal, read a Teams chat or find something said in Teams, asks what is on a Planner board or what Planner tasks are theirs, needs to hand someone a password or API key safely, asks for a Graph or Arena token, or says "wsg". Exempel "skicka ett mail till Anna med rapporten", "svara Erik att torsdag funkar", "arkivera tråden", "skriv till Erik i Teams att det är klart", "vad skrev Gustav i Teams idag", "var var det någon nämnde returfrakten i Teams", "vad har jag i Planner", "vad ligger på tavlan Vartex Service", "skicka lösenordet till Erik på ett säkert sätt", "logga in wsg", "uppdatera wsg".
+description: Logga in som sig själv mot Microsoft 365 (Graph) och WeSports Arena med wsg-cli, och använd det för att skicka mail, svara på mail i tråden och arkivera trådar, skriva, läsa och söka i Teams, läsa Planner-tavlor, skapa engångslänkar för lösenord och nycklar, eller hämta en token till ett eget script. Use when the user wants to list or filter their own mail by sender or unread status, send a mail, answer a mail in its thread, archive a mail thread, or send a Teams message from the terminal, read a Teams chat or find something said in Teams, asks what is on a Planner board or what Planner tasks are theirs, needs to hand someone a password or API key safely, asks for a Graph or Arena token, or says "wsg". Exempel "skicka ett mail till Anna med rapporten", "svara Erik att torsdag funkar", "arkivera tråden", "skriv till Erik i Teams att det är klart", "vad skrev Gustav i Teams idag", "var var det någon nämnde returfrakten i Teams", "vad har jag i Planner", "vad ligger på tavlan Vartex Service", "skicka lösenordet till Erik på ett säkert sätt", "logga in wsg", "uppdatera wsg".
 ---
 
 # wsg: inloggning mot Microsoft 365 och Arena
@@ -29,6 +29,26 @@ python -m wsg graph status       vem som är inloggad och vad inloggningen omfat
   ska öppna den. Öppna aldrig webbläsaren själv.
 - Inloggningen håller i 90 dagar efter senaste användning. Svarar ett kommando
   `Not signed in. Run: wsg graph login` (slutkod 2), logga in igen.
+
+## Lista egna mejl
+
+```
+python -m wsg mail list                                  senaste 30, nyast först
+python -m wsg mail list --from Alex --from Sam -n 10       från någon av avsändarna
+python -m wsg mail list --from someone@example.com --unread --json
+```
+
+- Använder befintlig `wsg graph login`, bara personens egen brevlåda. Alla mappar
+  ingår, även Skickat och Borttaget. Inga mejl markeras som lästa.
+- `--from TEXT` matchar en del av avsändarens namn eller adress utan hänsyn till
+  stora/små bokstäver. Upprepa flaggan för flera alternativ (någon av dem).
+- `--unread` tar bara olästa. `-n`, `--number` och `--limit` anger ett positivt
+  maxantal träffar, 30 som standard. Senare sidor hämtas tills antalet uppnåtts
+  eller brevlådan tar slut. Glesa filter kan därför ta tid.
+- Visar datum i lokal tid, avsändare, ämne och lässtatus. `--json` ger en array
+  med `id`, `receivedDateTime`, `from.emailAddress`, `subject` och `isRead`;
+  tomt resultat är `[]`. Använd `id` för svar eller arkivering.
+- Hämtar bara metadata, ingen brödtext eller bilagor. Skriver aldrig ut token.
 
 ## Skicka mail
 
@@ -69,7 +89,7 @@ python -m wsg mail archive MAIL-ID --dry-run
 - **Ett svar ska vara ett svar, inte ett nytt mail.** `sendmail` med "Re:" i ämnet
   hamnar utanför tråden. `mail reply` svarar i tråden och citerar originalet.
 - MAIL-ID är mailets id, eller `mail:///messages/<id>` som M365-connectorn ger.
-  Hitta mailet med connectorns sökning och svara sedan med wsg.
+  Hitta id med `wsg mail list --json` eller connectorns sökning.
 - `--all` svarar alla (avsändaren plus Till och Kopia, utom personen själv).
   `--attach FIL` för bilagor, högst cirka 3 MB.
 - Texten är markdown, precis som i `sendmail`. `--plain` skickar den som den är.

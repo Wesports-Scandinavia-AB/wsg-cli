@@ -1517,7 +1517,7 @@ def _add_teams_commands(sub):
 
 
 # ── Mail ──────────────────────────────────────────────────────────────────────
-# Answering in the thread and archiving the thread; see mail.py. sendmail stays
+# Listing mail, answering and archiving threads; see mail.py. sendmail stays
 # under graph, where it has always been.
 
 def _graph_error(prefix, e):
@@ -1537,6 +1537,60 @@ def _print_thread(msgs):
 
     for m in msgs:
         print(f"  {_ts(m.get('receivedDateTime'))}  {mail._addr(m.get('from'))}  {m.get('subject') or ''}")
+
+
+def cmd_mail_list(a):
+    from . import mail
+    from urllib.error import HTTPError, URLError
+
+    try:
+        rows = mail.messages(a.number, a.senders, a.unread)
+    except auth.AuthError:
+        # Token endpoint errors may contain credentials; do not echo them.
+        print("Kunde inte använda inloggningen. Kör: wsg graph login", file=sys.stderr)
+        return 2
+    except HTTPError as e:
+        print(f"Kunde inte lista mejl (HTTP {e.code}).", file=sys.stderr)
+        return 2
+    except (URLError, OSError):
+        print("Kunde inte nå Microsoft Graph. Försök igen senare.", file=sys.stderr)
+        return 2
+    except ValueError:
+        print("Kunde inte läsa svaret från Microsoft Graph.", file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("Inga mejl matchar.")
+        return 0
+    print("Datum             Lässtatus  Avsändare  Ämne")
+    for m in rows:
+        sender = (m.get("from") or {}).get("emailAddress") or {}
+        who = " ".join(filter(None, [sender.get("name"),
+                                    f"<{sender['address']}>" if sender.get("address") else None])) or "?"
+        status = {True: "läst", False: "oläst"}.get(m.get("isRead"), "?")
+        subject = m.get("subject") or "(utan ämne)"
+        # Keep one message per line even when a field contains control characters.
+        who, subject = (" ".join(s.split()) for s in (who, subject))
+        print(f"{_ts(m.get('receivedDateTime'))}  {status:<9} {who}  {subject}")
+    return 0
+
+
+def _mail_count(value):
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("count must be a positive integer")
+    if n < 1:
+        raise argparse.ArgumentTypeError("count must be a positive integer")
+    return n
+
+
+def _mail_sender(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("sender must not be empty")
+    return value.strip()
 
 
 def cmd_mail_reply(a):
@@ -1628,6 +1682,15 @@ def cmd_mail_archive(a):
 
 
 def _add_mail_commands(sub):
+    s = sub.add_parser("list", help="list your own mail, newest first, across all folders")
+    s.add_argument("--from", dest="senders", action="append", type=_mail_sender, metavar="TEXT",
+                   help="case-insensitive name or address fragment (repeat to match any)")
+    s.add_argument("-n", "--number", "--limit", type=_mail_count, default=30,
+                   help="maximum matching messages, default 30; follows Graph pages")
+    s.add_argument("--unread", action="store_true", help="only unread messages")
+    s.add_argument("--json", action="store_true", help="print a JSON array with Graph ids and raw timestamps")
+    s.set_defaults(fn=cmd_mail_list)
+
     s = sub.add_parser("reply", help="answer a mail in its thread, text from stdin; --dry-run first")
     s.add_argument("message", help="the message id, or the connector's mail:///messages/<id>")
     s.add_argument("--all", action="store_true", help="reply to everyone on it, not only the sender")
@@ -1970,7 +2033,7 @@ def main(argv=None):
     te = sub.add_parser("teams", help="Teams chats: find, read and post as yourself, markdown in")
     _add_teams_commands(te.add_subparsers(dest="teams_cmd", required=True))
 
-    ma = sub.add_parser("mail", help="answer a mail in its thread, archive a thread")
+    ma = sub.add_parser("mail", help="list your mail, answer in its thread, archive a thread")
     _add_mail_commands(ma.add_subparsers(dest="mail_cmd", required=True))
 
     se = sub.add_parser("secret", help="one-time links on secrets.wesports.io, encrypted before they leave")

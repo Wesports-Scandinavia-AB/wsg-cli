@@ -75,6 +75,7 @@ wsg teams chats [X]    your chats, most recent first, filtered by topic or membe
 wsg teams read         one chat, oldest first: --chat ID, --to ADDRESS or --name TEXT
 wsg teams find TEXT    search your chats and channels for TEXT, the whole history
 wsg teams md           print the Teams HTML for a markdown text, send nothing
+wsg mail list          your latest mail, with sender/unread filters and --json
 wsg mail reply ID      answer a mail in its thread, markdown from stdin, --dry-run first
 wsg mail md            print the mail HTML for a markdown text (-o FILE to view it), send nothing
 wsg mail archive ID    move every message in a mail's thread from the inbox to Archive
@@ -231,6 +232,31 @@ attachment. Above that ceiling the file needs `createUploadSession` against a dr
 or OneDrive and a link; this command refuses up front rather than failing halfway.
 
 Needs `Mail.Send`, which is in the default scope set.
+
+### Listing your mail
+
+```
+wsg mail list                                      latest 30 messages, newest first
+wsg mail list --from Alex --from Sam -n 10          either sender, name or address fragment
+wsg mail list --from someone@example.com --unread   unread messages from that sender
+wsg mail list --limit 50 --json                     JSON array for scripts
+```
+
+Uses the existing `wsg graph login` session and `GET /me/messages`, across your
+own mailbox folders (including Sent Items and Deleted Items). Shows local date/time,
+sender name and address, subject and read status. Reading does not mark messages as
+read. `--from TEXT` is a case-insensitive substring match against the sender's name
+or address; repeat it to match any of several senders. `--unread` combines with it.
+`-n`, `--number` and `--limit` set a positive maximum number of **matching** messages
+(default 30). Graph pages are followed until that many matches are found or the
+mailbox ends. Filters run locally over metadata in date order, so a sparse filter
+can require many requests; message bodies and attachments are never requested.
+
+`--json` returns an array (empty results are `[]`) with Graph fields `id`,
+`receivedDateTime`, `from.emailAddress` (`name`, `address`), `subject` and `isRead`.
+Times retain their original offsets in JSON. Use the `id` with `mail reply` or
+`mail archive`. Errors go to stderr with exit code 2; no credentials are printed.
+Needs `Mail.ReadWrite`, already in the default scope set; no new consent is needed.
 
 ### Replying in the thread, archiving the thread
 
@@ -581,4 +607,18 @@ domain has exactly one incident in the relevant state. `ack` only needs
 
 Send a real `User-Agent`: the zone's bot rules answer 403 to `Python-urllib`.
 Override the app with `WSG_ARENA_URL`, the token cache with `WSG_ARENA_TOKEN_CACHE`.
+
+## Development checks
+
+Run from the repository root with `src` on `PYTHONPATH` (PowerShell:
+`$env:PYTHONPATH = 'src'`; POSIX: `export PYTHONPATH=src`):
+
+```
+python -m unittest discover -v
+python -m compileall -q src tests
+git diff --check
+```
+
+Tests use mocked Graph responses and authentication; they do not read a real
+mailbox or require a sign-in. No third party test dependencies are needed.
 

@@ -40,7 +40,7 @@ det privata `wsg-admin-cli` och kopplas in via entry point `wsg.commands`.
   Entra-app, så att wsg-admin-cli kan använda samma kod mot sin app.
 - `src/wsg/arena.py`: Arena-inloggning via Arenas OAuth. Använder den publika
   klienten `cl_wsg_cli` (ingen hemlighet), om inte `arena.json` anger en egen.
-- `src/wsg/mail.py`: svara i tråd (createReply) och arkivera en hel tråd.
+- `src/wsg/mail.py`: lista egna mejl, svara i tråd (createReply) och arkivera en hel tråd.
 - `src/wsg/markdown.py`: markdown till HTML, för Teams (`to_html`) och mail
   (`to_mail_html`, med stilarna inline).
 - `src/wsg/mscal.py`, `planner.py`, `onetime.py`: kalenderspegling, Planner
