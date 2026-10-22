@@ -31,6 +31,11 @@ DEFAULT_SCOPES = [
     # coordination@wesportsgroup.com. Calendars.ReadWrite räcker bara för den
     # egna kalendern; Graph kräver .Shared för en annans, FullAccess eller ej.
     "Calendars.Read.Shared",
+    # Teams-mötets närvarorapport, för den som själv är arrangör av mötet
+    # (t.ex. ett funktionskonto man loggat in som). Delegerat funkar bara för
+    # egna möten, oavsett roll eller FullAccess på kontots brevlåda.
+    "OnlineMeetings.Read",
+    "OnlineMeetingArtifact.Read.All",
     # Namn på personer och grupper, t.ex. vilka som är tilldelade i Planner
     # (directoryObjects/getByIds). Bara läsning, samma katalog som Outlook visar.
     "User.Read.All",
