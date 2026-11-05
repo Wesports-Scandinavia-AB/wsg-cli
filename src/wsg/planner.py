@@ -27,11 +27,10 @@ most, so an account that signed in before then gets HTTP 403 from every call
 here until `wsg graph login` runs once more - which is what the 403 says.
 """
 
-import json
-from urllib import parse, request
+from urllib import parse
 from urllib.error import HTTPError
 
-from .auth import decode_jwt, get_token
+from .auth import decode_jwt, graph_token, graph, error_message
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 
@@ -51,37 +50,25 @@ class PlannerError(Exception):
 
 
 def _call(path, method="GET", body=None, token=None):
-    token = token or get_token()
-    url = path if path.startswith("http") else f"{GRAPH}{path}"
-    data = json.dumps(body).encode() if body is not None else None
-    headers = {"Authorization": f"Bearer {token}"}
-    if data:
-        headers["Content-Type"] = "application/json"
-    elif method == "POST":
-        headers["Content-Length"] = "0"
-    req = request.Request(url, data=data, method=method, headers=headers)
     try:
-        with request.urlopen(req) as r:
-            raw = r.read()
-            return json.loads(raw) if raw else {}
+        return graph(method, path, token=token, body=body) or {}
     except HTTPError as e:
-        detail = (e.read().decode("utf-8", "replace") or "").strip()
         if e.code == 403:
             raise PlannerError(
-                f"{method} {url.split('?')[0]} gav HTTP 403.\n"
+                "Microsoft Graph gav HTTP 403.\n"
                 "Planner kräver scopet Tasks.Read. Logga in en gång till så hämtas det:\n"
                 "  wsg graph login"
             ) from None
-        raise PlannerError(f"{method} {url.split('?')[0]} gav HTTP {e.code}\n{detail[:800]}") from None
+        raise PlannerError(error_message(e)) from None
 
 
 def _paged(path):
-    out, url = [], path
-    while url:
-        page = _call(url)
-        out.extend(page.get("value", []))
-        url = page.get("@odata.nextLink")
-    return out
+    from .auth import graph_pages
+
+    try:
+        return list(graph_pages(path))
+    except HTTPError as e:
+        raise PlannerError(error_message(e)) from None
 
 
 def _looks_like_guid(s):
@@ -110,7 +97,7 @@ def names(ids, kind=None):
 
 # ── plans ─────────────────────────────────────────────────────────────────────
 
-def plans():
+def plans(with_names=True):
     """Every plan the signed-in account can see, each with its owner's name.
 
     The owner is `container.containerId` on current plans and the legacy `owner`
@@ -124,6 +111,8 @@ def plans():
     resolves, which is why that one falls back to a word rather than an id.
     """
     rows = _paged("/me/planner/plans")
+    if not with_names:
+        return rows
     for p in rows:
         c = p.get("container") or {}
         p["_owner"] = c.get("containerId") or p.get("owner")
@@ -190,7 +179,7 @@ def tasks(plan_id, include_done=False):
     return _with_assignees(sorted(rows, key=lambda t: t.get("orderHint") or ""))
 
 
-def my_tasks(include_done=False):
+def my_tasks(include_done=False, with_assignees=True):
     """Tasks assigned to the signed-in account, across every plan it can see.
 
     Sorted by due date with the undated last, because the question this answers
@@ -199,8 +188,8 @@ def my_tasks(include_done=False):
     rows = _paged("/me/planner/tasks")
     if not include_done:
         rows = [t for t in rows if (t.get("percentComplete") or 0) < 100]
-    return _with_assignees(sorted(rows, key=lambda t: (t.get("dueDateTime") or "9999",
-                                                       t.get("title") or "")))
+    rows = sorted(rows, key=lambda t: (t.get("dueDateTime") or "9999", t.get("title") or ""))
+    return _with_assignees(rows) if with_assignees else rows
 
 
 def task(task_id):
@@ -231,7 +220,7 @@ def tenant_id():
     signed into several; without it the web app picks whichever session it finds
     and answers "you don't have access" for a board that is perfectly readable.
     """
-    return decode_jwt(get_token()).get("tid") or ""
+    return decode_jwt(graph_token()).get("tid") or ""
 
 
 def url(plan_id, task_id=None, legacy=False):

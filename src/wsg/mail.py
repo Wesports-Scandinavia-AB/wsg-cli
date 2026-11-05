@@ -30,56 +30,200 @@ import base64
 import html
 import mimetypes
 import re
+import json
+from html.parser import HTMLParser
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib import parse
+from urllib.error import HTTPError, URLError
 
-from .auth import graph
+from .auth import graph, graph_pages, AuthError, error_message
+from .dates import InputError, bounds, moment, utc
 from .markdown import MAIL_FONT, to_mail_html
 
 # Graph caps a request at about 4 MB; base64 adds a third. Same ceiling as sendmail.
 INLINE_LIMIT = 3 * 1024 * 1024
+LIST_FIELDS = "id,receivedDateTime,from,subject,isRead"
+READ_FIELDS = LIST_FIELDS + ",toRecipients,ccRecipients,conversationId,body,hasAttachments,webLink,flag"
+TEXT_HEADER = {"Prefer": 'outlook.body-content-type="text"'}
 
 
-def messages(n=30, senders=None, unread=False, all_folders=False):
+def _collection(path, headers=None):
+    return graph_pages(path, headers=headers, fetch=graph)
+
+
+def _mailbox(all_folders=False, folder=None):
+    if all_folders and folder:
+        raise InputError("Välj antingen --folder eller --all-folders.")
+    return "/me/messages" if all_folders else f"/me/mailFolders/{parse.quote(folder or 'inbox', safe='')}/messages"
+
+
+def messages(n=30, senders=None, unread=False, all_folders=False, since=None, before=None, folder=None):
     """Own inbox by default, newest first; n counts matches across Graph pages.
 
-    Match name/address fragments locally: Graph's search has result limits and
-    different ordering, and combining sender filters with orderby can fail with
-    InefficientFilter. Fetch metadata only, following nextLink unchanged.
+    Sender fragments match locally; date/read filters run on Graph. The sort
+    property comes first in the filter to avoid Graph's InefficientFilter.
     """
     if n < 1:
-        raise ValueError("Antalet måste vara minst 1.")
+        raise InputError("Antalet måste vara minst 1.")
     terms = [s.strip().casefold() for s in senders or []]
     if any(not s for s in terms):
-        raise ValueError("Avsändarfiltret får inte vara tomt.")
-    query = parse.urlencode({
-        "$select": "id,receivedDateTime,from,subject,isRead",
+        raise InputError("Avsändarfiltret får inte vara tomt.")
+    start, end = bounds(since, before)
+    query = {
+        "$select": LIST_FIELDS,
         "$orderby": "receivedDateTime desc",
-        "$top": 100 if terms or unread else min(n, 100),
-    })
-    path = "/me/messages" if all_folders else "/me/mailFolders/inbox/messages"
-    url = f"{path}?{query}"
+        "$top": 100 if terms else min(n, 100),
+    }
+    filters = []
+    if start:
+        filters.append(f"receivedDateTime ge {utc(start)}")
+    if end:
+        filters.append(f"receivedDateTime lt {utc(end)}")
+    if unread:
+        if not filters:
+            filters.append("receivedDateTime ge 0001-01-01T00:00:00Z")
+        filters.append("isRead eq false")
+    if filters:
+        query["$filter"] = " and ".join(filters)
+    path = _mailbox(all_folders, folder) + "?" + parse.urlencode(query)
     out = []
-    while url:
-        page = graph("GET", url)
-        for msg in page.get("value", []):
-            if unread and msg.get("isRead") is not False:
-                continue
-            sender = (msg.get("from") or {}).get("emailAddress") or {}
-            values = [(sender.get(k) or "").casefold() for k in ("name", "address")]
-            if terms and not any(term in value for term in terms for value in values):
-                continue
-            out.append(msg)
-            if len(out) == n:
-                return out
-        url = page.get("@odata.nextLink")
-        if url:
-            # Never send the cached credential to a different host or mailbox.
-            target = parse.urlsplit(url)
-            if (target.scheme != "https" or target.netloc != "graph.microsoft.com"
-                    or target.path != f"/v1.0{path}" or target.fragment):
-                raise ValueError("Graph returnerade en ogiltig sidlänk.")
+    for msg in _collection(path):
+        if unread and msg.get("isRead") is not False:
+            continue
+        sender = (msg.get("from") or {}).get("emailAddress") or {}
+        values = [(sender.get(k) or "").casefold() for k in ("name", "address")]
+        if terms and not any(term in value for term in terms for value in values):
+            continue
+        out.append(msg)
+        if len(out) == n:
+            break
     return out
+
+
+def read(mid):
+    return graph("GET", f"{_path(mid)}?" + parse.urlencode({"$select": READ_FIELDS}), headers=TEXT_HEADER)
+
+
+def thread(mid, inbox=False, bodies=True):
+    conv = get(mid, "conversationId")["conversationId"].replace("'", "''")
+    query = parse.urlencode({"$filter": f"conversationId eq '{conv}'",
+                             "$select": READ_FIELDS if bodies else LIST_FIELDS, "$top": 100})
+    rows = list(_collection(_mailbox(not inbox) + "?" + query, TEXT_HEADER if bodies else None))
+    return sorted(rows, key=lambda m: moment(m.get("receivedDateTime")) or datetime.min.replace(tzinfo=timezone.utc))
+
+
+def find(query, n=30, all_folders=False, since=None, before=None, folder=None):
+    """Graph's indexed KQL search (up to 1000 hits, sent time descending)."""
+    if not query.strip() or not 1 <= n <= 1000:
+        raise InputError("Söktext krävs och antalet måste vara mellan 1 och 1000.")
+    start, end = bounds(since, before)
+    search = f"({query})"
+    # Date-only KQL narrows the index; exact timestamp boundaries are checked
+    # locally because KQL date parsing has day precision.
+    if start:
+        search += f" AND received>={start:%Y-%m-%d}"
+    if end:
+        search += f" AND received<={end:%Y-%m-%d}"
+    args = {"$search": json.dumps(search, ensure_ascii=False), "$select": LIST_FIELDS,
+            "$top": 1000 if start or end else n}
+    out = []
+    for msg in _collection(_mailbox(all_folders, folder) + "?" + parse.urlencode(args)):
+        when = moment(msg.get("receivedDateTime"))
+        if (start or end) and (not when or (start and when < start) or (end and when >= end)):
+            continue
+        out.append(msg)
+        if len(out) == n:
+            break
+    return out
+
+
+class _BodyText(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts, self.hidden = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.hidden += 1
+        if not self.hidden and tag in ("br", "p", "div", "li", "tr", "blockquote"):
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.hidden = max(0, self.hidden - 1)
+        if not self.hidden and tag in ("p", "div", "li", "tr", "blockquote"):
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+
+
+def text_of(msg):
+    body = msg.get("body") or {}
+    content = body.get("content") or ""
+    if body.get("contentType", "").lower() != "html":
+        return content.strip()
+    parser = _BodyText()
+    parser.feed(content)
+    return re.sub(r"\n[ \t]*\n+", "\n\n", "".join(parser.parts)).strip()
+
+
+def attachments(mid):
+    fields = "id,name,contentType,size,isInline"
+    return list(_collection(f"{_path(mid)}/attachments?" + parse.urlencode({"$select": fields, "$top": 100})))
+
+
+def save_attachment(mid, aid, destination):
+    """Save exactly one selected file; exclusive creation prevents overwrites."""
+    path = f"{_path(mid)}/attachments/{parse.quote(aid, safe='')}"
+    meta = graph("GET", path + "?" + parse.urlencode({"$select": "id,name,contentType,size"}))
+    if meta.get("@odata.type") == "#microsoft.graph.referenceAttachment":
+        raise InputError("Detta är en molnlänk, inte en filbilaga. Öppna den i Outlook.")
+    dest = Path(destination).expanduser()
+    if dest.is_dir():
+        # Treat both slash conventions as separators on every OS. Never use a
+        # server-supplied filename to escape the selected directory.
+        name = re.split(r"[/\\]", meta.get("name") or "attachment")[-1]
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).rstrip(". ")
+        if not name or name in (".", ".."):
+            name = "attachment"
+        if name.split(".", 1)[0].upper() in {"CON", "PRN", "AUX", "NUL", *[f"COM{i}" for i in range(1, 10)],
+                                           *[f"LPT{i}" for i in range(1, 10)]}:
+            name = "_" + name
+        dest = dest / name
+    if dest.exists():
+        raise InputError("Målfilen finns redan. Välj ett annat filnamn.")
+    content = graph("GET", path + "/$value", raw=True)
+    try:
+        with dest.open("xb") as handle:
+            handle.write(content)
+    except FileExistsError:
+        raise InputError("Målfilen finns redan. Välj ett annat filnamn.") from None
+    return {"id": aid, "name": meta.get("name"), "path": str(dest.resolve()), "bytes": len(content)}
+
+
+def folders(parent=None):
+    path = f"/me/mailFolders/{parse.quote(parent, safe='')}/childFolders" if parent else "/me/mailFolders"
+    return list(_collection(path + "?" + parse.urlencode({
+        "$select": "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount", "$top": 100})))
+
+
+def mark(mid, is_read):
+    return graph("PATCH", _path(mid), body={"isRead": is_read})
+
+
+def flag(mid, status="flagged"):
+    if status not in ("flagged", "complete", "notFlagged"):
+        raise InputError("Ogiltig flaggstatus.")
+    return graph("PATCH", _path(mid), body={"flag": {"flagStatus": status}})
+
+
+def move(mid, folder):
+    if not folder.strip():
+        raise InputError("En målmapp krävs.")
+    return graph("POST", _path(mid) + "/move", body={"destinationId": folder})
 
 
 def message_id(ref):
@@ -180,19 +324,15 @@ def reply(mid, text, reply_all=False, attachments=None, plain=False):
 
 def thread_in_inbox(mid):
     """Every message in the inbox from the same conversation as `mid`."""
-    conv = get(mid, "conversationId")["conversationId"]
-    q = parse.urlencode({
-        "$filter": f"conversationId eq '{conv}'",
-        "$select": "id,subject,from,receivedDateTime",
-        "$top": "100",
-    })
-    r = graph("GET", f"/me/mailFolders/inbox/messages?{q}")
-    msgs = r.get("value", [])
-    return sorted(msgs, key=lambda m: m.get("receivedDateTime", ""))
+    return thread(mid, inbox=True, bodies=False)
 
 
 def archive(msgs):
     """Move the messages to the Archive folder; returns how many moved."""
-    for m in msgs:
-        graph("POST", f"{_path(m['id'])}/move", body={"destinationId": "archive"})
+    for moved, m in enumerate(msgs):
+        try:
+            graph("POST", f"{_path(m['id'])}/move", body={"destinationId": "archive"})
+        except (HTTPError, URLError, AuthError, OSError, ValueError) as e:
+            raise InputError(f"{moved} meddelanden flyttades före felet; det sista anropets utfall "
+                             f"kan behöva kontrolleras. {error_message(e)}") from None
     return len(msgs)

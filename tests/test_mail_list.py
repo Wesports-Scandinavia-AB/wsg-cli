@@ -115,7 +115,7 @@ class MailListCliTests(unittest.TestCase):
     def test_all_folders_option(self, messages):
         messages.return_value = []
         self.assertEqual(self.run_cli(["--all-folders", "--json"]), (0, "[]\n", ""))
-        messages.assert_called_once_with(30, None, False, True)
+        messages.assert_called_once_with(30, None, False, True, since=None, before=None, folder=None)
 
     @patch("wsg.mail.messages")
     def test_json_and_parser_options(self, messages):
@@ -126,14 +126,14 @@ class MailListCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(stdout), rows)
         self.assertEqual(stderr, "")
-        messages.assert_called_once_with(7, ["Alex", "Sam"], True, False)
+        messages.assert_called_once_with(7, ["Alex", "Sam"], True, False, since=None, before=None, folder=None)
 
     @patch("wsg.mail.messages")
     def test_default_and_count_aliases(self, messages):
         messages.return_value = []
         for args, n in [([], 30), (["--number", "4"], 4), (["--limit", "5"], 5)]:
             self.assertEqual(self.run_cli(args)[0], 0)
-            messages.assert_called_with(n, None, False, False)
+            messages.assert_called_with(n, None, False, False, since=None, before=None, folder=None)
 
     @patch("wsg.mail.messages")
     def test_invalid_arguments_fail_before_auth(self, messages):
@@ -182,7 +182,7 @@ class MailListCliTests(unittest.TestCase):
                 if isinstance(error, HTTPError):
                     self.assertIn("403", stderr)
 
-    @patch("wsg.auth.request.urlopen")
+    @patch("wsg.auth._graph_open")
     @patch("wsg.auth.get_token", return_value="test-only-credential")
     def test_existing_graph_auth_used_without_exposing_token(self, get_token, urlopen):
         urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(

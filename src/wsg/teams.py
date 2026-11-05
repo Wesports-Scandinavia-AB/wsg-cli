@@ -1,5 +1,5 @@
 """
-Teams chat over Graph: post a message as the signed-in user.
+Teams chat over Graph: read, post and edit messages as the signed-in user.
 
 Six things here that are easy to get wrong by hand:
 
@@ -40,8 +40,10 @@ Six things here that are easy to get wrong by hand:
    the bytes from the item's pre-signed download URL, which wants no token.
 
 Sending needs `ChatMessage.Send`, finding a 1:1 chat to post in `Chat.Create`,
-reading `Chat.Read`, searching `ChannelMessage.Read.All`, fetching a shared file
-`Files.Read.All`. All of them are in the default scope set.
+reading `Chat.Read`, editing a chat message `Chat.ReadWrite`, searching
+`ChannelMessage.Read.All`, and fetching a shared file `Files.Read.All`. All are
+in the default scope set; the tenant app must grant each scope before login can
+use it.
 """
 
 import base64
@@ -50,7 +52,7 @@ import os
 import re
 from urllib import parse, request
 
-from .auth import get_token, graph
+from .auth import get_token, graph, parallel_reads, error_message
 from .markdown import to_html  # noqa: F401  (cli.py calls teams.to_html)
 
 GRAPH = "https://graph.microsoft.com/v1.0"
@@ -117,6 +119,19 @@ def send(chat_id, content_html):
     """Post one message in a chat as the signed-in user; returns Graph's message."""
     return graph("POST", f"/chats/{parse.quote(chat_id)}/messages",
                  body={"body": {"contentType": "html", "content": content_html}})
+
+
+def edit(chat_id, message_id, content_html):
+    """Edit one of our messages in a chat; Graph only permits editing own messages."""
+    if not chat_id or not message_id:
+        raise ValueError("Chat ID and message ID are required.")
+    current = graph("GET", f"/chats/{parse.quote(chat_id)}/messages/{parse.quote(message_id)}"
+                           "?$select=id,from,messageType")
+    if current.get("messageType") != "message" or sender(current)[1] != me_id():
+        raise PermissionError("Bara dina egna Teams-meddelanden kan redigeras.")
+    return graph("PATCH", f"/chats/{parse.quote(chat_id)}/messages/{parse.quote(message_id)}",
+                 body={"body": {"contentType": "html", "content": content_html}},
+                 scopes=["Chat.ReadWrite"])
 
 
 def me_id():
@@ -250,10 +265,10 @@ def save_images(m, folder):
         if not os.path.exists(p):
             try:
                 req = request.Request(html.unescape(src), headers={"Authorization": f"Bearer {token}"})
-                with request.urlopen(req) as r, open(p, "wb") as f:
+                with request.urlopen(req, timeout=30) as r, open(p, "wb") as f:
                     f.write(r.read())
             except Exception as e:
-                p = f"(bilden gick inte att hämta: {e})"
+                p = f"(bilden gick inte att hämta: {error_message(e)})"
         paths.append(p)
     return paths
 
@@ -271,10 +286,10 @@ def save_files(m, folder):
             try:
                 share = "u!" + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
                 item = graph("GET", f"/shares/{share}/driveItem")
-                with request.urlopen(item["@microsoft.graph.downloadUrl"]) as r, open(p, "wb") as f:
+                with request.urlopen(item["@microsoft.graph.downloadUrl"], timeout=30) as r, open(p, "wb") as f:
                     f.write(r.read())
             except Exception as e:
-                p = f"(filen gick inte att hämta: {e})"
+                p = f"(filen gick inte att hämta: {error_message(e)})"
         paths.append(p)
     return paths
 
@@ -286,11 +301,10 @@ def find(query, n_chats=25, since=None, per_chat=200):
     Returns (chat, message) pairs.
     """
     q = query.casefold()
-    hits = []
-    for c in chats(n_chats):
-        for m in messages(c["id"], per_chat, since):
-            if q in text_of(m).casefold():
-                hits.append((c, m))
+    def in_chat(c):
+        return [(c, m) for m in messages(c["id"], per_chat, since) if q in text_of(m).casefold()]
+
+    hits = [hit for group in parallel_reads(in_chat, chats(n_chats)) for hit in group]
     hits.sort(key=lambda h: h[1]["createdDateTime"], reverse=True)
     return hits
 

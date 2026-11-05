@@ -23,18 +23,31 @@ import base64
 import hashlib
 import http.server
 import json
+import math
 import os
 import secrets
 import socket
+import ssl
 import sys
 import threading
 import time
 import webbrowser
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from http.client import HTTPException
 from pathlib import Path
 from urllib import parse, request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 GRAPH = "https://graph.microsoft.com"
+HTTP_TIMEOUT = 30
+READ_RETRIES = 2
+MAX_RETRY_WAIT = 30
+_graph_tokens = ContextVar("wsg_graph_tokens", default=None)
+_graph_transport = threading.local()
 # Vartex. Our apps are single-tenant, and a single-tenant app cannot sign in
 # through /organizations, so the tenant is named rather than discovered.
 TENANT_ID = "8a11617d-a9b4-42ec-985c-0fb8488747c4"
@@ -134,7 +147,7 @@ def decode_jwt(token):
 def _post(url, body):
     req = request.Request(url, data=parse.urlencode(body).encode())
     try:
-        with request.urlopen(req) as r:
+        with request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
             return json.loads(r.read()), None
     except HTTPError as e:
         try:
@@ -156,7 +169,7 @@ def _refresh(refresh_token, scopes, client=None):
     })
     if tok:
         return _write_cache(tok, client)
-    raise AuthError((err or {}).get("error_description") or (err or {}).get("error") or "refresh failed")
+    raise AuthError(f"Inloggningen kunde inte förnyas. Kör: {(client or CORE).login_command}")
 
 
 def get_token(scopes=None, client=None):
@@ -337,15 +350,189 @@ def login_device(scopes, out=sys.stderr, client=None):
 
 # ── convenience ───────────────────────────────────────────────────────────────
 
-def graph(method, path, token=None, body=None, scopes=None, client=None):
-    """Small Graph helper for scripts: graph('GET', '/me')."""
-    token = token or get_token(scopes, client)
+@contextmanager
+def graph_session():
+    """Reuse credentials during one command, never across commands/accounts."""
+    state = _graph_tokens.set({})
+    try:
+        yield
+    finally:
+        _graph_tokens.reset(state)
+
+
+def graph_token(scopes=None, client=None):
+    cache = _graph_tokens.get()
+    key = (client or CORE, tuple(sorted(scopes or [])))
+    if cache is None:
+        return get_token(scopes, client)
+    if key not in cache:
+        cache[key] = get_token(scopes, client)
+    return cache[key]
+
+
+def parallel_reads(fn, items):
+    """At most four independent reads at once, preserving input order/errors."""
+    items = list(items)
+    if not items:
+        return []
+    if _graph_tokens.get() is None:
+        with graph_session():
+            return parallel_reads(fn, items)
+    # Resolve/refresh before starting threads; no concurrent cache writes.
+    graph_token()
+    with ThreadPoolExecutor(max_workers=min(4, len(items))) as pool:
+        futures = [pool.submit(copy_context().run, fn, item) for item in items]
+        try:
+            return [future.result() for future in futures]
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+
+
+def graph_url(path):
+    """Only the configured Graph origin may receive the credential."""
+    if not isinstance(path, str):
+        raise ValueError("Graph returnerade en ogiltig adress.")
     url = path if path.startswith("http") else f"{GRAPH}/v1.0{path}"
+    target = parse.urlsplit(url)
+    if (target.scheme != "https" or target.netloc != "graph.microsoft.com"
+            or not target.path.startswith(("/v1.0/", "/beta/")) or target.fragment):
+        raise ValueError("Graph returnerade en ogiltig adress.")
+    return url
+
+
+def error_message(error):
+    """Actionable diagnostics without response bodies, URLs or credentials."""
+    user_message = getattr(error, "user_message", None)
+    if isinstance(user_message, str):
+        return user_message
+    if isinstance(error, AuthError):
+        return "Kunde inte använda inloggningen. Kör: wsg graph login"
+    if isinstance(error, HTTPError):
+        hints = {401: "Kör: wsg graph login", 403: "Åtkomst saknas; kontrollera behörigheterna.",
+                 404: "Objektet finns inte längre eller har flyttats.",
+                 429: "För många anrop. Försök igen senare."}
+        return f"Microsoft Graph gav HTTP {error.code}. " + hints.get(error.code, "Försök igen senare.")
+    if isinstance(error, URLError):
+        reason = error.reason
+        if isinstance(reason, socket.gaierror):
+            detail = "DNS-uppslagningen misslyckades"
+            if reason.errno is not None:
+                detail += f" (felkod {reason.errno})"
+            return f"Kunde inte ansluta till Microsoft Graph: {detail}."
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return "Tidsgränsen nåddes vid anslutning till Microsoft Graph."
+        if isinstance(reason, ConnectionRefusedError):
+            return "Microsoft Graph nekade nätverksanslutningen."
+        if isinstance(reason, ssl.SSLError):
+            return "TLS-anslutningen till Microsoft Graph misslyckades."
+        if isinstance(reason, PermissionError):
+            return "Körningsmiljön nekade socketåtkomst till Microsoft Graph."
+        if isinstance(reason, OSError):
+            detail = reason.strerror or reason.__class__.__name__
+            if reason.errno is not None:
+                detail += f" (felkod {reason.errno})"
+            return f"Nätverksfel mot Microsoft Graph: {detail}."
+        return f"Nätverksfel mot Microsoft Graph ({reason.__class__.__name__})."
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return "Tidsgränsen nåddes vid anslutning till Microsoft Graph."
+    if isinstance(error, ConnectionRefusedError):
+        return "Microsoft Graph nekade nätverksanslutningen."
+    if isinstance(error, socket.gaierror):
+        detail = "DNS-uppslagningen misslyckades"
+        if error.errno is not None:
+            detail += f" (felkod {error.errno})"
+        return f"Kunde inte ansluta till Microsoft Graph: {detail}."
+    if isinstance(error, ssl.SSLError):
+        return "TLS-anslutningen till Microsoft Graph misslyckades."
+    if isinstance(error, PermissionError):
+        return "Körningsmiljön nekade socketåtkomst till Microsoft Graph."
+    if isinstance(error, OSError):
+        detail = error.strerror or error.__class__.__name__
+        if error.errno is not None:
+            detail += f" (felkod {error.errno})"
+        return f"Nätverksfel mot Microsoft Graph: {detail}."
+    return "Kunde inte nå tjänsten inom tidsgränsen. Försök igen senare."
+    return "Kunde inte läsa svaret från tjänsten."
+
+
+class _GraphRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib otherwise copies Authorization to the redirect target.
+        try:
+            graph_url(newurl)
+        except ValueError:
+            raise HTTPError(req.full_url, code, "Graph redirect refused", headers, fp) from None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _graph_open(req, timeout):
+    if not hasattr(_graph_transport, "opener"):
+        _graph_transport.opener = request.build_opener(_GraphRedirect())
+    return _graph_transport.opener.open(req, timeout=timeout)
+
+
+def _retry_delay(error, attempt):
+    value = error.headers.get("Retry-After") if error.headers else None
+    if value:
+        try:
+            delay = float(value)
+        except ValueError:
+            try:
+                delay = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+            except (ValueError, TypeError, OverflowError):
+                delay = 2 ** attempt
+        # Do not retry early when the service asks for a longer wait.
+        if not math.isfinite(delay) or delay > MAX_RETRY_WAIT:
+            return None
+        return max(0, delay)
+    return 2 ** attempt
+
+
+def graph(method, path, token=None, body=None, scopes=None, client=None, headers=None, raw=False):
+    """Graph JSON (or raw bytes), bounded reads; mutations are never retried."""
+    url = graph_url(path)
+    token = token or graph_token(scopes, client)
     data = json.dumps(body).encode() if body is not None else None
-    headers = {"Authorization": f"Bearer {token}"}
-    if data:
-        headers["Content-Type"] = "application/json"
-    req = request.Request(url, data=data, method=method, headers=headers)
-    with request.urlopen(req) as r:
-        raw = r.read()
-        return json.loads(raw) if raw else None
+    request_headers = dict(headers or {})
+    request_headers["Authorization"] = f"Bearer {token}"
+    if data is not None:
+        request_headers["Content-Type"] = "application/json"
+    req = request.Request(url, data=data, method=method, headers=request_headers)
+    for attempt in range(READ_RETRIES + 1):
+        try:
+            with _graph_open(req, timeout=HTTP_TIMEOUT) as response:
+                content = response.read()
+                return content if raw else (json.loads(content) if content else None)
+        except HTTPError as error:
+            if method != "GET" or error.code not in (429, 502, 503, 504) or attempt == READ_RETRIES:
+                raise
+            delay = _retry_delay(error, attempt)
+            if delay is None:
+                raise
+            error.close()
+            time.sleep(delay)
+        except (URLError, TimeoutError, ConnectionError, HTTPException) as error:
+            if method != "GET" or attempt == READ_RETRIES:
+                if isinstance(error, HTTPException):
+                    raise URLError("Graph transport failed") from None
+                raise
+            time.sleep(2 ** attempt)
+
+
+def graph_pages(path, headers=None, fetch=None):
+    """Yield collection rows, following opaque links without changing scope."""
+    expected = parse.urlsplit(graph_url(path)).path
+    seen = set()
+    while path:
+        url = graph_url(path)
+        if parse.urlsplit(url).path != expected or url in seen:
+            raise ValueError("Graph returnerade en ogiltig sidlänk.")
+        seen.add(url)
+        page = (fetch or graph)("GET", path, **({"headers": headers} if headers else {}))
+        if (not isinstance(page, dict) or not isinstance(page.get("value", []), list)
+                or any(not isinstance(row, dict) for row in page.get("value", []))):
+            raise ValueError("Graph returnerade en ogiltig lista.")
+        yield from page.get("value", [])
+        path = page.get("@odata.nextLink")

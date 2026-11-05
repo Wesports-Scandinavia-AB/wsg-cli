@@ -31,11 +31,12 @@ worse than an honest no.
 """
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from urllib import parse
 from urllib.error import HTTPError
 
-from .auth import graph
+from .auth import graph, graph_pages, error_message
+from .dates import InputError, utc
 
 # Named properties live under a GUID namespace of the caller's choosing. This one
 # is arbitrary but fixed: change it and every mirror already on the calendar stops
@@ -55,11 +56,30 @@ class MirrorError(Exception):
 
 
 def _error(e):
-    """Graph's own reason, which is in the body rather than the status line."""
+    """Safe status-based diagnostics, without the server's response body."""
+    return error_message(e)
+
+
+def agenda(day=None, days=7, include_cancelled=False):
+    """Occurrences and exceptions in the default work calendar, in time order.
+
+    Convert each local midnight separately so a range spanning a DST change
+    has the right UTC boundaries, rather than assuming every day is 24 hours.
+    """
+    if not 1 <= days <= 366:
+        raise InputError("--days måste vara mellan 1 och 366.")
     try:
-        return json.loads(e.read() or b"{}").get("error", {}).get("message") or str(e)
-    except Exception:
-        return str(e)
+        first = date.fromisoformat(day) if day else date.today()
+        start = datetime.combine(first, time.min).astimezone(timezone.utc)
+        end = datetime.combine(first + timedelta(days=days), time.min).astimezone(timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        raise InputError("--date måste vara ett giltigt datum, t.ex. 2026-10-22.") from None
+    args = {"startDateTime": utc(start), "endDateTime": utc(end), "$top": 100,
+            "$orderby": "start/dateTime",
+            "$select": "id,subject,start,end,isAllDay,isCancelled,location,organizer,showAs,webLink"}
+    rows = graph_pages("/me/calendarView?" + parse.urlencode(args),
+                       headers={"Prefer": 'outlook.timezone="UTC"'})
+    return [row for row in rows if include_cancelled or not row.get("isCancelled")]
 
 
 def mailbox_timezone():
@@ -175,16 +195,13 @@ def _find_by_title(google_id):
     url = ("/me/events?$filter=" + parse.quote(flt, safe="")
            + "&$expand=" + parse.quote(exp, safe="") + "&$top=100")
     out = []
-    while url:
-        try:
-            got = graph("GET", url) or {}
-        except HTTPError as e:
-            raise MirrorError("Reservsökningen misslyckades: %s" % _error(e))
-        for ev in got.get("value") or []:
+    try:
+        for ev in graph_pages(url):
             if any((prop or {}).get("value") == google_id
                    for prop in ev.get("singleValueExtendedProperties") or []):
                 out.append(ev)
-        url = got.get("@odata.nextLink")
+    except HTTPError as e:
+        raise MirrorError("Reservsökningen misslyckades: %s" % _error(e))
     return out
 
 
@@ -202,10 +219,10 @@ def find(google_id):
     flt = "singleValueExtendedProperties/any(ep:ep/id eq '%s' and ep/value eq '%s')" % (
         LINK, google_id.replace("'", "''"))
     try:
-        got = graph("GET", "/me/events?$filter=" + parse.quote(flt, safe=""))
+        rows = list(graph_pages("/me/events?$filter=" + parse.quote(flt, safe="")))
     except HTTPError as e:
         raise MirrorError("Sökningen misslyckades: %s" % _error(e))
-    return ((got or {}).get("value") or []) or _find_by_title(google_id)
+    return rows or _find_by_title(google_id)
 
 
 def bodies_for(ev, zone=None, travel=0):
@@ -248,7 +265,11 @@ def _refused(ev, e, made):
     which is the part worth printing.
     """
     reason = _error(e)
-    if "transactionid" in reason.lower() and not made:
+    try:
+        duplicate = "transactionid" in json.loads(e.read() or b"{}").get("error", {}).get("message", "").lower()
+    except (ValueError, AttributeError):
+        duplicate = False
+    if duplicate and not made:
         here = find((ev.get("id") or "").strip())
         if here:
             return MirrorError(
@@ -262,10 +283,10 @@ def _refused(ev, e, made):
     return MirrorError("Graph nekade bokningen: %s.%s" % (reason, extra))
 
 
-def unmirror(google_id):
+def unmirror(google_id, rows=None):
     """Remove every block that belongs to one Google event. Returns how many."""
     gone = 0
-    for ev in find(google_id):
+    for ev in find(google_id) if rows is None else rows:
         try:
             graph("DELETE", "/me/events/" + ev["id"])
         except HTTPError as e:

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import arena, auth, mscal, onetime, planner, shortlink
 from .scopes import DEFAULT_SCOPES
+from .dates import InputError
 
 
 def _scopes_arg(s, default=DEFAULT_SCOPES):
@@ -40,6 +41,18 @@ def _stdin_text():
     they already disagree about it on purpose — a password may end in a space.
     """
     return sys.stdin.read().lstrip("﻿")
+
+
+def _utf8_message_file(path):
+    try:
+        return Path(path).read_text(encoding="utf-8-sig")
+    except OSError as e:
+        raise InputError(f"Kunde inte läsa meddelandefilen: {e}") from e
+
+
+def _normalize_message_text(text):
+    """Accept escaped line breaks commonly produced by Windows command quoting."""
+    return text.replace("\\n", "\n") if "\\n" in text and "\n" not in text else text
 
 
 def cmd_graph_login(a):
@@ -157,10 +170,14 @@ def cmd_graph_sendmail(a):
         if send_at <= datetime.now().astimezone():
             print(f"--send-at {send_at:%Y-%m-%d %H:%M} har redan passerat.", file=sys.stderr)
             return 2
-    if sys.stdin.isatty():
+    if a.file:
+        body_text = _utf8_message_file(a.file)
+    elif sys.stdin.isatty():
         print("Brodtexten lases fran stdin. Pipa in den, t.ex. med en here-doc.", file=sys.stderr)
         return 2
-    body_text = _stdin_text()
+    else:
+        body_text = _stdin_text()
+    body_text = _normalize_message_text(body_text)
     if not body_text.strip():
         print("Tom brodtext, avbryter.", file=sys.stderr)
         return 2
@@ -222,8 +239,9 @@ def cmd_graph_sendmail(a):
                  "base64Bytes": len(att["contentBytes"])}
                 for att in attachments
             ]
-        print("[torrkorning] POST /me/sendMail - inget skickat")
-        if send_at:
+        if not a.json:
+            print("[torrkorning] POST /me/sendMail - inget skickat")
+        if send_at and not a.json:
             print(f"Skulle ga {send_at:%Y-%m-%d %H:%M} ({utc} UTC)")
         print(json.dumps({"message": preview, "saveToSentItems": payload["saveToSentItems"]},
                          indent=2, ensure_ascii=False))
@@ -231,16 +249,13 @@ def cmd_graph_sendmail(a):
 
     try:
         auth.graph("POST", "/me/sendMail", body=payload)
-    except Exception as e:  # urllib raises HTTPError; its body carries Graph's reason
-        detail = ""
-        read = getattr(e, "read", None)
-        if callable(read):
-            try:
-                detail = ": " + read().decode(errors="replace")[:400]
-            except Exception:
-                detail = ""
-        print(f"Sandningen misslyckades{detail or ': ' + str(e)}", file=sys.stderr)
-        return 2
+    except Exception as e:
+        return _graph_error("Sändningen misslyckades", e)
+    if a.json:
+        print(json.dumps({"accepted": True, "to": recipients, "cc": cc,
+                          "saveToSentItems": not a.no_save,
+                          "sendAt": utc if send_at else None}, ensure_ascii=False, indent=2))
+        return 0
     if send_at:
         print(f"Lagt i Utkorgen till {', '.join(recipients)}, gar {send_at:%Y-%m-%d %H:%M}."
               " Ta bort det ur Utkorgen for att stoppa det.")
@@ -662,6 +677,7 @@ def _add_graph_commands(sub, visible=True, client=None, scopes=DEFAULT_SCOPES, s
     s.add_argument("--to", required=True, help="recipient, or several comma-separated")
     s.add_argument("--cc", help="cc recipients, comma-separated")
     s.add_argument("--subject", required=True)
+    s.add_argument("--file", metavar="UTF8-FILE", help="read the UTF-8 markdown body from a file")
     s.add_argument("--attach", action="append", metavar="FILE",
                    help="attach a file inline (repeatable; ~3 MB total after base64)")
     fmt = s.add_mutually_exclusive_group()
@@ -672,6 +688,7 @@ def _add_graph_commands(sub, visible=True, client=None, scopes=DEFAULT_SCOPES, s
                    help="send later, e.g. 2026-10-15T08:00 (local time); waits in Outbox")
     s.add_argument("--dry-run", action="store_true", help="print the exact request and send nothing")
     s.set_defaults(fn=cmd_graph_sendmail)
+    s.add_argument("--json", action="store_true")
 
     s = add("logout", **h("delete the cached token"))
     s.set_defaults(fn=cmd_graph_logout)
@@ -932,7 +949,8 @@ def cmd_calendar_mirror(a):
     try:
         bodies = mscal.bodies_for(ev, travel=travel)
         if a.dry_run:
-            print(f"[torrkörning] {len(bodies)} × POST /me/events — inget bokat")
+            if not a.json:
+                print(f"[torrkörning] {len(bodies)} × POST /me/events — inget bokat")
             print(json.dumps(bodies, indent=2, ensure_ascii=False))
             return 0
         made = mscal.mirror(ev, travel=travel)
@@ -943,6 +961,9 @@ def cmd_calendar_mirror(a):
         print(str(e), file=sys.stderr)
         return 2
 
+    if a.json:
+        print(json.dumps(made, ensure_ascii=False, indent=2))
+        return 0
     print(f"{ev.get('summary') or 'namnlös bokning'} speglad:")
     for block in made:
         print(f"  {block.get('subject', '?'):12} {_block_when(block)}"
@@ -998,9 +1019,15 @@ def cmd_calendar_unmirror(a):
         print(str(e), file=sys.stderr)
         return 2
     if not rows:
+        if a.json:
+            print(json.dumps({"removed": 0, "dryRun": not a.yes}))
+            return 0
         print("Ingen spegling att ta bort.")
         return 0
     if not a.yes:
+        if a.json:
+            print(json.dumps({"dryRun": True, "wouldRemove": rows}, ensure_ascii=False, indent=2))
+            return 1
         for ev in rows:
             # The list read before deleting, so it shows what is going in full
             # rather than a start time that hides three of the four days.
@@ -1008,21 +1035,57 @@ def cmd_calendar_unmirror(a):
         print(f"\n{len(rows)} bokning(ar) skulle tas bort. Kör om med --yes.")
         return 1
     try:
-        gone = mscal.unmirror(a.google_id)
+        gone = mscal.unmirror(a.google_id, rows=rows)
     except mscal.MirrorError as e:
         print(str(e), file=sys.stderr)
         return 1
+    if a.json:
+        print(json.dumps({"removed": gone}))
+        return 0
     print(f"{gone} spegling(ar) borttagna. Google-eventet är orört.")
     return 0
 
 
+def cmd_calendar_agenda(a):
+    rows = mscal.agenda(a.date, a.days, a.include_cancelled)
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    for row in rows:
+        def local_time(block):
+            value = block.get("dateTime") or ""
+            # Graph returns UTC because agenda requests it explicitly.
+            if block.get("timeZone") == "UTC" and not re.search(r"(?:Z|[+-]\d\d:\d\d)$", value):
+                value += "Z"
+            return _ts(value)
+
+        start, end = local_time(row.get("start") or {}), local_time(row.get("end") or {})
+        when = f"{start[:10]} hela dagen" if row.get("isAllDay") else f"{start} – {end}"
+        place = (row.get("location") or {}).get("displayName")
+        print(f"{when}  {row.get('subject') or '(utan ämne)'}"
+              + (f"  ({place})" if place else "") + (" [inställt]" if row.get("isCancelled") else ""))
+    if not rows:
+        print("Inga kalenderbokningar under perioden.")
+    return 0
+
+
 def _add_calendar_commands(sub):
+    for name, days in (("today", 1), ("agenda", 7)):
+        s = sub.add_parser(name, help="show today's events" if name == "today" else "show upcoming calendar events")
+        s.add_argument("--date", help="first local date (YYYY-MM-DD), default today")
+        if name == "agenda":
+            s.add_argument("--days", type=_mail_count, default=days, help="number of local calendar days, default 7, max 366")
+        s.add_argument("--include-cancelled", action="store_true")
+        s.add_argument("--json", action="store_true")
+        s.set_defaults(fn=cmd_calendar_agenda, **({"days": days} if name == "today" else {}))
+
     s = sub.add_parser("mirror", help="block the time on the work calendar; reads a Google event on stdin")
     s.add_argument("--restid", metavar="LEN", default="30m",
                    help="travel time blocked either side: 30m, 1h, 45 (default: 30m)")
     s.add_argument("--no-restid", action="store_true", help="the booking only, no travel time")
     s.add_argument("--dry-run", action="store_true", help="print the Graph bodies and book nothing")
     s.set_defaults(fn=cmd_calendar_mirror)
+    s.add_argument("--json", action="store_true")
 
     s = sub.add_parser("show", help="whether a Google event is mirrored, and where")
     s.add_argument("google_id", metavar="GOOGLE-ID")
@@ -1033,6 +1096,7 @@ def _add_calendar_commands(sub):
     s.add_argument("google_id", metavar="GOOGLE-ID")
     s.add_argument("--yes", action="store_true", help="actually delete; without it, only lists")
     s.set_defaults(fn=cmd_calendar_unmirror)
+    s.add_argument("--json", action="store_true")
 
 
 # ── Planner ───────────────────────────────────────────────────────────────────
@@ -1126,7 +1190,7 @@ def cmd_planner_tasks(a):
     try:
         plan = planner.resolve_plan(a.plan)
         rows = planner.tasks(plan["id"], include_done=a.all)
-        cols = planner.buckets(plan["id"])
+        cols = [] if a.json else planner.buckets(plan["id"])
     except planner.PlannerError as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -1155,8 +1219,8 @@ def cmd_planner_tasks(a):
 
 def cmd_planner_mine(a):
     try:
-        rows = planner.my_tasks(include_done=a.all)
-        titles = {p["id"]: p.get("title") for p in planner.plans()}
+        rows = planner.my_tasks(include_done=a.all, with_assignees=a.json)
+        titles = {} if a.json or not rows else {p["id"]: p.get("title") for p in planner.plans(with_names=False)}
     except planner.PlannerError as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -1249,6 +1313,10 @@ def _add_planner_commands(sub):
 
 def _message_text(a):
     """The message from the arguments, or from stdin when there are none."""
+    if getattr(a, "file", None):
+        if a.text:
+            raise InputError("Ge antingen meddelandet som argument eller med --file, inte båda.")
+        return _utf8_message_file(a.file)
     if a.text:
         return " ".join(a.text)
     if sys.stdin.isatty():
@@ -1259,7 +1327,12 @@ def _message_text(a):
 def cmd_teams_send(a):
     from . import teams
 
-    text = _message_text(a).strip()
+    try:
+        text = _message_text(a).strip()
+    except InputError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    text = _normalize_message_text(text)
     if not text:
         print("Tom text, inget skickat. Ge texten som argument eller på stdin.", file=sys.stderr)
         return 2
@@ -1267,6 +1340,10 @@ def cmd_teams_send(a):
     target = a.chat or f"1:1-chatten med {a.to}"
 
     if a.dry_run:
+        if a.json:
+            print(json.dumps({"dryRun": True, "to": a.to, "chatId": a.chat,
+                              "text": text, "html": content}, ensure_ascii=False, indent=2))
+            return 0
         print(f"[torrkörning] till {target} - inget skickat")
         print(text)
         print("--- som HTML:")
@@ -1276,16 +1353,8 @@ def cmd_teams_send(a):
     try:
         chat = a.chat or teams.chat_with(a.to)
         r = teams.send(chat, content)
-    except Exception as e:  # urllib raises HTTPError; its body carries Graph's reason
-        detail = ""
-        read = getattr(e, "read", None)
-        if callable(read):
-            try:
-                detail = ": " + read().decode(errors="replace")[:400]
-            except Exception:
-                detail = ""
-        print(f"Sändningen misslyckades{detail or ': ' + str(e)}", file=sys.stderr)
-        return 2
+    except Exception as e:
+        return _graph_error("Sändningen misslyckades", e)
     if a.sent_log:
         # A loop that answers in a chat tells its own messages from the ones the
         # person typed by these ids.
@@ -1295,6 +1364,33 @@ def cmd_teams_send(a):
         print(json.dumps({"chatId": chat, "id": r["id"], "createdDateTime": r["createdDateTime"]}))
     else:
         print(f"Skickat till {target}: {r['id']} {_ts(r['createdDateTime'])}")
+    return 0
+
+
+def cmd_teams_edit(a):
+    from . import teams
+
+    try:
+        text = _message_text(a).strip()
+    except InputError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if not text:
+        print("Tom text, inget ändrat. Ge texten som argument eller med --file.", file=sys.stderr)
+        return 2
+    text = _normalize_message_text(text)
+    content = text if a.html else teams.to_html(text)
+    if a.dry_run:
+        print(f"[torrkörning] meddelande {a.message_id} i {a.chat} - inget ändrat")
+        print(text)
+        print("--- som HTML:")
+        print(content)
+        return 0
+    try:
+        teams.edit(a.chat, a.message_id, content)
+    except Exception as e:
+        return _graph_error("Redigeringen misslyckades", e)
+    print(f"Redigerat meddelande {a.message_id} i chatten.")
     return 0
 
 
@@ -1424,7 +1520,7 @@ def cmd_teams_find(a):
     except (auth.AuthError, HTTPError) as e:
         # A login from before 0.8.0 may lack ChannelMessage.Read.All; read the
         # recent chats rather than fail.
-        print(f"Sökningen gick inte ({e}); letar i de senaste chattarna i stället. "
+        print(f"Sökningen gick inte ({auth.error_message(e)}); letar i de senaste chattarna i stället. "
               "wsg graph login en gång till ger sökning i hela historiken.", file=sys.stderr)
         return _find_recent(a)
     if a.json:
@@ -1478,11 +1574,21 @@ def _add_teams_commands(sub):
     who.add_argument("--to", metavar="ADDRESS", help="the 1:1 chat with this person, found or made by address")
     who.add_argument("--chat", metavar="CHAT-ID", help="a chat by id, e.g. a group chat 19:...@thread.v2")
     s.add_argument("text", nargs="*", help="the message; read from stdin when left out")
+    s.add_argument("--file", metavar="UTF8-FILE", help="read UTF-8 markdown from a file")
     s.add_argument("--html", action="store_true", help="the text is HTML already, send it as it is")
     s.add_argument("--dry-run", action="store_true", help="print the text and its HTML, send nothing")
     s.add_argument("--sent-log", metavar="FILE", help="append the sent message's id to this file")
     s.add_argument("--json", action="store_true", help="print chatId, id and createdDateTime as JSON")
     s.set_defaults(fn=cmd_teams_send)
+
+    s = sub.add_parser("edit", help="edit one of your messages in a chat; markdown in, Teams HTML out")
+    s.add_argument("--chat", required=True, metavar="CHAT-ID")
+    s.add_argument("--message", dest="message_id", required=True, metavar="MESSAGE-ID")
+    s.add_argument("text", nargs="*", help="replacement text; read from stdin when left out")
+    s.add_argument("--file", metavar="UTF8-FILE", help="read UTF-8 markdown from a file")
+    s.add_argument("--html", action="store_true", help="the text is HTML already, send it as it is")
+    s.add_argument("--dry-run", action="store_true", help="print the rendered result; change nothing")
+    s.set_defaults(fn=cmd_teams_edit)
 
     s = sub.add_parser("chats", help="your chats, most recent first; a filter matches topic, member name or address")
     s.add_argument("filter", nargs="?", help="e.g. a person's name or a group chat's topic")
@@ -1521,14 +1627,7 @@ def _add_teams_commands(sub):
 # under graph, where it has always been.
 
 def _graph_error(prefix, e):
-    detail = ""
-    read = getattr(e, "read", None)
-    if callable(read):
-        try:
-            detail = ": " + read().decode(errors="replace")[:400]
-        except Exception:
-            detail = ""
-    print(f"{prefix}{detail or ': ' + str(e)}", file=sys.stderr)
+    print(f"{prefix}: {str(e) if isinstance(e, InputError) else auth.error_message(e)}", file=sys.stderr)
     return 2
 
 
@@ -1541,26 +1640,17 @@ def _print_thread(msgs):
 
 def cmd_mail_list(a):
     from . import mail
-    from urllib.error import HTTPError, URLError
 
-    try:
-        rows = mail.messages(a.number, a.senders, a.unread, a.all_folders)
-    except auth.AuthError:
-        # Token endpoint errors may contain credentials; do not echo them.
-        print("Kunde inte använda inloggningen. Kör: wsg graph login", file=sys.stderr)
-        return 2
-    except HTTPError as e:
-        print(f"Kunde inte lista mejl (HTTP {e.code}).", file=sys.stderr)
-        return 2
-    except (URLError, OSError):
-        print("Kunde inte nå Microsoft Graph. Försök igen senare.", file=sys.stderr)
-        return 2
-    except ValueError:
-        print("Kunde inte läsa svaret från Microsoft Graph.", file=sys.stderr)
-        return 2
+    rows = mail.messages(a.number, a.senders, a.unread, a.all_folders,
+                         since=a.since, before=a.before, folder=a.folder)
     if a.json:
         print(json.dumps(rows, indent=2, ensure_ascii=False))
         return 0
+    _print_mail_rows(rows)
+    return 0
+
+
+def _print_mail_rows(rows):
     if not rows:
         print("Inga mejl matchar.")
         return 0
@@ -1596,10 +1686,14 @@ def _mail_sender(value):
 def cmd_mail_reply(a):
     from . import mail
 
-    if sys.stdin.isatty():
+    if a.file:
+        text = _utf8_message_file(a.file).strip()
+    elif sys.stdin.isatty():
         print("Svarstexten läses från stdin. Pipa in den, t.ex. med en here-doc.", file=sys.stderr)
         return 2
-    text = _stdin_text().strip()
+    else:
+        text = _stdin_text().strip()
+    text = _normalize_message_text(text)
     if not text:
         print("Tom svarstext, inget skickat.", file=sys.stderr)
         return 2
@@ -1616,6 +1710,13 @@ def cmd_mail_reply(a):
         return _graph_error("Kunde inte läsa mailet", e)
 
     if a.dry_run:
+        if a.json:
+            preview = {"dryRun": True, "id": mid, "to": to, "cc": cc, "text": text,
+                       "attachments": [{"name": att["name"]} for att in attachments]}
+            if a.archive:
+                preview["wouldArchive"] = mail.thread_in_inbox(mid)
+            print(json.dumps(preview, ensure_ascii=False, indent=2))
+            return 0
         print(f"[torrkörning] {'svara alla' if a.all else 'svara'} på \"{msg.get('subject') or ''}\" - inget skickat")
         print(f"Till: {', '.join(to) or '-'}")
         if cc:
@@ -1630,17 +1731,22 @@ def cmd_mail_reply(a):
         return 0
 
     try:
-        mail.reply(mid, text, a.all, attachments, a.plain)
+        sent_id = mail.reply(mid, text, a.all, attachments, a.plain)
     except Exception as e:
         return _graph_error("Svaret gick inte iväg", e)
-    print(f"Svarat till {', '.join(to)}" + (f" (kopia {', '.join(cc)})" if cc else "")
-          + f" på \"{msg.get('subject') or ''}\"")
+    if not a.json:
+        print(f"Svarat till {', '.join(to)}" + (f" (kopia {', '.join(cc)})" if cc else "")
+              + f" på \"{msg.get('subject') or ''}\"")
+    n = 0
     if a.archive:
         try:
             n = mail.archive(mail.thread_in_inbox(mid))
         except Exception as e:
             return _graph_error("Svaret gick iväg, men arkiveringen misslyckades", e)
-        print(f"Tråden arkiverad: {n} meddelanden flyttade från inkorgen.")
+        if not a.json:
+            print(f"Tråden arkiverad: {n} meddelanden flyttade från inkorgen.")
+    if a.json:
+        print(json.dumps({"id": sent_id, "to": to, "cc": cc, "archived": n}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1666,9 +1772,16 @@ def cmd_mail_archive(a):
     except Exception as e:
         return _graph_error("Kunde inte läsa tråden", e)
     if not msgs:
+        if a.json:
+            print(json.dumps({"moved": 0, "dryRun": a.dry_run}))
+            return 0
         print("Inget från den tråden ligger i inkorgen.")
         return 0
     if a.dry_run:
+        if a.json:
+            print(json.dumps({"dryRun": True, "wouldMove": len(msgs), "messages": msgs},
+                             ensure_ascii=False, indent=2))
+            return 0
         print(f"[torrkörning] {len(msgs)} meddelanden skulle flyttas till Arkiv:")
         _print_thread(msgs)
         return 0
@@ -1676,14 +1789,20 @@ def cmd_mail_archive(a):
         n = mail.archive(msgs)
     except Exception as e:
         return _graph_error("Arkiveringen misslyckades", e)
+    if a.json:
+        print(json.dumps({"moved": n, "originalIds": [m["id"] for m in msgs]}, ensure_ascii=False, indent=2))
+        return 0
     print(f"Tråden arkiverad: {n} meddelanden flyttade från inkorgen.")
     _print_thread(msgs)
     return 0
 
 
 def _add_mail_commands(sub):
+    from . import mail_cli
+
+    mail_cli.register(sub, _mail_count)
     s = sub.add_parser("list", help="list your inbox, newest first")
-    s.add_argument("--all-folders", action="store_true", help="include all mailbox folders instead of only Inbox")
+    mail_cli.add_scope(s)
     s.add_argument("--from", dest="senders", action="append", type=_mail_sender, metavar="TEXT",
                    help="case-insensitive name or address fragment (repeat to match any)")
     s.add_argument("-n", "--number", "--limit", type=_mail_count, default=30,
@@ -1696,10 +1815,12 @@ def _add_mail_commands(sub):
     s.add_argument("message", help="the message id, or the connector's mail:///messages/<id>")
     s.add_argument("--all", action="store_true", help="reply to everyone on it, not only the sender")
     s.add_argument("--attach", action="append", metavar="FILE", help="attach a file (repeat; ~3 MB in total)")
+    s.add_argument("--file", metavar="UTF8-FILE", help="read the UTF-8 markdown reply from a file")
     s.add_argument("--archive", action="store_true", help="then move the whole thread out of the inbox")
     s.add_argument("--plain", action="store_true", help="send the text as it is, not rendered from markdown")
     s.add_argument("--dry-run", action="store_true", help="show who it goes to and the text, send nothing")
     s.set_defaults(fn=cmd_mail_reply)
+    s.add_argument("--json", action="store_true")
 
     s = sub.add_parser("md", help="print the mail HTML for a markdown text, send nothing")
     s.add_argument("text", nargs="*", help="the text; read from stdin when left out")
@@ -1710,6 +1831,7 @@ def _add_mail_commands(sub):
     s.add_argument("message", help="any message in the thread: its id, or mail:///messages/<id>")
     s.add_argument("--dry-run", action="store_true", help="list what would move, move nothing")
     s.set_defaults(fn=cmd_mail_archive)
+    s.add_argument("--json", action="store_true")
 
 
 # ── One-time links (secrets.wesports.io) ──────────────────────────────────────
@@ -2025,7 +2147,7 @@ def main(argv=None):
     ar = sub.add_parser("arena", help="WeSports Arena, signed in with Arena's own OAuth")
     _add_arena_commands(ar.add_subparsers(dest="arena_cmd", required=True))
 
-    ca = sub.add_parser("calendar", help="mirror a private booking onto the work calendar as busy")
+    ca = sub.add_parser("calendar", help="read your agenda or mirror a private booking as busy")
     _add_calendar_commands(ca.add_subparsers(dest="calendar_cmd", required=True))
 
     pl = sub.add_parser("planner", help="Planner boards, read-only: what is on them and what is mine")
@@ -2057,10 +2179,15 @@ def main(argv=None):
     a = p.parse_args(argv)
     # Most commands catch a missing login themselves; the ones that do not used to
     # end in a traceback. The message already names the login to run.
+    from urllib.error import HTTPError, URLError
     try:
-        return a.fn(a)
-    except auth.AuthError as e:
+        with auth.graph_session():
+            return a.fn(a)
+    except InputError as e:
         print(str(e), file=sys.stderr)
+        return 2
+    except (auth.AuthError, HTTPError, URLError, OSError, ValueError) as e:
+        print(auth.error_message(e), file=sys.stderr)
         return 2
 
 

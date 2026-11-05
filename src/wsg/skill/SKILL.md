@@ -1,6 +1,6 @@
 ---
 name: wsg
-description: Logga in som sig själv mot Microsoft 365 (Graph) och WeSports Arena med wsg-cli, och använd det för att skicka mail, svara på mail i tråden och arkivera trådar, skriva, läsa och söka i Teams, läsa Planner-tavlor, skapa engångslänkar för lösenord och nycklar, eller hämta en token till ett eget script. Use when the user wants to list or filter their own mail by sender or unread status, send a mail, answer a mail in its thread, archive a mail thread, or send a Teams message from the terminal, read a Teams chat or find something said in Teams, asks what is on a Planner board or what Planner tasks are theirs, needs to hand someone a password or API key safely, asks for a Graph or Arena token, or says "wsg". Exempel "skicka ett mail till Anna med rapporten", "svara Erik att torsdag funkar", "arkivera tråden", "skriv till Erik i Teams att det är klart", "vad skrev Gustav i Teams idag", "var var det någon nämnde returfrakten i Teams", "vad har jag i Planner", "vad ligger på tavlan Vartex Service", "skicka lösenordet till Erik på ett säkert sätt", "logga in wsg", "uppdatera wsg".
+description: Logga in som sig själv mot Microsoft 365 (Graph) och WeSports Arena med wsg-cli, och använd det för att skicka mail, svara på mail i tråden och arkivera trådar, skriva, läsa och söka i Teams, läsa Planner-tavlor, skapa engångslänkar för lösenord och nycklar, eller hämta en token till ett eget script. Use when the user wants to read, search or organize their own mail, inspect conversations or attachments, view their calendar agenda, send a mail, answer a mail in its thread, archive a mail thread, or send a Teams message from the terminal, read a Teams chat or find something said in Teams, asks what is on a Planner board or what Planner tasks are theirs, needs to hand someone a password or API key safely, asks for a Graph or Arena token, or says "wsg". Exempel "skicka ett mail till Anna med rapporten", "svara Erik att torsdag funkar", "arkivera tråden", "skriv till Erik i Teams att det är klart", "vad skrev Gustav i Teams idag", "var var det någon nämnde returfrakten i Teams", "vad har jag i Planner", "vad ligger på tavlan Vartex Service", "skicka lösenordet till Erik på ett säkert sätt", "logga in wsg", "uppdatera wsg".
 ---
 
 # wsg: inloggning mot Microsoft 365 och Arena
@@ -37,6 +37,7 @@ python -m wsg mail list                                  senaste 30, nyast förs
 python -m wsg mail list --from Alex --from Sam -n 10       från någon av avsändarna
 python -m wsg mail list --from someone@example.com --unread --json
 python -m wsg mail list --all-folders                     även övriga mappar
+python -m wsg mail list --since 2026-10-01 --before 2026-11-01 --unread
 ```
 
 - Använder befintlig `wsg graph login`, bara personens egen inkorg som standard.
@@ -51,6 +52,68 @@ python -m wsg mail list --all-folders                     även övriga mappar
   med `id`, `receivedDateTime`, `from.emailAddress`, `subject` och `isRead`;
   tomt resultat är `[]`. Använd `id` för svar eller arkivering.
 - Hämtar bara metadata, ingen brödtext eller bilagor. Skriver aldrig ut token.
+- `--since` inkluderar starttid, `--before` exkluderar sluttid. ISO-datum utan
+  tidszon använder datorns lokala tid. Datum och oläst filtreras på servern;
+  avsändarfragment matchas lokalt. `--folder ID` väljer en bestämd mapp i stället
+  för inkorgen och kan inte kombineras med `--all-folders`.
+
+## Läsa, söka och hämta bilagor
+
+```
+python -m wsg mail read MAIL-ID
+python -m wsg mail thread MAIL-ID --json
+python -m wsg mail find "invoice" --since 2026-10-01 --json
+python -m wsg mail find "from:someone@example.com AND subject:invoice" --all-folders
+python -m wsg mail attachments MAIL-ID --json
+python -m wsg mail save MAIL-ID BILAGE-ID -o ./report.pdf --json
+```
+
+- `read` hämtar brödtexten utan att markera som läst. `thread` läser hela
+  konversationen i alla egna mappar, även Skickat och Arkiv, äldst först.
+- `find` använder indexerad sökning med ord eller KQL. Inkorgen är standard;
+  `--folder ID` eller `--all-folders` väljer andra mappar. Resultaten är sorterade
+  efter sändtid, senaste först. Graph har ett tak på 1000 indexerade träffar och
+  nya mejl kan dröja innan de syns. Begränsa med datum eller en mer specifik fråga.
+  Exakta tidsgränser kontrolleras efter indexets datumfilter, så färre än `-n`
+  träffar kan återstå. `--since` och `--before` fungerar som i listningen.
+- `attachments` hämtar bara metadata och id. `save` sparar en vald bilaga till
+  fil eller befintlig mapp utan att skriva över. Molnlänkar öppnas i Outlook.
+- Alla kommandon har `--json`. Listor och trådar ger arrayer, ett mejl ger ett
+  objekt med brödtext, mottagare och konversations-id. Innehållet kan vara känsligt:
+  redovisa det som behövs för personens fråga.
+
+## Ordna mejlen
+
+```
+python -m wsg mail mark MAIL-ID --read --dry-run
+python -m wsg mail mark MAIL-ID --unread
+python -m wsg mail flag MAIL-ID --dry-run
+python -m wsg mail flag MAIL-ID --status complete
+python -m wsg mail flag MAIL-ID --status notFlagged
+python -m wsg mail folders --json
+python -m wsg mail folders --parent MAPP-ID --json
+python -m wsg mail move MAIL-ID --to archive --dry-run --json
+```
+
+- `mark`, `flag` och `move` ändrar ett valt mejl. Kör `--dry-run` för att visa
+  åtgärden först. Förhandsvisningen gör inga anrop och kräver ingen inloggning.
+- Målmapp anges med id från `folders` eller ett standardnamn som `inbox`,
+  `archive` eller `deleteditems`. Flytt ger ett nytt mejl-id; använd det därefter.
+- `--json` stöds för både åtgärder och förhandsvisning.
+
+## Visa kalendern
+
+```
+python -m wsg calendar today
+python -m wsg calendar agenda --days 7
+python -m wsg calendar agenda --date 2026-11-02 --days 3 --json
+```
+
+- Läser personens vanliga jobbkalender, även återkommande mötestillfällen och
+  undantag. Visar lokal tid, ämne och plats. Ingen bokning ändras.
+- `--date` anger första lokala dagen, idag som standard. `agenda --days` är 7
+  som standard, högst 366. Inställda möten visas med `--include-cancelled`.
+- `--json` ger en array med råa Graph-händelser och UTC-tider.
 
 ## Skicka mail
 
@@ -67,6 +130,8 @@ EOF
   dem. Formatera efter innehållet: fetstil på det som inte får missas, det
   mottagaren ska klistra in eller känna igen (ett kommando, ett fältnamn, JSON)
   som `kod` eller kodblock, steg som numrerad lista. Ett kort mail är bara stycken.
+- `--file UTF8-FILE` läser en mejltext med UTF-8, inklusive å, ä och ö, utan att
+  passera texten genom Windows terminalkodningen. Använd det för längre texter.
 - `--plain` skickar texten som ren text, `--html` om texten redan är HTML.
   `wsg mail md` visar HTML:en, och `-o FIL` sparar den som en sida att öppna i
   webbläsaren.
@@ -95,10 +160,14 @@ python -m wsg mail archive MAIL-ID --dry-run
 - `--all` svarar alla (avsändaren plus Till och Kopia, utom personen själv).
   `--attach FIL` för bilagor, högst cirka 3 MB.
 - Texten är markdown, precis som i `sendmail`. `--plain` skickar den som den är.
+- `--file UTF8-FILE` läser svarstexten med UTF-8 och bevarar svenska tecken.
 - `--dry-run` visar mottagare, kopia och text. **Visa dem för personen** innan
   svaret går iväg.
 - `--archive` flyttar sedan hela tråden från inkorgen till Arkiv. `mail archive`
   gör bara det, för en tråd som är klar utan svar. Ett flyttat mail får nytt id.
+- `reply` och `archive` har `--json`, även med `--dry-run`. Arkivering följer
+  alla sidor. `graph sendmail --json` ger ett objekt med att Graph accepterat
+  sändningen, vilket inte är en leveransbekräftelse.
 
 ## Skriva i Teams
 
@@ -108,6 +177,7 @@ python -m wsg teams send --to erik@example.com --dry-run <<'EOF'
 1. Öppna inställningarna
 2. Klistra in `nyckeln`
 EOF
+python -m wsg teams edit --chat CHAT-ID --message MESSAGE-ID --file ./message.md --dry-run
 ```
 
 - Texten är markdown och går ut formaterad: fetstil, listor, `kod`, kodblock,
@@ -122,6 +192,12 @@ EOF
 - Texten tas från argumenten eller från stdin. Kör `--dry-run` först och **visa
   meddelandet för personen** innan det skickas. Ett skickat meddelande syns direkt
   hos mottagaren.
+- `--file` läser markdown som UTF-8 och bevarar å, ä och ö. På Windows, använd fil
+  när meddelandet innehåller flera stycken eller svenska tecken. `\\n` i en text
+  räknas som radbrytning om det inte redan finns riktiga radbrytningar.
+- `edit` ersätter ett av dina egna meddelanden i chatten. Hämta id:t med `read --json`;
+  kör `--dry-run` och visa den nya texten innan du redigerar. Graph kräver att
+  `Chat.ReadWrite` är beviljat och inloggningen kan behöva göras om.
 - Formatera efter innehållet: steg som numrerad lista, det mottagaren ska klistra in
   i ett kodblock, fetstil på det enda som inte får missas. Ett kort svar är en mening
   utan formatering.
@@ -256,6 +332,15 @@ python -m wsg update
 Hämtar senaste versionen och skriver om den här skillen. Inloggningen ligger kvar.
 
 ## Felmeddelanden
+
+N?tverksfel skiljer nu p? DNS, TLS, nekad anslutning och faktisk timeout. Graph-anrop har 30 sekunders tidsgr?ns per f?rs?k; h?j den bara om diagnostiken visar en timeout.
+
+
+Graph-läsningar har 30 sekunders tidsgräns per försök och högst två återförsök
+vid tillfälliga fel. Serverns väntetid följs; en längre väntan än 30 sekunder
+avbryter kommandot. Skrivningar upprepas aldrig automatiskt. Fel går till stderr
+utan token eller råa serversvar. Kommandon återanvänder inloggningen under sin
+körning; mejl och kalenderdata sparas inte i någon bakgrundscache.
 
 | Meddelande | Betyder | Gör |
 |---|---|---|

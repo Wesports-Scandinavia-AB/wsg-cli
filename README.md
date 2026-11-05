@@ -71,11 +71,20 @@ wsg planner task ID    one task with its description and checklist
 wsg planner link X     the address of one board, --bare for the URL alone
 
 wsg teams send         post in a Teams chat as yourself, markdown in, --dry-run first
+wsg teams edit         edit one of your own messages, markdown in, --dry-run first
 wsg teams chats [X]    your chats, most recent first, filtered by topic or member
 wsg teams read         one chat, oldest first: --chat ID, --to ADDRESS or --name TEXT
 wsg teams find TEXT    search your chats and channels for TEXT, the whole history
 wsg teams md           print the Teams HTML for a markdown text, send nothing
 wsg mail list          your latest inbox mail, with sender/unread filters and --json
+wsg mail read ID       read one message without marking it read
+wsg mail thread ID     read the whole conversation, oldest first
+wsg mail find QUERY    indexed search in your inbox (words or KQL)
+wsg mail attachments ID  list attachments; mail save ID ATTACHMENT -o FILE downloads one
+wsg mail mark ID --read  mark read (--unread to mark unread)
+wsg mail flag ID       flag for follow-up; --status complete or notFlagged
+wsg mail folders       list folder ids; --parent ID for subfolders
+wsg mail move ID --to FOLDER  move a message, returning its new id
 wsg mail reply ID      answer a mail in its thread, markdown from stdin, --dry-run first
 wsg mail md            print the mail HTML for a markdown text (-o FILE to view it), send nothing
 wsg mail archive ID    move every message in a mail's thread from the inbox to Archive
@@ -211,7 +220,8 @@ EOF
 ```
 
 The body is read from stdin so a here-doc keeps its formatting, which a shell
-argument would mangle. It is markdown, rendered the way `teams send` renders it
+argument would mangle. Use `--file UTF8-FILE` on Windows to preserve Swedish
+characters through file-based UTF-8 decoding. It is markdown, rendered the way `teams send` renders it
 (bold, italic, `code`, code blocks, links, headings, quotes, tables, lists), with
 the look written inline on every tag: Outlook on Windows renders mail with Word
 and ignores a `<style>` block. `--plain` sends the text as it is, `--html` sends
@@ -241,6 +251,8 @@ wsg mail list --from Alex --from Sam -n 10          either sender, name or addre
 wsg mail list --from someone@example.com --unread   unread messages from that sender
 wsg mail list --limit 50 --json                     JSON array for scripts
 wsg mail list --all-folders                        include all mailbox folders
+wsg mail list --since 2026-10-01 --before 2026-11-01 --unread
+wsg mail list --folder archive                     list a chosen folder
 ```
 
 Uses the existing `wsg graph login` session and `GET /me/mailFolders/inbox/messages`
@@ -251,14 +263,71 @@ read. `--from TEXT` is a case-insensitive substring match against the sender's n
 or address; repeat it to match any of several senders. `--unread` combines with it.
 `-n`, `--number` and `--limit` set a positive maximum number of **matching** messages
 (default 30). Graph pages are followed until that many matches are found or the
-selected folder scope ends. Filters run locally over metadata in date order, so a sparse filter
-can require many requests; message bodies and attachments are never requested.
+selected folder scope ends. Date and unread filters run on Graph, reducing the
+amount transferred. Sender fragments match locally over metadata in date order,
+so a sparse sender filter can require many requests. Bodies and attachments are
+never requested for a list. `--since` is inclusive and `--before` exclusive;
+ISO dates/times without an offset use your computer's local timezone.
+`--folder ID` (or a well-known name such as `archive`) selects another folder;
+it cannot be combined with `--all-folders`.
 
 `--json` returns an array (empty results are `[]`) with Graph fields `id`,
 `receivedDateTime`, `from.emailAddress` (`name`, `address`), `subject` and `isRead`.
 Times retain their original offsets in JSON. Use the `id` with `mail reply` or
 `mail archive`. Errors go to stderr with exit code 2; no credentials are printed.
 Needs `Mail.ReadWrite`, already in the default scope set; no new consent is needed.
+
+### Reading, searching and downloading attachments
+
+```
+wsg mail read <message-id>
+wsg mail thread <message-id> --json
+wsg mail find "invoice" -n 20
+wsg mail find "from:someone@example.com AND subject:invoice" --all-folders
+wsg mail find "invoice" --since 2026-10-01 --before 2026-11-01 --json
+wsg mail attachments <message-id> --json
+wsg mail save <message-id> <attachment-id> -o ./report.pdf --json
+```
+
+`read` retrieves the body as text; reading does not change read status. `thread`
+follows the conversation across all your folders, including Sent Items and Archive,
+and returns every page, oldest first. JSON returns Graph message objects, including
+body, recipients, conversation id and Outlook link. Text output safely renders an
+HTML body as plain text if Graph returns HTML.
+
+`find` uses Graph's indexed `$search`, with words or KQL for sender, subject and
+other indexed properties. It defaults to Inbox and also accepts `--folder` or
+`--all-folders`. Unlike `list`, search results follow Graph's **sent time descending**
+order. Graph returns at most **1000 indexed hits per search** and indexing can lag;
+use a narrower query/date range when looking further back. Exact `--since` and
+`--before` timestamps are checked after the index's date filter, so fewer than
+`-n` matches may remain within that 1000-hit window. See Microsoft's
+[mail search documentation](https://learn.microsoft.com/en-us/graph/search-query-parameter).
+
+`attachments` lists metadata without transferring file contents. `save` downloads
+one selected attachment as binary data, avoiding base64 overhead. Its `-o` accepts
+a filename or an existing directory. It never overwrites an existing file and
+strips directory components from server-provided filenames. Item attachments are
+saved as MIME; cloud reference attachments must be opened through Outlook.
+
+### Organizing the inbox
+
+```
+wsg mail mark <message-id> --read --dry-run
+wsg mail mark <message-id> --unread --json
+wsg mail flag <message-id>
+wsg mail flag <message-id> --status complete
+wsg mail flag <message-id> --status notFlagged
+wsg mail folders --json
+wsg mail folders --parent <folder-id> --json
+wsg mail move <message-id> --to <folder-id> --dry-run --json
+```
+
+`mark`, `flag` and `move` change one selected message and support `--dry-run`
+without signing in or writing. Folder destinations are ids from `folders`, or
+well-known names such as `inbox`, `archive` and `deleteditems`. A move returns a
+new message id; use that for subsequent commands. All these commands support
+`--json`. Action results are objects; list results are arrays, including `[]`.
 
 ### Replying in the thread, archiving the thread
 
@@ -279,6 +348,7 @@ headers and the quoted original. The text is markdown, as with `sendmail`
 (`--plain` for text as it is), and is written into the draft's HTML above the
 quote rather than passed as `comment`, which joins its lines into one. Attachments are
 added to the draft before it is sent, under the same ~3 MB ceiling as `sendmail`.
+Use `--file UTF8-FILE` on Windows to preserve Swedish characters in a reply.
 `--dry-run` shows who it would go to, worked out as Outlook does: the sender (or
 Reply-To), plus To and Cc with `--all`, minus yourself.
 
@@ -290,6 +360,12 @@ gets a new id in Archive.
 The message id is Graph's, or the M365 connector's `mail:///messages/<id>`, which
 carries the same id. Needs `Mail.ReadWrite` beside `Mail.Send`; both are in the
 default scope set.
+
+`reply` and `archive` also support `--json`, including dry runs. A reply returns
+the sent draft id and recipients; archive returns the count and original message
+ids (which stop working after the move). Thread archiving follows all pages.
+`graph sendmail --json` reports Graph's acceptance, and its dry run prints only
+the JSON preview. Acceptance does not prove delivery to the recipient.
 
 ## Teams messages
 
@@ -312,6 +388,12 @@ and lists) and sent as `contentType: html`. It reads like chat rather than stric
 markdown: a line break stays a line break, and a list directly under a line of
 text is a list. `--html` sends HTML as it is; `wsg teams md` prints the HTML
 without sending.
+
+Use `--file UTF8-FILE` for multiline messages on Windows to preserve Swedish
+characters and paragraph breaks. Literal `\\n` sequences are treated as line
+breaks when the input contains no real line breaks. `teams edit --chat ID
+--message ID` replaces one of your own messages; the command checks authorship
+and requires the delegated `Chat.ReadWrite` scope.
 
 For scripts and loops: `--json` prints `chatId`, `id` and `createdDateTime`, and
 `--sent-log FILE` appends the message id to a file, so a loop can tell its own
@@ -431,6 +513,21 @@ our own domain.
 
 ## The work calendar
 
+```
+wsg calendar today
+wsg calendar agenda --days 7
+wsg calendar agenda --date 2026-11-02 --days 3 --json
+```
+
+`today` and `agenda` read your default work calendar with `calendarView`, so
+recurring occurrences and exceptions are included. Local date boundaries are
+converted separately to UTC, including across clock changes. Events are shown in
+start order with local times, subject and location; all-day events are labelled.
+Cancelled events are hidden unless `--include-cancelled` is given. `--date` starts
+at local midnight (today by default); `agenda --days` defaults to 7, maximum 366.
+JSON returns an array of Graph event objects with UTC times. These are read-only
+commands using the existing `Calendars.ReadWrite` permission.
+
 `calendar mirror` blocks time on your work calendar from a booking that lives in a
 private one. It reads the Google event as JSON on stdin, the same way `sendmail`
 reads a body, because the booking already exists over there and retyping it into
@@ -481,6 +578,10 @@ worse than an honest no: mirror the individual occurrences you want blocked.
 `calendar show <google-id>` says whether a booking is mirrored and where.
 `calendar unmirror <google-id> --yes` removes the block and leaves the Google
 event alone.
+
+`mirror --json` returns the created events (or the proposed bodies with
+`--dry-run`). `unmirror --json` returns removal metadata and reuses the events
+already fetched for its preview. Without `--yes`, unmirror previews and returns 1.
 
 Needs `Calendars.ReadWrite`.
 
@@ -610,6 +711,23 @@ domain has exactly one incident in the relevant state. `ack` only needs
 Send a real `User-Agent`: the zone's bot rules answer 403 to `Python-urllib`.
 Override the app with `WSG_ARENA_URL`, the token cache with `WSG_ARENA_TOKEN_CACHE`.
 
+## Reliability and performance
+
+Network diagnostics distinguish DNS, TLS, refused connections and actual timeouts without printing URLs or raw server responses. Increase the timeout only when the diagnostic reports a timeout.
+Graph requests use a 30-second timeout per attempt. GET requests retry at most
+twice for HTTP 429/502/503/504 and temporary network errors, respecting
+`Retry-After` (seconds or HTTP date). If Graph asks for more than 30 seconds, the
+command stops instead of retrying early. Writes are never retried automatically,
+avoiding duplicate sends or moves. Diagnostics omit response bodies, URLs and
+credentials; errors go to stderr. JSON output contains only the result.
+
+Within a command, Graph credentials are read/refreshed once per client/scope set
+and reused. They are discarded from that command's memory cache afterwards; no
+mail or calendar data is cached to disk. Recent Teams searches read up to four
+chats concurrently. Planner JSON skips bucket and plan-name lookups it does not
+display, and text-only plan titles skip group-name resolution. These reduce
+round trips; actual latency still depends on Microsoft Graph and data volume.
+
 ## Development checks
 
 Run from the repository root with `src` on `PYTHONPATH` (PowerShell:
@@ -621,6 +739,7 @@ python -m compileall -q src tests
 git diff --check
 ```
 
-Tests use mocked Graph responses and authentication; they do not read a real
+Tests cover mail, calendar, Planner, Teams and the shared Graph transport using
+mocked responses and authentication; they do not read a real
 mailbox or require a sign-in. No third party test dependencies are needed.
 

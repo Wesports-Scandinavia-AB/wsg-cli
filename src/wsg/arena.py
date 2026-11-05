@@ -41,7 +41,7 @@ import threading
 import time
 from pathlib import Path
 from urllib import parse, request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 from . import __version__
 from .auth import AuthError
@@ -50,6 +50,30 @@ DEFAULT_URL = "https://arena.wesports.io"
 # Cloudflare's bot rules on the zone answer 403 (error 1010, browser_signature_banned)
 # to the default "Python-urllib/x.y" agent, so identify as ourselves.
 USER_AGENT = f"wsg/{__version__} (+https://github.com/Wesports-Scandinavia-AB/wsg-cli)"
+
+
+class ArenaTransportError(OSError):
+    """A safe, actionable explanation for an Arena connection failure."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.user_message = message
+
+
+
+def _transport_message(error):
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "Arena timed out before responding. Check whether Arena is reachable, then retry."
+    if isinstance(reason, socket.gaierror):
+        return "Could not resolve Arena's address (DNS lookup failed). Check your network or DNS, then retry."
+    if isinstance(reason, ConnectionRefusedError):
+        return "Arena refused the connection. Check whether the service is reachable, then retry."
+    if isinstance(reason, ConnectionResetError):
+        return "The connection to Arena was interrupted. Check your network, then retry."
+    if isinstance(reason, OSError) and reason.errno is not None:
+        return f"Could not connect to Arena (network error {reason.errno}). Check your network, then retry."
+    return "Could not connect to Arena. Check your network or proxy settings, then retry."
 
 
 def app_url():
@@ -296,7 +320,10 @@ def api(method, path, body=None, token=None, timeout=60):
     A 401 on our own cached token (revoked, or the sign-in ran out between the
     expiry check and the call) signs in again once at a terminal and retries. A
     401 is refused before the handler runs, so the retry cannot do a write twice."""
-    tok = token or get_token()
+    try:
+        tok = token or get_token()
+    except (URLError, TimeoutError, ConnectionError, OSError) as e:
+        raise ArenaTransportError(_transport_message(e)) from None
     url = app_url() + (path if path.startswith("/") else "/" + path)
     data = json.dumps(body).encode() if body is not None else None
 
@@ -326,6 +353,8 @@ def api(method, path, body=None, token=None, timeout=60):
         except (ValueError, AttributeError):
             detail = raw.decode(errors="replace")
         raise AuthError(f"{method} {path}: HTTP {e.code}: {detail[:500]}")
+    except (URLError, TimeoutError, ConnectionError, OSError) as e:
+        raise ArenaTransportError(_transport_message(e)) from None
     if "json" in ctype:
         return json.loads(raw) if raw else None
     head = raw.lstrip()[:200].lower()
