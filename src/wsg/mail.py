@@ -43,7 +43,7 @@ from .markdown import MAIL_FONT, to_mail_html
 
 # Graph caps a request at about 4 MB; base64 adds a third. Same ceiling as sendmail.
 INLINE_LIMIT = 3 * 1024 * 1024
-LIST_FIELDS = "id,receivedDateTime,from,subject,isRead"
+LIST_FIELDS = "id,receivedDateTime,from,subject,isRead,parentFolderId"
 READ_FIELDS = LIST_FIELDS + ",toRecipients,ccRecipients,conversationId,body,hasAttachments,webLink,flag"
 TEXT_HEADER = {"Prefer": 'outlook.body-content-type="text"'}
 
@@ -202,6 +202,36 @@ def save_attachment(mid, aid, destination):
     except FileExistsError:
         raise InputError("Målfilen finns redan. Välj ett annat filnamn.") from None
     return {"id": aid, "name": meta.get("name"), "path": str(dest.resolve()), "bytes": len(content)}
+
+
+# One lookup per distinct folder, kept for the length of the command: a thread
+# touches two or three folders and they do not move while it runs.
+_FOLDER_NAMES = {}
+
+
+def folder_name(fid):
+    """The folder's display name, or the id itself when it cannot be read."""
+    if not fid:
+        return None
+    if fid not in _FOLDER_NAMES:
+        try:
+            got = graph("GET", f"/me/mailFolders/{parse.quote(fid, safe='')}?$select=displayName")
+            _FOLDER_NAMES[fid] = got.get("displayName") or fid
+        except (HTTPError, URLError, AuthError, OSError, ValueError):
+            _FOLDER_NAMES[fid] = fid
+    return _FOLDER_NAMES[fid]
+
+
+def with_folders(rows):
+    """Name the folder each message sits in, beside Graph's parentFolderId.
+
+    Where a message is answers "have I already archived this thread"; the id on
+    its own does not, and a thread is often half archived with only the newest
+    messages left in the inbox.
+    """
+    for row in rows:
+        row["folder"] = folder_name(row.get("parentFolderId"))
+    return rows
 
 
 def folders(parent=None):

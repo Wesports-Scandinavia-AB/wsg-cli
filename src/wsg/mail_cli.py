@@ -18,7 +18,8 @@ def _address(value):
 def _print_message(msg):
     from .cli import _ts
 
-    print(f"--- {_ts(msg.get('receivedDateTime'))}  {_address(msg.get('from'))}")
+    where = f"  [{msg['folder']}]" if msg.get("folder") else ""
+    print(f"--- {_ts(msg.get('receivedDateTime'))}  {_address(msg.get('from'))}{where}")
     print(f"Ämne: {msg.get('subject') or '(utan ämne)'}")
     for key, label in (("toRecipients", "Till"), ("ccRecipients", "Kopia")):
         if msg.get(key):
@@ -31,13 +32,13 @@ def _print_message(msg):
 
 
 def cmd_read(a):
-    row = mail.read(mail.message_id(a.message))
+    row = mail.with_folders([mail.read(mail.message_id(a.message))])[0]
     _json(row) if a.json else _print_message(row)
     return 0
 
 
 def cmd_thread(a):
-    rows = mail.thread(mail.message_id(a.message))
+    rows = mail.with_folders(mail.thread(mail.message_id(a.message)))
     if a.json:
         _json(rows)
     else:

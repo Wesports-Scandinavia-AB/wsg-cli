@@ -45,7 +45,7 @@ class MailMessagesTests(unittest.TestCase):
         query = parse_qs(urlsplit(url).query)
         self.assertEqual(query["$orderby"], ["receivedDateTime desc"])
         self.assertEqual(query["$top"], ["2"])
-        self.assertEqual(query["$select"], ["id,receivedDateTime,from,subject,isRead"])
+        self.assertEqual(query["$select"], [mail.LIST_FIELDS])
         self.assertNotIn("$search", query)
         self.assertNotIn("$filter", query)
 

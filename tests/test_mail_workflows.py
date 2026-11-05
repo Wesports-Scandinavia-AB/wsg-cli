@@ -294,3 +294,27 @@ class MailCliWorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MailFolderTests(unittest.TestCase):
+    @patch("wsg.mail.graph")
+    def test_thread_selects_parent_folder_and_names_it_once_per_folder(self, graph):
+        mail._FOLDER_NAMES.clear()
+        rows = [dict(message("a"), parentFolderId="inbox-id"),
+                dict(message("b"), parentFolderId="archive-id"),
+                dict(message("c"), parentFolderId="archive-id")]
+        graph.side_effect = [{"conversationId": "conv"}, {"value": rows},
+                             {"displayName": "Inbox"}, {"displayName": "Archive"}]
+        got = mail.with_folders(mail.thread("a"))
+        self.assertEqual([r["folder"] for r in got], ["Inbox", "Archive", "Archive"])
+        query = parse_qs(urlsplit(graph.call_args_list[1].args[1]).query)
+        self.assertIn("parentFolderId", query["$select"][0])
+        # The second message in Archive is answered from the cache, not a fourth call.
+        self.assertEqual(graph.call_count, 4)
+
+    @patch("wsg.mail.graph")
+    def test_unreadable_folder_falls_back_to_the_id(self, graph):
+        mail._FOLDER_NAMES.clear()
+        graph.side_effect = URLError("offline")
+        self.assertEqual(mail.folder_name("some-id"), "some-id")
+        self.assertIsNone(mail.folder_name(None))
