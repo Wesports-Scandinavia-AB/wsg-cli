@@ -234,6 +234,28 @@ def with_folders(rows):
     return rows
 
 
+def deeplink(msg):
+    """A link to the message in Outlook on the web that actually opens.
+
+    Graph's own webLink is the old OWA form on outlook.office365.com with an
+    ItemID, and current Outlook on the web does not resolve it; deeplink/read
+    does. The ItemID is taken from webLink rather than from the message id,
+    because Graph encodes + as _ in the id and OWA wants standard base64.
+    """
+    link = msg.get("webLink") or ""
+    if not link:
+        return ""
+    item = parse.parse_qs(parse.urlsplit(link).query).get("ItemID", [""])[0]
+    return "https://outlook.office.com/mail/deeplink/read/" + parse.quote(item, safe="") if item else link
+
+
+def with_links(rows):
+    """Add `deeplink` beside each message, so a listing can be clicked into."""
+    for row in rows:
+        row["deeplink"] = deeplink(row)
+    return rows
+
+
 def folders(parent=None):
     path = f"/me/mailFolders/{parse.quote(parent, safe='')}/childFolders" if parent else "/me/mailFolders"
     return list(_collection(path + "?" + parse.urlencode({

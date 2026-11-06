@@ -318,3 +318,16 @@ class MailFolderTests(unittest.TestCase):
         graph.side_effect = URLError("offline")
         self.assertEqual(mail.folder_name("some-id"), "some-id")
         self.assertIsNone(mail.folder_name(None))
+
+
+class MailDeeplinkTests(unittest.TestCase):
+    def test_deeplink_uses_the_item_id_from_weblink(self):
+        link = ("https://outlook.office365.com/owa/?ItemID=AAMk%2Ba%2Fb%3D"
+                "&exvsurl=1&viewmodel=ReadMessageItem")
+        self.assertEqual(mail.deeplink({"webLink": link}),
+                         "https://outlook.office.com/mail/deeplink/read/AAMk%2Ba%2Fb%3D")
+
+    def test_deeplink_without_an_item_id_keeps_what_graph_gave(self):
+        self.assertEqual(mail.deeplink({"webLink": "https://example.test/x"}),
+                         "https://example.test/x")
+        self.assertEqual(mail.deeplink({}), "")

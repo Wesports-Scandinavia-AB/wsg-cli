@@ -32,13 +32,13 @@ def _print_message(msg):
 
 
 def cmd_read(a):
-    row = mail.with_folders([mail.read(mail.message_id(a.message))])[0]
+    row = mail.with_links(mail.with_folders([mail.read(mail.message_id(a.message))]))[0]
     _json(row) if a.json else _print_message(row)
     return 0
 
 
 def cmd_thread(a):
-    rows = mail.with_folders(mail.thread(mail.message_id(a.message)))
+    rows = mail.with_links(mail.with_folders(mail.thread(mail.message_id(a.message))))
     if a.json:
         _json(rows)
     else:
