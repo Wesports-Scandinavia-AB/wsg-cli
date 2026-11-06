@@ -331,3 +331,40 @@ class MailDeeplinkTests(unittest.TestCase):
         self.assertEqual(mail.deeplink({"webLink": "https://example.test/x"}),
                          "https://example.test/x")
         self.assertEqual(mail.deeplink({}), "")
+
+
+class MailRelativeTimeAndPeopleTests(unittest.TestCase):
+    def test_a_time_back_is_counted_from_now(self):
+        from datetime import datetime, timedelta, timezone
+        from wsg import dates
+        now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(dates.moment("30d", now), now - timedelta(days=30))
+        self.assertEqual(dates.moment(" 36 h ", now), now - timedelta(hours=36))
+        self.assertEqual(dates.moment("2w", now), now - timedelta(weeks=2))
+        # The absolute form is untouched, and a nonsense value still explains itself.
+        self.assertEqual(dates.moment("2026-10-22T08:00Z", now),
+                         datetime(2026, 10, 22, 8, 0, tzinfo=timezone.utc))
+        with self.assertRaises(InputError):
+            dates.moment("30 fortnights", now)
+
+    @patch("wsg.mail.graph")
+    def test_older_than_thirty_days_filters_on_graph(self, graph):
+        graph.return_value = {"value": []}
+        mail.messages(before="30d")
+        query = parse_qs(urlsplit(graph.call_args.args[1]).query)
+        self.assertTrue(query["$filter"][0].startswith("receivedDateTime lt "))
+
+    @patch("wsg.mail.graph")
+    def test_with_matches_sender_recipient_or_cc_and_asks_for_them(self, graph):
+        sender = dict(message("a"), toRecipients=[], ccRecipients=[])
+        to = dict(message("b", name="Bo", address="bo@example.com"),
+                  toRecipients=[{"emailAddress": {"name": "Alex", "address": "alex@example.com"}}],
+                  ccRecipients=[])
+        cc = dict(message("c", name="Bo", address="bo@example.com"), toRecipients=[],
+                  ccRecipients=[{"emailAddress": {"name": "", "address": "ALEX@example.com"}}])
+        neither = dict(message("d", name="Bo", address="bo@example.com"), toRecipients=[], ccRecipients=[])
+        graph.return_value = {"value": [sender, to, cc, neither]}
+        got = mail.messages(10, involving=["alex"])
+        self.assertEqual([m["id"] for m in got], ["a", "b", "c"])
+        query = parse_qs(urlsplit(graph.call_args.args[1]).query)
+        self.assertIn("ccRecipients", query["$select"][0])

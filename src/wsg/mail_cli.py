@@ -124,8 +124,10 @@ def add_scope(s):
     scope = s.add_mutually_exclusive_group()
     scope.add_argument("--all-folders", action="store_true", help="include all your mailbox folders")
     scope.add_argument("--folder", metavar="ID", help="folder id or well-known name, default inbox")
-    s.add_argument("--since", metavar="DATE", help="received at or after this ISO date/time; local if no offset")
-    s.add_argument("--before", metavar="DATE", help="received before this ISO date/time (exclusive)")
+    s.add_argument("--since", metavar="DATE", help="received at or after this ISO date/time, or a time back "
+                                                   "like 7d; local if no offset")
+    s.add_argument("--before", metavar="DATE", help="received before this (exclusive); 30d means older than "
+                                                    "thirty days")
 
 
 def register(sub, count_type):

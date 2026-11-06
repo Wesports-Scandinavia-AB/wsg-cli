@@ -1642,7 +1642,8 @@ def cmd_mail_list(a):
     from . import mail
 
     rows = mail.messages(a.number, a.senders, a.unread, a.all_folders,
-                         since=a.since, before=a.before, folder=a.folder)
+                         since=a.since, before=a.before, folder=a.folder,
+                         involving=getattr(a, "involving", None))
     if a.json:
         print(json.dumps(rows, indent=2, ensure_ascii=False))
         return 0
@@ -1805,6 +1806,8 @@ def _add_mail_commands(sub):
     mail_cli.add_scope(s)
     s.add_argument("--from", dest="senders", action="append", type=_mail_sender, metavar="TEXT",
                    help="case-insensitive name or address fragment (repeat to match any)")
+    s.add_argument("--with", dest="involving", action="append", type=_mail_sender, metavar="TEXT",
+                   help="fragment matching anyone on From, To or Cc (repeat to match any)")
     s.add_argument("-n", "--number", "--limit", type=_mail_count, default=30,
                    help="maximum matching messages, default 30; follows Graph pages")
     s.add_argument("--unread", action="store_true", help="only unread messages")

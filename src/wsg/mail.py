@@ -44,6 +44,9 @@ from .markdown import MAIL_FONT, to_mail_html
 # Graph caps a request at about 4 MB; base64 adds a third. Same ceiling as sendmail.
 INLINE_LIMIT = 3 * 1024 * 1024
 LIST_FIELDS = "id,receivedDateTime,from,subject,isRead,parentFolderId"
+# Only asked for when a filter needs them: every listing would otherwise carry
+# two recipient arrays it never reads.
+PEOPLE_FIELDS = LIST_FIELDS + ",toRecipients,ccRecipients"
 READ_FIELDS = LIST_FIELDS + ",toRecipients,ccRecipients,conversationId,body,hasAttachments,webLink,flag"
 TEXT_HEADER = {"Prefer": 'outlook.body-content-type="text"'}
 
@@ -58,22 +61,40 @@ def _mailbox(all_folders=False, folder=None):
     return "/me/messages" if all_folders else f"/me/mailFolders/{parse.quote(folder or 'inbox', safe='')}/messages"
 
 
-def messages(n=30, senders=None, unread=False, all_folders=False, since=None, before=None, folder=None):
+def people_on(msg):
+    """Every name and address on a message: the sender, To and Cc.
+
+    What "was X involved" means in practice. Graph can filter on the sender
+    but not on a fragment across all three, so the match is local, like the
+    sender filter beside it.
+    """
+    boxes = [msg.get("from") or {}, *(msg.get("toRecipients") or []), *(msg.get("ccRecipients") or [])]
+    values = []
+    for box in boxes:
+        who = box.get("emailAddress") or {}
+        values += [(who.get("name") or "").casefold(), (who.get("address") or "").casefold()]
+    return values
+
+
+def messages(n=30, senders=None, unread=False, all_folders=False, since=None, before=None, folder=None,
+             involving=None):
     """Own inbox by default, newest first; n counts matches across Graph pages.
 
-    Sender fragments match locally; date/read filters run on Graph. The sort
-    property comes first in the filter to avoid Graph's InefficientFilter.
+    Sender and participant fragments match locally; date/read filters run on
+    Graph. The sort property comes first in the filter to avoid Graph's
+    InefficientFilter.
     """
     if n < 1:
         raise InputError("Antalet måste vara minst 1.")
     terms = [s.strip().casefold() for s in senders or []]
-    if any(not s for s in terms):
+    people = [s.strip().casefold() for s in involving or []]
+    if any(not s for s in terms + people):
         raise InputError("Avsändarfiltret får inte vara tomt.")
     start, end = bounds(since, before)
     query = {
-        "$select": LIST_FIELDS,
+        "$select": PEOPLE_FIELDS if people else LIST_FIELDS,
         "$orderby": "receivedDateTime desc",
-        "$top": 100 if terms else min(n, 100),
+        "$top": 100 if terms or people else min(n, 100),
     }
     filters = []
     if start:
@@ -94,6 +115,8 @@ def messages(n=30, senders=None, unread=False, all_folders=False, since=None, be
         sender = (msg.get("from") or {}).get("emailAddress") or {}
         values = [(sender.get(k) or "").casefold() for k in ("name", "address")]
         if terms and not any(term in value for term in terms for value in values):
+            continue
+        if people and not any(term in value for term in people for value in people_on(msg)):
             continue
         out.append(msg)
         if len(out) == n:

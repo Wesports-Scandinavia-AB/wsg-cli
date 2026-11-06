@@ -38,6 +38,8 @@ python -m wsg mail list --from Alex --from Sam -n 10       från någon av avsä
 python -m wsg mail list --from someone@example.com --unread --json
 python -m wsg mail list --all-folders                     även övriga mappar
 python -m wsg mail list --since 2026-10-01 --before 2026-11-01 --unread
+python -m wsg mail list --before 30d                       äldre än trettio dagar
+python -m wsg mail list --with anna --since 2w             någon rad Anna står på
 ```
 
 - Använder befintlig `wsg graph login`, bara personens egen inkorg som standard.
@@ -45,6 +47,9 @@ python -m wsg mail list --since 2026-10-01 --before 2026-11-01 --unread
   Inga mejl markeras som lästa.
 - `--from TEXT` matchar en del av avsändarens namn eller adress utan hänsyn till
   stora/små bokstäver. Upprepa flaggan för flera alternativ (någon av dem).
+- `--with TEXT` matchar alla på mailet, avsändare, Till och Kopia, inte bara
+  avsändaren. Upprepa för flera. Det är frågan "var den här personen
+  inblandad", till skillnad från `--from` som bara är "skickade hen det".
 - `--unread` tar bara olästa. `-n`, `--number` och `--limit` anger ett positivt
   maxantal träffar, 30 som standard. Senare sidor hämtas tills antalet uppnåtts
   eller de valda mapparna tar slut. Glesa filter kan därför ta tid.
@@ -53,7 +58,9 @@ python -m wsg mail list --since 2026-10-01 --before 2026-11-01 --unread
   tomt resultat är `[]`. Använd `id` för svar eller arkivering.
 - Hämtar bara metadata, ingen brödtext eller bilagor. Skriver aldrig ut token.
 - `--since` inkluderar starttid, `--before` exkluderar sluttid. ISO-datum utan
-  tidszon använder datorns lokala tid. Datum och oläst filtreras på servern;
+  tidszon använder datorns lokala tid. Båda tar också en tid tillbaka i stället
+  för ett datum: `36h`, `30d`, `2w`. `--before 30d` betyder alltså äldre än
+  trettio dagar, `--since 7d` den senaste veckan. Datum och oläst filtreras på servern;
   avsändarfragment matchas lokalt. `--folder ID` väljer en bestämd mapp i stället
   för inkorgen och kan inte kombineras med `--all-folders`.
 
