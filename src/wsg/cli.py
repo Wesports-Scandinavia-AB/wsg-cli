@@ -267,8 +267,8 @@ def cmd_graph_sendmail(a):
 
 def cmd_arena_login(a):
     try:
-        arena.login(timeout=a.timeout)
-        me = arena.get("/api/me")
+        arena.login(timeout=a.timeout, sensitive=a.sensitive)
+        me = arena.get("/api/me", sensitive=a.sensitive)
     except auth.AuthError as e:
         print(f"Inloggningen misslyckades: {e}", file=sys.stderr)
         return 1
@@ -279,7 +279,7 @@ def cmd_arena_login(a):
 
 def cmd_arena_token(a):
     try:
-        tok = arena.get_token()
+        tok = arena.get_token(sensitive=a.sensitive)
     except auth.AuthError as e:
         print(str(e), file=sys.stderr)
         return 2
@@ -288,9 +288,9 @@ def cmd_arena_token(a):
 
 
 def cmd_arena_status(a):
-    c = arena.status()
+    c = arena.status(sensitive=a.sensitive)
     if not c:
-        print(f"Inte inloggad mot {arena.app_url()}. Kör: wsg arena login")
+        print(f"Inte inloggad mot {arena.app_url()}. Kör: wsg arena login{' --sensitive' if a.sensitive else ''}")
         return 2
     exp = datetime.fromtimestamp(c["access_expires_at"])
     since = datetime.fromtimestamp(c["signed_in_at"]) if c.get("signed_in_at") else None
@@ -301,16 +301,19 @@ def cmd_arena_status(a):
             "access_expires_at": exp.isoformat(timespec="seconds"),
             "access_valid": live,
             "renewable": c["renewable"],
+            "scope": c["scope"],
+            "refresh_expires_at": datetime.fromtimestamp(c["refresh_expires_at"]).isoformat(timespec="seconds"),
             "token_issued_at": since.isoformat(timespec="seconds") if since else None,
             "cache": c["cache"],
         }, indent=2, ensure_ascii=False))
         return 0
     print(f"App:      {c['url']}")
+    print(f"Åtkomst:  {'känslig (högst tolv timmar)' if a.sensitive else 'vanlig (30 dagars förnyelse)'}")
     print(f"Token:    {'giltig till ' + exp.strftime('%Y-%m-%d %H:%M') if live else 'utgången'}"
-          f"{', förnyas av sig själv' if c['renewable'] else ', kör: wsg arena login'}")
+          + (", förnyas av sig själv" if c['renewable'] else f", kör: wsg arena login{' --sensitive' if a.sensitive else ''}"))
     if since:
-        until = datetime.fromtimestamp(c["signed_in_at"] + arena.SIGN_IN_TTL_SECONDS)
-        print(f"Inloggad: {since.strftime('%Y-%m-%d %H:%M')} (gäller till {until.strftime('%Y-%m-%d %H:%M')}, sedan loggar wsg in igen)")
+        until = datetime.fromtimestamp(c["refresh_expires_at"])
+        print(f"Inloggad: {since.strftime('%Y-%m-%d %H:%M')} (förnyelse giltig till {until.strftime('%Y-%m-%d %H:%M')})")
     print(f"Cache:    {c['cache']}")
     return 0
 
@@ -606,7 +609,7 @@ def cmd_arena_reopen(a):
 
 
 def cmd_arena_logout(a):
-    print("Arena-session borttagen." if arena.logout() else "Ingen Arena-session fanns.")
+    print("Arena-session borttagen." if arena.logout(sensitive=a.sensitive) else "Ingen Arena-session fanns.")
     return 0
 
 
@@ -697,14 +700,17 @@ def _add_graph_commands(sub, visible=True, client=None, scopes=DEFAULT_SCOPES, s
 def _add_arena_commands(sub):
     s = sub.add_parser("login", help="sign in to Arena (OAuth in the browser, prints the URL)")
     s.add_argument("--timeout", type=int, default=600, help="seconds to wait for the browser, default 600")
+    s.add_argument("--sensitive", action="store_true", help="separate twelve-hour access for sensitive operations")
     s.set_defaults(fn=cmd_arena_login)
 
     s = sub.add_parser("token", help="print a live Arena access token (renews it when needed)")
     s.add_argument("--header", action="store_true", help="print as 'Authorization: Bearer <token>'")
+    s.add_argument("--sensitive", action="store_true", help="use the separate sensitive credential")
     s.set_defaults(fn=cmd_arena_token)
 
     s = sub.add_parser("status", help="the Arena session on this machine and until when")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--sensitive", action="store_true", help="show the sensitive credential's status")
     s.set_defaults(fn=cmd_arena_status)
 
     s = sub.add_parser("whoami", help="call Arena /api/me")
@@ -799,6 +805,7 @@ def _add_arena_commands(sub):
     s.set_defaults(fn=cmd_arena_reopen)
 
     s = sub.add_parser("logout", help="delete the cached Access token for Arena")
+    s.add_argument("--sensitive", action="store_true", help="delete only the sensitive credential")
     s.set_defaults(fn=cmd_arena_logout)
 
 

@@ -20,13 +20,13 @@ and wins when it is configured: id and secret in %LOCALAPPDATA%\\wsg\\arena.json
 (or ~/.config/wsg/arena.json), or in WSG_ARENA_CLIENT_ID / WSG_ARENA_CLIENT_SECRET.
 Before 2026-10-09 that was the only way.
 
-An access token lives an hour and is renewed with the refresh token, which
-rotates on every use. The sign-in as a whole ends twelve hours after it began,
-the same as a browser session (Arena, API_FAMILY_TTL_SECONDS): the token carries
-that sign-in's assurance, tier 3 included, and a month of it on disk was too
-much. When it ends, an interactive run signs in again by itself (prints the URL
-and waits); a script without a terminal gets an AuthError instead, or always
-with WSG_ARENA_NO_RELOGIN=1.
+Everyday and sensitive API credentials are stored separately. Everyday access
+renews with a rotating thirty-day refresh token and cannot reach M&A, IR,
+secrets or access administration. Sensitive access requires explicit consent
+and ends twelve hours after sign-in, including refreshes. The server decides
+which credential an operation needs; an ordinary 403 never triggers elevation.
+An interactive run prints a sign-in URL when needed; a script gets AuthError,
+as does any run with WSG_ARENA_NO_RELOGIN=1.
 """
 
 import base64
@@ -89,8 +89,9 @@ def client_path():
     return Path(os.environ.get("WSG_ARENA_CLIENT") or _config_dir() / "arena.json")
 
 
-def cache_path():
-    return Path(os.environ.get("WSG_ARENA_TOKEN_CACHE") or _config_dir() / "arena-token.json")
+def cache_path(sensitive=False):
+    p = Path(os.environ.get("WSG_ARENA_TOKEN_CACHE") or _config_dir() / "arena-token.json")
+    return p.with_name(p.stem + "-sensitive" + p.suffix) if sensitive else p
 
 
 # Arena's shared public client for wsg. Not a secret: it is in this public repo on purpose.
@@ -112,36 +113,48 @@ def client():
     return cid, secret
 
 
-# How long Arena keeps a sign-in alive, refreshes included. Arena decides; this is
-# only for `wsg arena status` to say when the next sign-in is due.
-SIGN_IN_TTL_SECONDS = 12 * 60 * 60
+STANDARD_SCOPE = "arena:standard"
+SENSITIVE_SCOPE = "arena:sensitive"
+
+
+def _scope(sensitive):
+    return SENSITIVE_SCOPE if sensitive else STANDARD_SCOPE
 
 # ── token cache ───────────────────────────────────────────────────────────────
 
-def _read_cache():
+def _read_cache(sensitive=False):
     try:
-        cached = json.loads(cache_path().read_text(encoding="utf-8"))
+        cached = json.loads(cache_path(sensitive).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     # A refresh token only works for the client that got it. A cache from another
     # client (arena.json added or removed since) reads as signed out, so the next
     # call signs in again instead of failing on a refresh Arena must refuse.
-    # Caches from before 2026-10-09 carry no client id and are kept as they are.
+    if not isinstance(cached, dict):
+        return None
     if cached.get("client_id", client()[0]) != client()[0]:
+        return None
+    # Never use a legacy unrestricted token as the new everyday credential,
+    # or accept a cache copied from the other profile.
+    if cached.get("scope") != _scope(sensitive):
         return None
     return cached
 
 
-def _write_cache(tok, signed_in_at=None):
-    p = cache_path()
+def _write_cache(tok, signed_in_at=None, *, sensitive=False):
+    if tok.get("scope") != _scope(sensitive):
+        raise AuthError("Arena gav fel tokenprofil. Uppdatera servern och logga in igen; inget sparades.")
+    p = cache_path(sensitive)
     p.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "url": app_url(),
         "client_id": client()[0],
+        "scope": tok["scope"],
         "access_token": tok["access_token"],
         "refresh_token": tok.get("refresh_token"),
         "expires_at": int(time.time()) + int(tok.get("expires_in", 3600)) - 60,
-        # When the SIGN-IN happened, kept across refreshes: Arena counts its twelve hours from it.
+        "refresh_expires_at": int(time.time()) + int(tok.get("refresh_expires_in", 0)),
+        # Kept across refreshes; the server caps sensitive access at twelve hours.
         "signed_in_at": int(signed_in_at or time.time()),
     }
     tmp = p.with_suffix(".tmp")
@@ -186,7 +199,7 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def login(timeout=600, out=sys.stderr):
+def login(timeout=600, out=sys.stderr, *, sensitive=False):
     """Authorization code + PKCE over a loopback redirect. Prints the URL, never opens a browser."""
     cid, _ = client()
     verifier = token_urlsafe(64)
@@ -202,6 +215,7 @@ def login(timeout=600, out=sys.stderr):
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "scope": _scope(sensitive),
     })
 
     result = {}
@@ -258,7 +272,7 @@ def login(timeout=600, out=sys.stderr):
     if not tok:
         err = err or {}
         raise AuthError(err.get("error_description") or err.get("error") or "tokenutbytet misslyckades")
-    return _write_cache(tok)
+    return _write_cache(tok, sensitive=sensitive)
 
 
 def _interactive():
@@ -267,61 +281,63 @@ def _interactive():
     return sys.stderr.isatty() and not os.environ.get("WSG_ARENA_NO_RELOGIN")
 
 
-def _relogin(reason):
+def _relogin(reason, *, sensitive=False):
     """Sign in again when someone can, else say how. Returns a fresh access token."""
     if not _interactive():
-        raise AuthError(f"{reason}. Kör: wsg arena login")
+        raise AuthError(f"{reason}. Kör: wsg arena login{' --sensitive' if sensitive else ''}")
     print(f"{reason}, loggar in igen.", file=sys.stderr, flush=True)
-    return login()["access_token"]
+    return login(sensitive=sensitive)["access_token"]
 
 
-def get_token():
+def get_token(*, sensitive=False):
     """A live access token: cached, refreshed, or (at a terminal) signed in again."""
-    c = _read_cache()
+    c = _read_cache(sensitive)
     if not c or c.get("url") != app_url():
-        return _relogin(f"Inte inloggad mot {app_url()}")
+        return _relogin(f"Inte inloggad mot {app_url()} ({'känslig' if sensitive else 'vanlig'} åtkomst)", sensitive=sensitive)
     if c.get("expires_at", 0) > time.time():
         return c["access_token"]
     if not c.get("refresh_token"):
-        return _relogin("Arena-inloggningen har gått ut")
+        return _relogin("Arena-inloggningen har gått ut", sensitive=sensitive)
     tok, err = _token_endpoint({"grant_type": "refresh_token", "refresh_token": c["refresh_token"]})
     if not tok:
-        # Spent, revoked, or past the sign-in's twelve hours: none of these can be retried.
-        return _relogin(f"Arena-inloggningen kunde inte förnyas ({(err or {}).get('error_description') or (err or {}).get('error', '?')})")
-    return _write_cache(tok, c.get("signed_in_at"))["access_token"]
+        # Spent, revoked or expired: none of these can be retried.
+        return _relogin(f"Arena-inloggningen kunde inte förnyas ({(err or {}).get('error_description') or (err or {}).get('error', '?')})", sensitive=sensitive)
+    return _write_cache(tok, c.get("signed_in_at"), sensitive=sensitive)["access_token"]
 
 
-def logout():
-    """Forget the tokens on this machine. Arena revokes them on offboarding, and they lapse twelve hours after sign-in."""
-    p = cache_path()
+def logout(*, sensitive=False):
+    """Forget the selected profile on this machine. Offboarding revokes both server-side."""
+    p = cache_path(sensitive)
     if p.exists():
         p.unlink()
         return True
     return False
 
 
-def status():
+def status(*, sensitive=False):
     """What the cache holds, or None. Does not call the network."""
-    c = _read_cache()
+    c = _read_cache(sensitive)
     if not c or c.get("url") != app_url():
         return None
     return {
         "url": c["url"],
         "access_expires_at": c.get("expires_at", 0),
         "signed_in_at": c.get("signed_in_at"),
-        "renewable": bool(c.get("refresh_token")),
-        "cache": str(cache_path()),
+        "renewable": bool(c.get("refresh_token")) and c.get("refresh_expires_at", 0) > time.time(),
+        "scope": c["scope"],
+        "refresh_expires_at": c.get("refresh_expires_at", 0),
+        "cache": str(cache_path(sensitive)),
     }
 
 
-def api(method, path, body=None, token=None, timeout=60):
+def api(method, path, body=None, token=None, timeout=60, *, sensitive=False):
     """Call the Arena API. `path` is like '/api/me'. Returns parsed JSON (or text).
 
     A 401 on our own cached token (revoked, or the sign-in ran out between the
     expiry check and the call) signs in again once at a terminal and retries. A
     401 is refused before the handler runs, so the retry cannot do a write twice."""
     try:
-        tok = token or get_token()
+        tok = token or get_token(sensitive=sensitive)
     except (URLError, TimeoutError, ConnectionError, OSError) as e:
         raise ArenaTransportError(_transport_message(e)) from None
     url = app_url() + (path if path.startswith("/") else "/" + path)
@@ -341,13 +357,24 @@ def api(method, path, body=None, token=None, timeout=60):
         try:
             raw, ctype = call(tok)
         except HTTPError as e:
+            # Only this server gate signal may select the sensitive credential.
+            # It is emitted before the handler, so retrying a write is safe.
+            if e.code == 403 and not token and not sensitive:
+                payload = e.read()
+                try:
+                    needs_sensitive = json.loads(payload).get("error") == "sensitive_token_required"
+                except (ValueError, AttributeError):
+                    needs_sensitive = False
+                if needs_sensitive:
+                    return api(method, path, body=body, timeout=timeout, sensitive=True)
+                raise AuthError(f"{method} {path}: HTTP 403: {payload.decode(errors='replace')[:500]}") from None
             if e.code != 401 or token or not _interactive():
                 raise
-            raw, ctype = call(_relogin(f"Arena tog inte emot inloggningen ({method} {path}: 401)"))
+            raw, ctype = call(_relogin(f"Arena tog inte emot inloggningen ({method} {path}: 401)", sensitive=sensitive))
     except HTTPError as e:
         raw = e.read()
         if e.code == 401:
-            raise AuthError(f"Arena tog inte emot inloggningen ({method} {path}: 401). Kör: wsg arena login")
+            raise AuthError(f"Arena tog inte emot inloggningen ({method} {path}: 401). Kör: wsg arena login{' --sensitive' if sensitive else ''}")
         try:
             detail = json.loads(raw).get("error") or raw.decode(errors="replace")
         except (ValueError, AttributeError):

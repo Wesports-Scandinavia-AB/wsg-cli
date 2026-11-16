@@ -193,9 +193,18 @@ wsg arena login                            prints a URL; sign in and allow
 wsg arena get /api/me
 ```
 
-The access token lives an hour and renews itself with the refresh token, which
-lasts 30 days and rotates on every use. Scripts should treat exit code 2 as
-"run `wsg arena login`". The token is a normal bearer token:
+Everyday access uses `arena:standard`: an hourly access token and a rotating
+30-day refresh token. It cannot reach M&A, IR, secrets or access administration.
+For those operations, run `wsg arena login --sensitive`: a separate credential
+with scope `arena:sensitive`, stored separately and limited to twelve hours
+including refreshes. It still requires your own permissions and the route's
+normal sign-in assurance. An API operation selects it only when the server
+returns `sensitive_token_required`; an ordinary permission denial never elevates.
+
+Use `wsg arena token --sensitive`, `status --sensitive` or `logout --sensitive`
+to work with that profile. Both profiles require a one-time sign-in after
+updating from a version whose tokens had no scope. The everyday token is a
+normal bearer token:
 
 ```powershell
 $H = @{ Authorization = "Bearer " + (wsg arena token); "User-Agent" = "my-script" }

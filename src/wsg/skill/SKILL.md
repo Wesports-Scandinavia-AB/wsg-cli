@@ -311,10 +311,20 @@ python -m wsg arena whoami     vem som är inloggad
 Samma regler som för Microsoft-inloggningen: kör `login` i bakgrunden, ge personen
 adressen som text, öppna inte webbläsaren själv. Personen loggar in som vanligt i
 Arena och trycker **Allow** på sidan som säger att ett kommandoradsverktyg vill
-agera som hen. Inloggningen gäller tolv timmar, sedan frågar den igen.
+agera som hen. Vanlig åtkomst har 30 dagars refresh-token som förnyas vid användning.
+Den kan inte använda M&A, IR, hemligheter eller behörighetsadministration.
+
+För känsligt arbete: `python -m wsg arena login --sensitive`. Det är en separat
+inloggning och tokenfil som gäller högst tolv timmar inklusive förnyelser.
+Kör den i bakgrunden och ge personen länken, precis som vid vanlig inloggning.
+`token`, `status` och `logout` har också `--sensitive`. API-anrop väljer den
+känsliga token endast när servern uttryckligen svarar `sensitive_token_required`.
+Ingen känslig token uppgraderar den vanliga, och förnyelse byter aldrig profil.
+Efter uppdatering från äldre version behövs en ny inloggning per profil.
 
 Verktyget får göra exakt det personen får göra i Arena-appen, inget mer. Ett 403
-betyder att personen saknar rätten i Arena, inte att något är fel i wsg.
+betyder normalt att personen saknar rätten i Arena; `sensitive_token_required`
+betyder i stället att en separat känslig inloggning behövs.
 
 ## Token till ett eget script
 
